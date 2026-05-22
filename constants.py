@@ -1,7 +1,15 @@
 # constants.py, place to put the game constants
 
+import sys
+from pathlib import Path
+
 import pygame
 pygame.init()
+
+
+def resource_path(relative_path):
+    base_path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+    return str(base_path / relative_path)
 
 #   ______   ______    __        ______   .______          _______.
 #  /      | /  __  \  |  |      /  __  \  |   _  \        /       |
@@ -97,9 +105,9 @@ NEIGHBORING_TILES = [(1,0), (1,-1), (0,-1), (-1,0), (1,1), (0,1)]
 #       |_|
 
 #character
-S_PLAYER = pygame.transform.scale(pygame.image.load('data/Otter_Warrior.png'), (CELL_WIDTH, CELL_HEIGHT))
-S_CITY = pygame.transform.scale(pygame.image.load('data/Ottertopia.png'), (CELL_WIDTH, CELL_HEIGHT))
-S_PLAINS = pygame.transform.scale(pygame.image.load('data/plains.png'), (HEX_SIZE, HEX_SIZE))
+S_PLAYER = pygame.transform.scale(pygame.image.load(resource_path('data/Otter_Warrior.png')), (CELL_WIDTH, CELL_HEIGHT))
+S_CITY = pygame.transform.scale(pygame.image.load(resource_path('data/Ottertopia.png')), (CELL_WIDTH, CELL_HEIGHT))
+S_PLAINS = pygame.transform.scale(pygame.image.load(resource_path('data/plains.png')), (HEX_SIZE, HEX_SIZE))
 
 
 # Fonts

@@ -914,8 +914,8 @@ class Game():
                                  constants.MOVEMENT_DIR[direction[0]][parity][1])
             GAME_OBJECTS[1].move(constants.MOVEMENT_DIR[direction[1]][parity2][0],
                                  constants.MOVEMENT_DIR[direction[1]][parity2][1])
-            GAME_OBJECTS[2].move(constants.MOVEMENT_DIR[direction[1]][parity3][0],
-                                 constants.MOVEMENT_DIR[direction[1]][parity3][1])
+            GAME_OBJECTS[2].move(constants.MOVEMENT_DIR[direction[2]][parity3][0],
+                                 constants.MOVEMENT_DIR[direction[2]][parity3][1])
             return "player-moved"
 
 

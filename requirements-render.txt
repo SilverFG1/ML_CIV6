@@ -1,0 +1,3 @@
+# Optional Pygame renderer; includes the headless dependencies.
+-r requirements.txt
+pygame==2.6.1

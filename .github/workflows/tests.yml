@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install headless dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Train and compare evaluation policies
+        run: python run_game.py --episodes 2 --max-steps 4 --eval-episodes 2 --fresh --no-save --metrics-dir artifacts/smoke
+      - name: Retain smoke metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-metrics
+          path: artifacts/smoke
+          if-no-files-found: ignore

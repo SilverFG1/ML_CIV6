@@ -1,926 +1,526 @@
-# game.py
-# Main game file. This file contains
+"""A small Civ-like combat environment with isolated state and seeded randomness."""
 
-
-
-
-
-import pygame
-import constants
+from dataclasses import dataclass
+import heapq
+import itertools
+import math
 import random
+
 import numpy as np
-import class_hex
+
+import constants
+from class_hex import HexMap, TERRAIN_CODES
 
 
-# ------------------------------
-# Base class
-# ------------------------------
+def hex_coords(position):
+    x, y = position
+    q = x - (y - y % 2) // 2
+    return q, -q - y, y
 
-class C_Sprite(pygame.sprite.Sprite):
-    """
-    Creatures have health and can damage other objects by attacking them.
-    Can also die.
-    """
 
-    def __init__(self,
-                 x,
-                 y,
-                 sprite,
-                 name_instance,
-                 hp=10,
-                 hp_max = 100,
-                 strength=20):
-        self.x = x
-        self.y = y
+def hex_distance(first, second):
+    return max(abs(a - b) for a, b in zip(hex_coords(first), hex_coords(second)))
+
+
+@dataclass(frozen=True)
+class GameConfig:
+    width: int = 8
+    height: int = 8
+    unit_count: int = 3
+    city_position: tuple | None = None
+    city_strength: float = 28
+    wall_hp: float = 0
+    ranged_strength: float = 0
+    city_heals: bool = True
+    mountain_density: float = 0
+    forest_density: float = 0
+    unit_strengths: tuple = ()
+    unit_types: tuple = ()
+    difficulty: str = 'normal'
+
+    def __post_init__(self):
+        for name in ('width', 'height'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 3 <= value <= 32:
+                raise ValueError(f'{name} must be an integer between 3 and 32')
+        if isinstance(self.unit_count, bool) or not isinstance(self.unit_count, int) or not 1 <= self.unit_count <= 4:
+            raise ValueError('unit_count must be between 1 and 4')
+        for name in ('city_strength', 'ranged_strength'):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0 <= value <= 100:
+                raise ValueError(f'{name} must be finite and between 0 and 100')
+        if not math.isfinite(self.wall_hp) or not 0 <= self.wall_hp <= 1000:
+            raise ValueError('wall_hp must be finite and between 0 and 1000')
+        for name in ('mountain_density', 'forest_density'):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f'{name} must be between 0 and 1')
+        if self.mountain_density + self.forest_density > 0.8:
+            raise ValueError('combined terrain density must be at most 0.8')
+        if self.unit_strengths and len(self.unit_strengths) != self.unit_count:
+            raise ValueError('unit_strengths must contain one strength for every unit')
+        if any(not math.isfinite(s) or not 0 < s <= 100 for s in self.unit_strengths):
+            raise ValueError('unit strengths must be finite and in (0, 100]')
+        if self.unit_types and (len(self.unit_types) != self.unit_count
+                               or any(t not in ('warrior', 'archer') for t in self.unit_types)):
+            raise ValueError('unit_types must contain warrior or archer for every unit')
+        if self.difficulty not in ('easy', 'normal', 'hard', 'curriculum'):
+            raise ValueError('Unknown difficulty')
+        if self.city_position is not None:
+            if len(self.city_position) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
+                                                 for v in self.city_position):
+                raise ValueError('city_position must contain two integers')
+            x, y = self.city_position
+            if not (0 <= x < self.width and 0 <= y < self.height):
+                raise ValueError('city_position must lie inside the map')
+
+
+class C_Sprite:
+    """A simulation object; sprite is retained for older construction callers."""
+    def __init__(self, x, y, sprite=None, name_instance='Object', hp=100,
+                 hp_max=100, strength=20, env=None):
+        self.x, self.y = int(x), int(y)
         self.sprite = sprite
         self.name_instance = name_instance
-        self.hp_max = hp_max
-        self.hp = hp
-        self.strength = strength
-        self.alive = True
-        self.status = 'alive'
+        self.hp_max = float(hp_max)
+        self.hp = float(hp)
+        self.strength = float(strength)
+        self.alive = self.hp > 0
+        self.status = 'alive' if self.alive else 'dead'
         self.status_default = 'alive'
+        self.env = env
 
-    def draw(self):
-        """Draw the unit"""
+    @property
+    def position(self):
+        return self.x, self.y
 
-        global GAME_MAP
-
-        SURFACE_MAIN.blit(self.sprite,
-                          (GAME_MAP.grid[(int(self.x), int(self.y))].rect.x,
-                          GAME_MAP.grid[(int(self.x), int(self.y))].rect.y - GAME_MAP.grid[(int(self.x), int(self.y))].rect.h / 4))
-
+    def _event(self, kind, **details):
+        if self.env is not None:
+            self.env.events.append({'type': kind, 'object': self.name_instance, **details})
 
 
 class C_Unit(C_Sprite):
-    def __init__(self,
-                 x,
-                 y,
-                 sprite,
-                 name_instance,
-                 hp=100,
-                 hp_max=100,
-                 strength=20):
-        super().__init__(x,
-                         y,
-                         sprite,
-                         name_instance,
-                         hp,
-                         hp_max,
-                         strength)
+    def __init__(self, *args, strength_ranged=0, unit_type='warrior', **kwargs):
+        super().__init__(*args, **kwargs)
+        self.strength_ranged = float(strength_ranged)
+        self.unit_type = unit_type
+        self.attack_range = 2 if unit_type == 'archer' else 1
 
-    def move(self,
-             dx,
-             dy):
+    def move(self, dx, dy):
+        if self.env is None:
+            raise RuntimeError('Unit must belong to a Game before moving')
+        self.env.move_unit(self, (int(dx), int(dy)))
 
-        # --- Check to see if the units is still alive!!!!
-        if self.alive:
-            # Check to see if the movement is still "in bounds"
-            if (int(self.x + dx), int(self.y + dy)) not in GAME_MAP.grid:
-                tile_is_wall = True
-            else:
-                tile_is_wall = False
-
-
-            # --- set unit status to 'hit wall' if it hit the wall
-            if tile_is_wall:
-                self.status = 'hit wall'
-
-            target = map_check_for_creatures(self.x + dx,
-                                             self.y + dy,
-                                             exclude_object=self)
-
-
-            if target and target.__class__ != C_Unit:
-                damage_output, damage_taken = attack(self, target)
-                #print('taken {}, output {}'.format(damage_taken, damage_output))
-
-                # Take the damage
-                if damage_taken > 0:
-                    #print('damage_taken', damage_taken)
-                    self.take_damage(damage_taken)
-
-                # Have the other object take damage
-                if damage_output > 0:
-                    target.take_damage(damage_output, self.alive)
-                    self.status = 'attacked'
-
-            # --- Heal the unit if it doesn't move
-            if dx == 0 and dy == 0:
-                self.hp += 10
-                self.status = 'healed'
-                if self.hp > self.hp_max:
-                    self.hp = self.hp_max
-                    self.status = self.status_default
-
-            # --- Move the unit if it can
-            if not tile_is_wall and target is None:
-                self.x += dx
-                self.y += dy
-
-    def take_damage(self,
-                    damage,
-                    aggressor_alive = True):
-        # Unit doesn't die if the unit doesn't have enough HP to take it over
-        if not aggressor_alive and (self.hp - damage) < 0:
-            self.hp = 1
-        else:
-            self.hp -= damage
-        #self.status = 'took damage'
-
-
-        # --- Unit dies if less than 0 health
+    def take_damage(self, damage, aggressor_alive=True):
+        if not self.alive:
+            return
+        actual = min(self.hp, max(0, float(damage)))
+        self.hp -= actual
+        self._event('unit_damaged', amount=actual)
         if self.hp <= 0:
             self.death_unit()
 
     def death_unit(self):
-        '''On death, most citys stop moving.'''
-        #print(self.name_instance + ' is dead!')
-        self.alive = False
-        self.status = 'dead'
+        if self.alive:
+            self.hp = 0
+            self.alive = False
+            self.status = 'dead'
+            self._event('unit_died')
 
 
 class C_City(C_Sprite):
-    def __init__(self,
-                 x,
-                 y,
-                 sprite,
-                 name_instance,
-                 hp=1,
-                 hp_max=100,
-                 wall_hp=100,
-                 strength=18,
-                 strength_ranged=0,
-                 ranged_combat=False,
-                 heal=False):
-        self.wall_hp = wall_hp
-        self.strength_ranged = strength_ranged
+    def __init__(self, x, y, sprite=None, name_instance='City', hp=100,
+                 hp_max=100, wall_hp=0, strength=28, strength_ranged=0,
+                 ranged_combat=False, heal=True, env=None):
+        super().__init__(x, y, sprite, name_instance, hp, hp_max, strength, env)
+        self.wall_hp = float(wall_hp)
+        self.wall_hp_max = float(wall_hp)
+        self.strength_ranged = float(strength_ranged)
         self.ranged_combat = ranged_combat
         self.heal = heal
 
-        super().__init__(x,
-                         y,
-                         sprite,
-                         name_instance,
-                         hp,
-                         hp_max,
-                         strength)
-
     def take_turn(self):
+        if self.env is not None and self.alive:
+            self.env.city_turn()
 
-        global GAME_OBJECTS, GAME_MAP
-
-        if self.ranged_combat:
-            # Check for a creature that is within two tiles
-            items_within_range = []
-            for ii in range(-2, 2):
-                for jj in range(-2, 2):
-                    temp = map_check_for_creatures(self.x - ii, self.y - jj, exclude_object=self)
-                    # print('checked location', self.x - ii, self.y - jj)
-                    if temp:
-                        # print(temp.__class__, ' within range')
-                        if temp.__class__ == C_Unit:
-                            # --- Only add alive units
-                            if temp.alive:
-                                #print('found {} at {} {}'.format(
-                                #    temp.name_instance,
-                                #    self.x - ii,
-                                #    self.y - jj))
-                                items_within_range.append(temp)
-
-            # --- Attack a random creature
-            if len(items_within_range) > 0:
-                rand_numb = random.randint(0, len(items_within_range) - 1)
-                damage_output, damage_taken = attack(self, items_within_range[rand_numb], ranged=True)
-
-                # City should not take any damage for the ranged combat
-                items_within_range[rand_numb].take_damage(damage_output)
-
-        if self.heal:
-            temp = GAME_MAP.grid[(self.x, self.y)].get_neighbors(GAME_MAP.grid)
-            tiles_within_range = []
-            for ii in range(len(temp)):
-                tiles_within_range.append(temp[ii].index)
-            # Check to make sure there are three creatures within one tile
-            items_within_range = []
-            for obj in GAME_OBJECTS:
-                for tile in tiles_within_range:
-                    if obj.x == tile[0] and obj.y == tile[1] and obj.alive:
-                        #print(f'position {obj.x} {obj.y} {obj.name_instance}')
-                        items_within_range.append(temp)
-
-
-            # --- Heal if less than 3 tiles are occupied
-            if len(items_within_range) < 3:
-                self.hp += 10
-                self.status = 'healed'
-                if self.hp > self.hp_max:
-                    self.hp = self.hp_max
-            else:
-                pass
-                #print(f'Three units are surrounding the city')
-
-
-    def take_damage(self,
-                    damage,
-                    aggressor_alive = True):
-        # City doesn't die if the unit doesn't have enough HP to take it over
-        if not aggressor_alive and (self.hp - damage) < 0:
-            self.hp = 1
-        else:
-            self.hp -= damage
-        self.status = 'took damage'
-
-        # --- City dies when it doesn't have HP
+    def take_damage(self, damage, aggressor_alive=True):
+        if not self.alive:
+            return
+        damage = max(0, float(damage))
+        wall_damage = min(self.wall_hp, damage)
+        if wall_damage:
+            self.wall_hp -= wall_damage
+            damage -= wall_damage
+            self._event('wall_damaged', amount=wall_damage)
+        actual = min(self.hp if aggressor_alive else max(0, self.hp - 1), damage)
+        if actual:
+            self.hp -= actual
+            self.status = 'took damage'
+            self._event('city_damaged', amount=actual)
         if self.hp <= 0:
-            self.hp = 0
             self.death()
 
     def death(self):
-        '''On death, most citys stop moving.'''
-        #print(self.name_instance + ' has been defeated!')
-        self.alive = False
-        self.status = 'dead'
+        if self.alive:
+            self.hp = 0
+            self.alive = False
+            self.status = 'dead'
+            self._event('city_captured')
 
 
-def attack(aggressor,
-           target,
-           ranged=False):
-    '''Base attack definition using the formula found on CivFanatics
-    TODO: Attack accounting for walls....'''
-
+def attack(aggressor, target, ranged=False, rng=None):
+    """Compute combat damage using the environment's private RNG."""
+    rng = rng or (aggressor.env.rng if aggressor.env is not None else random.Random())
+    offense = aggressor.strength_ranged if ranged else aggressor.strength
+    defense = target.strength
+    if isinstance(target, C_Unit) and target.env is not None:
+        defense += target.env.map.grid[target.position].defense_bonus
+    strength_diff = offense - defense
+    damage_out = round(rng.randint(24, 36) * math.exp(strength_diff / 25) * rng.uniform(.75, 1))
     if ranged:
-        strength_diff = aggressor.strength_ranged - target.strength
-    else:
-        strength_diff = aggressor.strength - target.strength
-
-    damage_out = np.round(random.randint(24, 36) * np.exp(strength_diff / 25.0) * (random.randint(75, 100) / 100.0))
-    damage_taken = np.round(random.randint(24, 36) * np.exp(-strength_diff / 25.0) * (random.randint(75, 100) / 100.0))
-
+        return damage_out, 0
+    retaliation_diff = target.strength - aggressor.strength
+    if aggressor.env is not None:
+        retaliation_diff -= aggressor.env.map.grid[aggressor.position].defense_bonus
+    damage_taken = round(rng.randint(24, 36) * math.exp(retaliation_diff / 25) * rng.uniform(.75, 1))
     return damage_out, damage_taken
 
 
-# ---------------------------------------------
-# MAP
-# ---------------------------------------------
-def map_create():
-
-    new_map = class_hex.HexMap(constants.MAP_HEIGHT,
-                                constants.MAP_WIDTH,
-                               (constants.HEX_SIZE, constants.HEX_SIZE),
-                                constants.EDGE_OFFSET)
-    # TODO: block the edge tiles!
-
-
-    return new_map
-
-
-def map_check_for_creatures(x,
-                            y,
-                            exclude_object=None):
-    target = None
-
-    # --- check objectlist to find creature at that location that isn't excluded
-    if exclude_object:
-        for object in GAME_OBJECTS:
-            if (object is not exclude_object and
-                    object.x == x and
-                    object.y == y and
-                    object.alive):
-                target = object
-
-            if target:
-                return target
-
-    # --- check objectlist to find any creature at that location
-    else:
-        for object in GAME_OBJECTS:
-            if (object.x == x and
-                    object.y == y and
-                    object.alive):
-                target = object
-
-            if target:
-                return target
-
-
-# ---------------------------------------------
-# DRAWING
-# ---------------------------------------------
-def draw_game():
-    global SURFACE_MAIN, episode_number, TURN_NUMBER
-
-    # --- Clear the surface
-    SURFACE_MAIN.fill(constants.COLOR_DEFAULT_BG)
-
-    # --- Draw the map
-    draw_map(GAME_MAP)
-
-    # --- Draw the objects
-    for obj in GAME_OBJECTS:
-        obj.draw()
-
-    # --- Draw the text
-    for obj in GAME_OBJECTS:
-        # Draw the HP above the unit
-        draw_text(SURFACE_MAIN, "{:.0f}/{:.0f}".format(obj.hp, obj.hp_max),
-                  (GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.x + GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.width / 2,
-                   GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.y - GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.h*2/7),
-                  constants.COLOR_RED, outline=True)
-
-        # Draw the units name
-        draw_text(SURFACE_MAIN, obj.name_instance,
-                  (GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.x + GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.width / 2,
-                   GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.y + GAME_MAP.grid[(int(obj.x), int(obj.y))].rect.h*4/5),
-                  constants.COLOR_PURPLE, outline=True)
-
-
-    # Draw the episode number
-    if False:
-        draw_text(SURFACE_MAIN, f'Episode: {episode_number}',
-                  (constants.EDGE_OFFSET,
-                   constants.HEX_SIZE * constants.MAP_HEIGHT - constants.EDGE_OFFSET + constants.HEX_SIZE / 2),
-                   constants.COLOR_LIGHT_GREY, outline=True, center=False, font_big = True)
-
-    # Draw the episode number
-    draw_text(SURFACE_MAIN, f'Turn: {TURN_NUMBER}',
-              (constants.EDGE_OFFSET,
-               constants.HEX_SIZE * constants.MAP_HEIGHT - constants.EDGE_OFFSET + constants.HEX_SIZE / 7),
-              constants.COLOR_LIGHT_GREY, outline=True, center=False, font_big = True)
-
-    # --- Update game display
-    pygame.display.flip()
-
-
-def draw_map(map_to_draw):
-
-    for loc in GAME_MAP.grid:
-        if SURFACE_MAIN is not None:
-            SURFACE_MAIN.blit(GAME_MAP.grid[loc].image, (GAME_MAP.grid[loc].rect.x, GAME_MAP.grid[loc].rect.y))
-            #SURFACE_MAIN.blit(GAME_MAP.grid[loc].image_outline, (GAME_MAP.grid[loc].rect.x, GAME_MAP.grid[loc].rect.y))
-
-            # Draw the distance between the city and the location on the map,
-            if False:
-                draw_text(SURFACE_MAIN, f'{hex_distance(loc, [3,3])}',
-                      (GAME_MAP.grid[loc].rect.x + int(constants.HEX_SIZE / 2),
-                       GAME_MAP.grid[loc].rect.y + int(constants.HEX_SIZE / 2)),
-                      constants.COLOR_BLACK)
-
-            # Draw the map location on the tile #f'{loc[0] - 3},{loc[1] - 3}, {-(loc[0]-3) -(loc[1]-3)}',
-            if False:
-                draw_text(SURFACE_MAIN, f'{loc[0]}, {loc[1]}',
-                      (GAME_MAP.grid[loc].rect.x + int(constants.HEX_SIZE / 2),
-                       GAME_MAP.grid[loc].rect.y + int(constants.HEX_SIZE / 2)),
-                      constants.COLOR_BLACK)
-
-def draw_text(display_surface, text_to_display, T_coordinates, text_color, outline = False, center = True, font_big = False):
-    """Definition takes in text and displays the text to the screen"""
-    # Outline feature from sloth at: https://stackoverflow.com/questions/54363047/how-to-draw-outline-on-the-fontpygame
-    _circle_cache = {}
-
-    def _circlepoints(r):
-        r = int(round(r))
-        if r in _circle_cache:
-            return _circle_cache[r]
-        x, y, e = r, 0, 1 - r
-        _circle_cache[r] = points = []
-        while x >= y:
-            points.append((x, y))
-            y += 1
-            if e < 0:
-                e += 2 * y - 1
-            else:
-                x -= 1
-                e += 2 * (y - x) - 1
-        points += [(y, x) for x, y in points if x > y]
-        points += [(-x, y) for x, y in points if x]
-        points += [(x, -y) for x, y in points if y]
-        points.sort()
-        return points
-
-    # --- Create an outline around the name text so you can read it!
-    if outline:
-        text_surf, text_rect = helper_text_objects(text_to_display, text_color, font_big=font_big)
-        text_surf.convert_alpha()
-        if center:
-            text_rect.center = T_coordinates
-        else:
-            text_rect.topleft = T_coordinates
-        w = text_surf.get_width() + 2 * constants.OUTLINE_SIZE
-        h = text_surf.get_height()
-        osurf = pygame.Surface((w, h + 2 * constants.OUTLINE_SIZE)).convert_alpha()
-        osurf.fill((0, 0, 0, 0))
-
-        surf = osurf.copy()
-        outline_surf, outline_rect = helper_text_objects(text_to_display, constants.COLOR_BLACK, font_big=font_big)
-        if center:
-            outline_rect.center = T_coordinates
-        else:
-            outline_rect.topleft = T_coordinates
-        osurf.blit(outline_surf.convert_alpha(), (0,0))
-
-        for dx, dy in _circlepoints(constants.OUTLINE_SIZE):
-            surf.blit(osurf, (dx + constants.OUTLINE_SIZE, dy + constants.OUTLINE_SIZE))
-
-        surf.blit(text_surf, (constants.OUTLINE_SIZE, constants.OUTLINE_SIZE))
-        display_surface.blit(surf, outline_rect)
-
-    else:
-        text_surf, text_rect = helper_text_objects(text_to_display, text_color, font_big=font_big)
-        text_surf.convert_alpha()
-        text_rect.center = T_coordinates
-        display_surface.blit(text_surf, text_rect)
-
-
-# ----------------------------------------------------------------------------------------------------------------------
-# ----------------------------------------------------------------------------------------------------------------------
-#
-# Helper objects
-#
-# ----------------------------------------------------------------------------------------------------------------------
-# ----------------------------------------------------------------------------------------------------------------------
-
-def helper_text_objects(incoming_text,
-                        incoming_color,
-                        font_big = False):
-    if font_big:
-        Text_surface = constants.FONT_BIG.render(incoming_text, True, incoming_color)
-    else:
-        Text_surface = constants.FONT_DEBUG_MESSAGE.render(incoming_text, True, incoming_color)
-
-    return Text_surface, Text_surface.get_rect()
-
-def hex_coords(obj1):
-    """This definition will find out how far obj1 is from obj2, using the axial coordinte system"""
-    obj1_cube = []
-    if obj1[1] % 2 == 0:
-        obj1_cube.append(obj1[0] - obj1[1] / 2)
-    else:
-        obj1_cube.append(obj1[0] - (obj1[1] - 1) / 2)
-    obj1_cube.append(-obj1_cube[0] - obj1[1])
-    obj1_cube.append(obj1[1])
-    return obj1_cube
-
-def hex_distance(obj1, obj2):
-    """This definition will find out how hard obj1 is from obj2"""
-
-    obj1_coords = hex_coords(obj1)
-    obj2_coords = hex_coords(obj2)
-
-    return max([abs(obj1_coords[0] - obj2_coords[0]),
-                abs(obj1_coords[1] - obj2_coords[1]),
-                abs(obj1_coords[2] - obj2_coords[2])])
-
-#   _______      ___      .___  ___.  _______
-#  /  _____|    /   \     |   \/   | |   ____|
-# |  |  __     /  ^  \    |  \  /  | |  |__
-# |  | |_ |   /  /_\  \   |  |\/|  | |   __|
-# |  |__| |  /  _____  \  |  |  |  | |  |____
-#  \______| /__/     \__\ |__|  |__| |_______|
-class Game():
-    def __init__(self,
-                 human=False,
-                 ml_ai=False,
-                 render = False):
-        self.human = human
-        self.ml_ai = ml_ai
+class Game:
+    def __init__(self, human=False, ml_ai=False, render=False, config=None, seed=None):
+        self.config = config or GameConfig()
+        self.human, self.ml_ai, self.render = human, ml_ai, render
+        self.rng = random.Random(seed)
+        self.unit_types = tuple(self.config.unit_types or ('warrior',) * self.config.unit_count)
+        self.unit_directions = [constants.DIRECTIONS + (('SHOOT',) if kind == 'archer' else ())
+                                for kind in self.unit_types]
+        self.actions = tuple(itertools.product(*self.unit_directions))
+        self.action_count = len(self.actions)
+        self._action_index = {a: i for i, a in enumerate(self.actions)}
+        self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
+                                   + ','.join(self.unit_types))
+        self._renderer = None
         self.quit = False
-        self.render = render
+        self.units = []
+        self.city = None
+        self.events = []
+        self.last_info = {'outcome': 'ongoing', 'events': []}
+        self.turn_number = 0
+        self._done = False
+        self._valid_cache_key = None
 
-        global GAME_OBJECTS
+    @property
+    def objects(self):
+        return self.units + [self.city] if self.city is not None else self.units
 
-        # initialize pygame
-        if self.render or self.human:
-            pygame.init()
+    def reset(self, seed=None):
+        if seed is not None:
+            self.rng.seed(seed)
+        c = self.config
+        city_pos = tuple(c.city_position or (c.width // 2, c.height // 2))
+        self.map = HexMap(c.height, c.width)
+        # Keep enough connected grassland for starting units and a possible siege.
+        for _ in range(100):
+            for cell in self.map.grid.values():
+                draw = self.rng.random()
+                terrain = ('MOUNTAIN' if draw < c.mountain_density else
+                           'FOREST' if draw < c.mountain_density + c.forest_density else 'GRASSLAND')
+                cell.set_terrain(terrain)
+            self.map.grid[city_pos].set_terrain('GRASSLAND')
+            component = self.map.reachable(city_pos)
+            adjacent = self.map.grid[city_pos].get_neighbors(self.map.grid)
+            if len(component) >= c.unit_count + 1 and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3):
+                break
+        else:
+            for cell in self.map.grid.values():
+                cell.set_terrain('GRASSLAND')
+            component = self.map.reachable(city_pos)
+        start_positions = self.rng.sample(sorted(component - {city_pos}), c.unit_count)
+        strengths = c.unit_strengths or tuple(12 if t == 'archer' else 20 for t in self.unit_types)
+        names = ('Otto', 'Fynn', 'Victor', 'Ada')
+        self.units = [C_Unit(*pos, name_instance=names[i], strength=strengths[i], env=self,
+                             unit_type=self.unit_types[i],
+                             strength_ranged=20 if self.unit_types[i] == 'archer' else 0)
+                      for i, pos in enumerate(start_positions)]
+        self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
+                           wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
+                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self)
+        self.turn_number = 0
+        self.events = []
+        self.last_info = {'outcome': 'ongoing', 'events': []}
+        self._done = self.quit = False
+        self._valid_cache_key = None
+        self._path_costs = None
+        return self.get_observation()
 
-    def game_main_loop(self,
-                       action=0):
-        """In this function we loop the main game."""
-        game_quit = False
+    def game_initialize(self, ep_number=0, seed=None):
+        self.episode_number = ep_number
+        return self.reset(seed)
 
-        # --- player action definition
-        player_action = 'no-action'
+    def occupant(self, position, exclude=None):
+        return next((obj for obj in self.objects if obj is not exclude
+                     and obj.alive and obj.position == tuple(position)), None)
 
-        while not game_quit:
+    def valid_actions(self):
+        """Legal joint actions account for moves executed earlier in the turn."""
+        if self.city is None:
+            raise RuntimeError('Call reset before using the environment')
+        terrain = tuple(cell.terrain_type for cell in self.map.grid.values())
+        key = (tuple((u.position, u.alive) for u in self.units), self.city.position, terrain)
+        if key == self._valid_cache_key:
+            return list(self._valid_cache)
+        result = []
+        occupied = {u.position for u in self.units if u.alive}
 
-            # --- handle player input
-            if self.human:
-                player_action = self.game_handle_keys_human(GAME_OBJECTS[0])
+        def visit(index, action, locations):
+            if index == len(self.units):
+                result.append(self._action_index[tuple(action)])
+                return
+            unit = self.units[index]
+            if not unit.alive:
+                visit(index + 1, action + ['SPACE'], locations)
+                return
+            remaining = locations - {unit.position}
+            for direction in self.unit_directions[index]:
+                if direction == 'SHOOT':
+                    if self.city.alive and hex_distance(unit.position, self.city.position) <= unit.attack_range:
+                        visit(index + 1, action + [direction], locations)
+                    continue
+                dx, dy = constants.movement_delta(direction, unit.y)
+                destination = (unit.x + dx, unit.y + dy)
+                cell = self.map.grid.get(destination)
+                if cell is None or cell.block_path or destination in remaining:
+                    continue
+                final = unit.position if destination == self.city.position else destination
+                visit(index + 1, action + [direction], remaining | {final})
 
-            if player_action == 'QUIT':
-                game_quit = True
+        visit(0, [], occupied)
+        self._valid_cache_key, self._valid_cache = key, result
+        return list(result)
 
+    def action_mask(self):
+        mask = np.zeros(self.action_count, dtype=bool)
+        mask[self.valid_actions()] = True
+        return mask
 
-            # --- draw the game
-            if self.render:
-                draw_game()
+    def encode_action(self, directions):
+        try:
+            return self._action_index[tuple(directions)]
+        except KeyError as exc:
+            raise ValueError('Expected one valid direction per unit') from exc
 
-            #CLOCK.tick(constants.GAME_FPS)
+    def move_unit(self, unit, delta):
+        if not unit.alive or not self.city.alive:
+            return
+        dx, dy = delta
+        destination = unit.x + dx, unit.y + dy
+        cell = self.map.grid.get(destination)
+        if cell is None or cell.block_path:
+            unit.status = 'hit wall'
+            unit._event('invalid_move')
+            return
+        target = self.occupant(destination, exclude=unit)
+        if target is self.city:
+            damage_out, damage_taken = attack(unit, self.city)
+            unit._event('attacked')
+            unit.take_damage(damage_taken)
+            self.city.take_damage(damage_out, aggressor_alive=unit.alive)
+            if unit.alive:
+                unit.status = 'attacked'
+        elif target is not None:
+            unit._event('blocked_move')
+        elif dx == 0 and dy == 0:
+            healed = min(10, unit.hp_max - unit.hp)
+            if healed > 0:
+                unit.hp += healed
+                unit.status = 'healed'
+                unit._event('unit_healed', amount=healed)
+        else:
+            distance_before = hex_distance(unit.position, self.city.position)
+            unit.x, unit.y = destination
+            unit.status = 'alive'
+            unit._event('moved', progress=distance_before - hex_distance(destination, self.city.position),
+                        cost=cell.movement_cost)
 
-        if self.render:
-            pygame.quit()
+    def city_turn(self):
+        if not self.city.alive:
+            return
+        if self.city.ranged_combat:
+            targets = [u for u in self.units if u.alive and hex_distance(u.position, self.city.position) <= 2]
+            if targets:
+                target = self.rng.choice(targets)
+                damage, _ = attack(self.city, target, ranged=True)
+                target.take_damage(damage)
+        if self.city.heal:
+            besiegers = sum(u.alive and hex_distance(u.position, self.city.position) == 1 for u in self.units)
+            if besiegers < min(3, self.config.unit_count):
+                healed = min(10, self.city.hp_max - self.city.hp)
+                if healed > 0:
+                    self.city.hp += healed
+                    self.city.status = 'healed'
+                    self.city._event('city_healed', amount=healed)
 
-        exit()
+    def shoot(self, unit):
+        if not unit.alive or not self.city.alive:
+            return
+        if unit.unit_type != 'archer' or hex_distance(unit.position, self.city.position) > unit.attack_range:
+            unit._event('invalid_move')
+            return
+        damage, _ = attack(unit, self.city, ranged=True)
+        unit._event('ranged_attack')
+        # Capturing requires a melee action; a ranged strike leaves at least 1 HP.
+        self.city.take_damage(damage, aggressor_alive=False)
 
-    def step(self,
-             action=0):
-        """In this function we take a step in the main game."""
-
-
-        global GAME_OBJECTS, TURN_NUMBER
-
-        TURN_NUMBER += 1
-
-        # --- draw the game
-        if self.render:
-            draw_game()
-
-        # --- player action definition
-        player_action = 'no-action'
-        game_quit = False
-        reward = 0
-
-        # --- Check for the city location, there has to be a better way...
-        # maybe have the city not under GAME_OBJECTS?
-        for obj in enumerate(GAME_OBJECTS):
-            if obj[1].__class__ == C_City:
-                city_loc = obj[0]
-
-        # --- Human loop to control only one unit
-        if self.human and not game_quit:
-            # --- Loop over each object to take the turn
-            for obj in GAME_OBJECTS:
-                if obj.__class__ == C_Unit:
-                    if obj.status != 'dead':
-                        if self.human and not game_quit:
-                            waiting_for_input = True
-                            while waiting_for_input:
-                                # --- handle player input
-                                player_action = self.game_handle_keys_human(obj)
-                                if player_action == 'player-moved':
-                                    waiting_for_input = False
-
-                                if player_action == 'QUIT':
-                                    game_quit = True
-                                    waiting_for_input = False
-                            if self.render:
-                                draw_game()
-
-                        # --- Get rewards after each turn, to account for attacking the city each turn
-                        reward += self.get_rewards()
-
-                        # --- Check to see if the city is dead or not
-                        if GAME_OBJECTS[city_loc].hp <= 0:
-                            game_quit = True
-                            break
-
-
-        elif self.ml_ai and not game_quit:
-            # --- First perform actions by the units
-            player_action = self.game_handle_moves_ml_ai(action)
-
-            if self.render:
-                draw_game()
-
-            # --- Check to see if the city is dead or not
-            if GAME_OBJECTS[city_loc].hp <= 0:
-                game_quit = True
-
-
-        if player_action == 'QUIT':
-            game_quit = True
-
-        # City takes a turn once the HUMAN or ML_AI moves
-        elif player_action != 'no-action':
-            for obj in GAME_OBJECTS:
-                if obj.__class__ == C_City:
-                    obj.take_turn()
-
-        # --- Get rewards after the city attacks, in case a unit dies
-        reward += self.get_rewards()
-
-        # --- Subtract 1 for the turn penalty
-        reward -= 1
-
-        #CLOCK.tick(constants.GAME_FPS)
-
-        return self.get_observation(), reward, game_quit
+    def _outcome(self):
+        if not self.city.alive or self.city.hp <= 0:
+            return 'win'
+        if not any(u.alive and u.hp > 0 for u in self.units):
+            return 'loss'
+        return 'ongoing'
 
     def get_rewards(self):
-        '''This definition will return the reward status for each step as
-        well as the location of the city relative to the units'''
-        global GAME_OBJECTS
+        """Reward only the events of the most recent turn; reading is harmless."""
+        reward = -.05
+        for event in self.events:
+            kind = event['type']
+            amount = event.get('amount', 0)
+            if kind == 'city_damaged':
+                reward += 3 * amount / self.city.hp_max
+            elif kind == 'wall_damaged':
+                reward += 2 * amount / max(1, self.city.wall_hp_max)
+            elif kind == 'city_healed':
+                reward -= 3 * amount / self.city.hp_max
+            elif kind == 'unit_damaged':
+                reward -= .5 * amount / 100
+            elif kind == 'unit_died':
+                reward -= 5
+            elif kind == 'unit_healed':
+                reward += .02 * amount / 100
+            elif kind in ('invalid_move', 'blocked_move'):
+                reward -= .2
+            elif kind == 'moved':
+                reward += .05 * event['progress'] - .01 * (event['cost'] - 1)
+        if self.last_info['outcome'] == 'win':
+            reward += 10
+        elif self.last_info['outcome'] == 'loss':
+            reward -= 10
+        return float(reward)
 
-        reward = 0
-
-        # --- Find the city location in GAME_OBJECTS
-        for obj in enumerate(GAME_OBJECTS):
-            if obj[1].__class__ == C_City:
-                city_loc = obj[0]
-                if obj[1].status == 'dead':
-                    reward += 3
-                    obj[1].status = None
-                elif obj[1].status == 'took damage':
-                    reward += 0.5
-                    obj[1].status = obj[1].status_default
-                elif obj[1].status == 'healed':
-                    reward -= 0.3
-                    obj[1].status = obj[1].status_default
-
-
-        # --- REWARDS for unit specific actions
-        for obj in GAME_OBJECTS:
-            if obj.__class__ == C_Unit:
-                #print('BEFORE: {} status of {}'.format(obj.name_instance, obj.status))
-                if obj.status == 'dead':
-                    reward -= 10
-                    obj.status = None
-                elif obj.status == 'took damage':
-                    reward += 0
-                    obj.status = obj.status_default
-                elif obj.status == 'hit wall':
-                    reward -= 1
-                    obj.status = obj.status_default
-                elif obj.status == 'healed':
-                    reward += 0.1
-                    obj.status = obj.status_default
-                elif obj.status == 'attacked':
-                    reward += 0.2
-                    obj.status = obj.status_default
-
-
-                # --- Rewards for how far they are away from the city!
-                # - This is a linear reward, 0 for being next to city, -0.5 for maximum distance, per unit
-                dist = hex_distance([obj.x, obj.y], [GAME_OBJECTS[city_loc].x,GAME_OBJECTS[city_loc].y])
-                dist_reward = float(dist - 1) / (max([constants.MAP_HEIGHT, constants.MAP_WIDTH]) - 2)
-                reward -= dist_reward / 0.5
-
-
-        return reward
+    def step(self, action=0):
+        if self.city is None:
+            raise RuntimeError('Call reset before step')
+        if isinstance(action, bool) or not isinstance(action, (int, np.integer)) or not 0 <= action < self.action_count:
+            raise ValueError(f'action must be an integer in [0, {self.action_count})')
+        if self._done:
+            return self.get_observation(), 0.0, True
+        self.events = []
+        self.turn_number += 1
+        if self._outcome() == 'ongoing':
+            for unit, direction in zip(self.units, self.actions[action]):
+                if direction == 'SHOOT':
+                    self.shoot(unit)
+                else:
+                    self.move_unit(unit, constants.movement_delta(direction, unit.y))
+                if not self.city.alive:
+                    break
+            if self._outcome() == 'ongoing':
+                self.city_turn()
+        outcome = self._outcome()
+        self._done = outcome != 'ongoing'
+        self.last_info = {'outcome': outcome, 'events': [event.copy() for event in self.events],
+                          'turn': self.turn_number}
+        reward = self.get_rewards()
+        return self.get_observation(), reward, self._done
 
     def get_observation(self):
-        '''Definition returns the known universe
-        positions of each unit and each city
-        TODO:
-        1) current health of each unit/city
-        2) current strength of each unit/city
-        '''
+        if self.city is None:
+            raise RuntimeError('Call reset before get_observation')
+        c = self.config
+        city = self.city
+        values = [city.x / (c.width - 1), city.y / (c.height - 1),
+                  city.hp / city.hp_max, city.wall_hp / 1000,
+                  city.strength / 100, city.strength_ranged / 100, float(city.heal)]
+        for unit in self.units:
+            values.extend([unit.x / (c.width - 1), unit.y / (c.height - 1),
+                           unit.hp / unit.hp_max, float(unit.alive), unit.strength / 100,
+                           float(unit.y % 2), unit.strength_ranged / 100, unit.attack_range / 2])
+        values.extend(TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
+                      for y in range(c.height) for x in range(c.width))
+        return np.asarray(values, dtype=float)
 
-        global GAME_OBJECTS
+    def _distances(self):
+        key = (self.city.position, tuple(cell.terrain_type for cell in self.map.grid.values()))
+        if self._path_costs is not None and self._path_costs[0] == key:
+            return self._path_costs[1]
+        costs = {self.city.position: 0}
+        pending = [(0, self.city.position)]
+        while pending:
+            cost, pos = heapq.heappop(pending)
+            if cost != costs[pos]:
+                continue
+            for neighbor in self.map.grid[pos].get_neighbors(self.map.grid):
+                if neighbor.block_path:
+                    continue
+                new_cost = cost + self.map.grid[pos].movement_cost
+                if new_cost < costs.get(neighbor.index, float('inf')):
+                    costs[neighbor.index] = new_cost
+                    heapq.heappush(pending, (new_cost, neighbor.index))
+        self._path_costs = key, costs
+        return costs
 
-        # --- Find the distance between the unit and the city
-        loc = -1 # position around the city -1 if not by, 0/8, 1/8, ..., 8/8 otherwise
-        city_loc = -1
-
-        observation = [] # city health, dx unit 1, dy unit 1, hp_norm unit 1, dx unit 2, dy unit 2, hp_nomr unit 2, ...
-
-        # --- Find the city location in GAME_OBJECTS
-        for obj in enumerate(GAME_OBJECTS):
-            if obj[1].__class__ == C_City:
-                city_loc = obj[0]
-                observation.append(obj[1].hp / obj[1].hp_max)
-
-        # --- Find the space between each unit and the city
-        for obj in GAME_OBJECTS:
-            if obj.__class__ == C_Unit:
-                dx_norm = (GAME_OBJECTS[city_loc].x - obj.x) / constants.MAP_WIDTH
-                dy_norm = (GAME_OBJECTS[city_loc].y - obj.y) / constants.MAP_HEIGHT
-                observation.append(dx_norm)
-                observation.append(dy_norm)
-
-                # --- Find the positional location around the city, not implimented!
-                if np.abs(GAME_OBJECTS[city_loc].x - obj.x) <= 1 and False:
-
-                    if GAME_OBJECTS[city_loc].x - obj.x > 0:
-                        if GAME_OBJECTS[city_loc].y - obj.y > 0: loc = 1
-                        if GAME_OBJECTS[city_loc].y - obj.y == 0: loc = 8
-                        if GAME_OBJECTS[city_loc].y - obj.y < 0: loc = 7
-
-                    if GAME_OBJECTS[city_loc].x - obj.x == 0:
-                        if GAME_OBJECTS[city_loc].y - obj.y > 0: loc = 2
-                        if GAME_OBJECTS[city_loc].y - obj.y == 0: loc = 91
-                        if GAME_OBJECTS[city_loc].y - obj.y < 0: loc = 6
-
-                    if GAME_OBJECTS[city_loc].x - obj.x < 0:
-                        if GAME_OBJECTS[city_loc].y - obj.y > 0: loc = 3
-                        if GAME_OBJECTS[city_loc].y - obj.y == 0: loc = 4
-                        if GAME_OBJECTS[city_loc].y - obj.y < 0: loc = 5
-                    if loc != -1:
-                        loc /= 8
-
-                # --- Normalized HP
-                observation.append(obj.hp / obj.hp_max)
-
-        return np.array(observation)
+    def guided_action(self, rng=None):
+        rng = rng or self.rng
+        costs = self._distances()
+        scores = []
+        for action in self.valid_actions():
+            score = 0
+            for unit, direction in zip(self.units, self.actions[action]):
+                if not unit.alive:
+                    continue
+                if direction == 'SHOOT':
+                    score += costs.get(unit.position, 10000) - 2
+                    if self.city.hp <= 1 and self.city.wall_hp == 0:
+                        score += 5
+                    continue
+                dx, dy = constants.movement_delta(direction, unit.y)
+                destination = unit.x + dx, unit.y + dy
+                score += costs.get(destination, 10000)
+                if direction == 'SPACE':
+                    score += -2 if unit.hp < .35 * unit.hp_max else .3
+            scores.append((score, action))
+        best = min(score for score, _ in scores)
+        return rng.choice([action for score, action in scores if score == best])
 
     def get_current_state(self):
-        """Use this to get unit position as well as health, used for rendering in Blender"""
-        global GAME_OBJECTS
-        temp_data = {}
-        for obj in GAME_OBJECTS:
-            temp_data[obj.name_instance] = {}
-            temp_data[obj.name_instance]['health'] = obj.hp
-            temp_data[obj.name_instance]['position'] = [obj.x, obj.y]
+        return {obj.name_instance: {'health': obj.hp, 'position': [obj.x, obj.y],
+                                   'alive': obj.alive} for obj in self.objects}
 
-        return temp_data
+    def render_frame(self, delay_ms=0):
+        if not self.render:
+            return True
+        if self._renderer is None:
+            from renderer import Renderer
+            self._renderer = Renderer(self)
+        self.quit = not self._renderer.frame(delay_ms)
+        return not self.quit
 
+    def close(self):
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
 
-    def game_initialize(self,
-                        ep_number = 0):
-        """This function initializes the main window, and pygame"""
-
-        global SURFACE_MAIN, GAME_MAP, PLAYER, ENEMY, GAME_OBJECTS, episode_number, TURN_NUMBER#, CLOCK
-        #self.episode_number = episode_number
-
-        episode_number = ep_number
-        TURN_NUMBER = 0
-        #CLOCK = pygame.time.Clock()
-
-        # --- Set sufrace dimensions
-        if self.render:
-            SURFACE_MAIN = pygame.display.set_mode((constants.MAP_WIDTH
-                                                    * constants.HEX_SIZE
-                                                    + int(constants.HEX_SIZE / 2)
-                                                    + constants.EDGE_OFFSET * 2,
-                                                    (constants.MAP_HEIGHT
-                                                     * constants.HEX_SIZE)
-                                                    - (int(constants.MAP_HEIGHT / 2)
-                                                       * int(constants.HEX_SIZE / 2))
-                                                    + int(constants.HEX_SIZE / 4)
-                                                    + constants.EDGE_OFFSET * 2))#, pygame.FULLSCREEN)
-            #SURFACE_MAIN = pygame.display.set_mode((1920,1080), pygame.FULLSCREEN)
-        else:
-            SURFACE_MAIN = None
-
-        # --- Create the game map. Fills the dictionary with values for each tile
-        GAME_MAP = map_create()
-
-        SPRITE_LOCATIONS = random.sample(constants.HEX_LOCATIONS, 3)
-
-        PLAYER = C_Unit(SPRITE_LOCATIONS[0][0],
-                        SPRITE_LOCATIONS[0][1],
-                        constants.S_PLAYER,
-                        "Otto",
-                        strength=20,
-                        hp=100,
-                        hp_max=100)
-
-        PLAYER2 = C_Unit(SPRITE_LOCATIONS[1][0],
-                        SPRITE_LOCATIONS[1][1],
-                        constants.S_PLAYER,
-                        "Fynn",
-                        strength=20,
-                        hp=100,
-                        hp_max=100)
-
-        PLAYER3 = C_Unit(SPRITE_LOCATIONS[2][0],
-                        SPRITE_LOCATIONS[2][1],
-                        constants.S_PLAYER,
-                        "Victor",
-                        strength=20,
-                        hp=100,
-                        hp_max=100)
-
-        CITY = C_City(constants.LOC_CITY[0],
-                      constants.LOC_CITY[1],
-                      constants.S_CITY,
-                      "Ottertopia",
-                      hp=100,
-                      strength=28,
-                      ranged_combat=False,
-                      heal=True)
-
-        # Must have units first then the city last!!!
-        GAME_OBJECTS = [PLAYER, PLAYER2, PLAYER3, CITY]
+    def game_main_loop(self, action=0):
+        """Interactive human mode: select units with Tab and use Q/E/A/D/Z/X."""
+        self.render = True
+        if self.city is None:
+            self.reset()
+        from renderer import Renderer
+        self._renderer = Renderer(self)
+        self._renderer.human_loop()
+        self.close()
 
 
-    def game_handle_keys_human(self,
-                               object):
-
-        # --- check to see if the y coordinate is even or odd
-        if object.y % 2 == 0:
-            parity = 'EVEN'
-            even = True
-        else:
-            parity = 'ODD'
-            even = False
-
-        # get player input
-        events_list = pygame.event.get()
-
-        # process input
-        for event in events_list:  # loop through all events that have happened
-            if event.type == pygame.QUIT or event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                return 'QUIT'
-
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_q:
-                    object.move(constants.MOVEMENT_DIR['NW'][parity][0], constants.MOVEMENT_DIR['NW'][parity][1])
-                    return "player-moved"
-
-                if event.key == pygame.K_a:
-                    object.move(constants.MOVEMENT_DIR['W'][parity][0], constants.MOVEMENT_DIR['W'][parity][1])
-                    return "player-moved"
-
-                if event.key == pygame.K_z:
-                    object.move(constants.MOVEMENT_DIR['SW'][parity][0], constants.MOVEMENT_DIR['SW'][parity][1])
-                    return "player-moved"
-
-                if event.key == pygame.K_e:
-                    object.move(constants.MOVEMENT_DIR['NE'][parity][0], constants.MOVEMENT_DIR['NE'][parity][1])
-                    return "player-moved"
-
-                if event.key == pygame.K_d:
-                    object.move(constants.MOVEMENT_DIR['E'][parity][0], constants.MOVEMENT_DIR['E'][parity][1])
-                    return "player-moved"
-
-                if event.key == pygame.K_x:
-                    object.move(constants.MOVEMENT_DIR['SE'][parity][0], constants.MOVEMENT_DIR['SE'][parity][1])
-                    return "player-moved"
-
-                if event.key == pygame.K_SPACE:
-                    if object.hp < PLAYER.hp_max:
-                        object.hp += 10
-                        if object.hp > object.hp_max:
-                            object.hp = object.hp_max
-                        object.status = 'healed'
-                    return "player-moved"
-
-        return 'no-action'
-
-    def game_handle_moves_ml_ai(self,
-                                action):
-
-        global GAME_OBJECTS
-
-        # --- determine the number of units on the battlefield
-        if len(GAME_OBJECTS) - 1 == 1:
-            print('in one')
-            # --- Determine the parity
-            if GAME_OBJECTS[0].y % 2 == 0:
-                parity = 'EVEN'
-            else:
-                parity = 'ODD'
-
-            # --- Make a movement
-            direction = constants.MOVEMENT_ONE_UNIT[action]
-            GAME_OBJECTS[0].move(constants.MOVEMENT_DIR[direction][parity][0],
-                                 constants.MOVEMENT_DIR[direction][parity][1])
-            return "player-moved"
-
-
-
-        if len(GAME_OBJECTS) - 1 == 2:
-            # --- Determine the parity
-            if GAME_OBJECTS[0].y % 2 == 0:
-                parity = 'EVEN'
-            else:
-                parity = 'ODD'
-            # --- Determine the parity
-            if GAME_OBJECTS[1].y % 2 == 0:
-                parity2 = 'EVEN'
-            else:
-                parity2 = 'ODD'
-
-            # --- Make a movement
-            direction = constants.MOVEMENT_TWO_UNITS[action]
-            GAME_OBJECTS[0].move(constants.MOVEMENT_DIR[direction[0]][parity][0],
-                                 constants.MOVEMENT_DIR[direction[0]][parity][1])
-            GAME_OBJECTS[1].move(constants.MOVEMENT_DIR[direction[1]][parity2][0],
-                                 constants.MOVEMENT_DIR[direction[1]][parity2][1])
-            return "player-moved"
-
-
-        # --- Movement commands for three units
-        if len(GAME_OBJECTS) - 1 == 3:
-            # --- Determine the parity
-            if GAME_OBJECTS[0].y % 2 == 0:
-                parity = 'EVEN'
-            else:
-                parity = 'ODD'
-            # --- Determine the parity
-            if GAME_OBJECTS[1].y % 2 == 0:
-                parity2 = 'EVEN'
-            else:
-                parity2 = 'ODD'
-            # --- Determine the parity
-            if GAME_OBJECTS[2].y % 2 == 0:
-                parity3 = 'EVEN'
-            else:
-                parity3 = 'ODD'
-            # --- Make a movement
-            direction = constants.MOVEMENT_THREE_UNITS[action]
-            GAME_OBJECTS[0].move(constants.MOVEMENT_DIR[direction[0]][parity][0],
-                                 constants.MOVEMENT_DIR[direction[0]][parity][1])
-            GAME_OBJECTS[1].move(constants.MOVEMENT_DIR[direction[1]][parity2][0],
-                                 constants.MOVEMENT_DIR[direction[1]][parity2][1])
-            GAME_OBJECTS[2].move(constants.MOVEMENT_DIR[direction[2]][parity3][0],
-                                 constants.MOVEMENT_DIR[direction[2]][parity3][1])
-            return "player-moved"
-
-
-
-if __name__ == "__main__":
-    env = Game(human = True, render = True)
-    env.game_initialize()
-    env.game_main_loop(1)
+if __name__ == '__main__':
+    env = Game(human=True, render=True)
+    env.reset()
+    env.game_main_loop()

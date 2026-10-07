@@ -1,251 +1,428 @@
-"""Train and evaluate a Q-learning agent in the Civ-like environment."""
+"""Reproducible training, checkpointing, and policy comparisons for ML_CIV6."""
 
 import argparse
+import csv
+import html
+import json
 import random
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-import numpy as np
-
-import constants
 import game
 from learning_ai import QLearningAgent
 
 
-ACTION_COUNT = len(constants.MOVEMENT_THREE_UNITS)
-ACTION_INDEX = {tuple(action): index for index, action in enumerate(constants.MOVEMENT_THREE_UNITS)}
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
+DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
+METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
+                 "random_actions", "policy_actions", "q_table_size", "city_strength")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a Q-learning AI for ML_CIV6.")
-    parser.add_argument("--episodes", type=int, default=1000, help="training episodes to run")
-    parser.add_argument("--max-steps", type=int, default=80, help="maximum turns per episode")
-    parser.add_argument("--eval-episodes", type=int, default=5, help="greedy evaluation episodes after training")
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH, help="where to load/save the Q-table")
-    parser.add_argument("--fresh", action="store_true", help="ignore any existing saved model")
-    parser.add_argument("--no-save", action="store_true", help="do not save the trained Q-table")
-    parser.add_argument("--render", action="store_true", help="render evaluation episodes")
-    parser.add_argument("--render-training", action="store_true", help="render training episodes")
-    parser.add_argument("--render-delay-ms", type=int, default=0, help="delay between rendered turns")
-    parser.add_argument("--seed", type=int, default=7, help="random seed")
-    parser.add_argument("--learning-rate", type=float, default=0.1, help="Q-learning update rate")
-    parser.add_argument("--discount-factor", type=float, default=0.95, help="future reward discount")
-    parser.add_argument("--epsilon", type=float, default=None, help="starting exploration rate")
-    parser.add_argument("--epsilon-decay", type=float, default=0.995, help="episode exploration decay")
-    parser.add_argument("--epsilon-min", type=float, default=0.05, help="minimum exploration rate")
-    parser.add_argument("--state-precision", type=int, default=None, help="observation discretization precision")
-    parser.add_argument("--initial-q", type=float, default=None, help="initial Q-value for unseen state-actions")
-    parser.add_argument("--guided-exploration", type=float, default=0.35, help="chance epsilon exploration uses guidance")
-    parser.add_argument("--no-guidance", action="store_true", help="disable heuristic guidance for unseen states")
-    parser.add_argument("--log-every", type=int, default=50, help="training progress interval")
-    return parser.parse_args()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--episodes", type=int, default=1000, help="additional training episodes")
+    parser.add_argument("--max-steps", type=int, help="turn limit (default: 80, or checkpoint value)")
+    parser.add_argument("--eval-episodes", type=int, default=5)
+    parser.add_argument("--eval-seed", type=int, default=100007, help="first fixed policy comparison seed")
+    parser.add_argument("--eval-policies", nargs="+", choices=("learned", "heuristic", "random"),
+                        default=["learned", "heuristic", "random"])
+    parser.add_argument("--eval-guidance", action="store_true", help="also measure the guided policy")
+    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--fresh", action="store_true")
+    parser.add_argument("--no-save", action="store_true")
+    parser.add_argument("--checkpoint-every", type=int, default=50,
+                        help="save latest model every N absolute episodes; 0 disables periodic saves")
+    parser.add_argument("--save-best", action="store_true", help="save best model using separate validation games")
+    parser.add_argument("--validation-episodes", type=int, help="best model validation games (default: 20)")
+    parser.add_argument("--validation-seed", type=int, help="first separate validation seed (default: 200007)")
+    parser.add_argument("--metrics-dir", type=Path, default=Path("training_metrics"))
+    parser.add_argument("--render", action="store_true", help="render evaluation games")
+    parser.add_argument("--render-training", action="store_true")
+    parser.add_argument("--render-delay-ms", type=int, default=0)
+    parser.add_argument("--seed", type=int, help="training seed (default: 7, or checkpoint value)")
+    for flag, kind in (("learning-rate", float), ("discount-factor", float), ("epsilon", float),
+                       ("epsilon-decay", float), ("epsilon-min", float), ("state-precision", int),
+                       ("initial-q", float)):
+        parser.add_argument("--" + flag, type=kind)
+    parser.add_argument("--guided-exploration", type=float,
+                        help="guided fraction of epsilon exploration (default: 0.35)")
+    parser.add_argument("--no-guidance", action="store_true", help="train without heuristic fallback")
+    parser.add_argument("--log-every", type=int, default=50)
+    for flag, kind in (("width", int), ("height", int), ("city-strength", float), ("wall-hp", float),
+                       ("ranged-strength", float), ("mountain-density", float), ("forest-density", float)):
+        parser.add_argument("--" + flag, type=kind)
+    parser.add_argument("--unit-count", type=int, choices=range(1, 5))
+    parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
+    parser.add_argument("--no-city-healing", action="store_true")
+    parser.add_argument("--unit-strengths", type=float, nargs="+")
+    parser.add_argument("--unit-types", choices=("warrior", "archer"), nargs="+")
+    parser.add_argument("--difficulty", choices=tuple(DIFFICULTY_STRENGTHS))
+    parser.add_argument("--curriculum-episodes", type=int,
+                        help="ramp city strength from 18 to selected difficulty over N absolute episodes")
+    args = parser.parse_args(argv)
+    for name in ("episodes", "eval_episodes", "checkpoint_every", "log_every", "render_delay_ms"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    for name in ("max_steps", "state_precision", "width", "height", "validation_episodes"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.curriculum_episodes is not None and args.curriculum_episodes < 0:
+        parser.error("--curriculum-episodes must be non-negative")
+    for name in ("epsilon", "epsilon_decay", "epsilon_min", "guided_exploration", "discount_factor",
+                 "mountain_density", "forest_density"):
+        value = getattr(args, name)
+        if value is not None and not 0 <= value <= 1:
+            parser.error(f"--{name.replace('_', '-')} must lie between 0 and 1")
+    if args.learning_rate is not None and not 0 < args.learning_rate <= 1:
+        parser.error("--learning-rate must lie above 0 and at most 1")
+    return args
+
+
+def config_from_args(args, saved=None):
+    """Restore omitted scenario flags and reject accidental changes on resume."""
+    saved = saved or {}
+    values = asdict(game.GameConfig())
+    values.update(saved)
+    explicit = {}
+    for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
+                 "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty"):
+        value = getattr(args, name)
+        if value is not None:
+            explicit[name] = tuple(value) if name in ("city_position", "unit_strengths", "unit_types") else value
+    if args.no_city_healing:
+        explicit["city_heals"] = False
+    if args.difficulty is not None and args.city_strength is None:
+        explicit["city_strength"] = DIFFICULTY_STRENGTHS[args.difficulty]
+    elif not saved and args.city_strength is None:
+        values["city_strength"] = DIFFICULTY_STRENGTHS[values["difficulty"]]
+    for name, value in explicit.items():
+        old = values.get(name)
+        if name in ("city_position", "unit_strengths", "unit_types") and old is not None:
+            old = tuple(old)
+        if saved and old != value:
+            raise ValueError(f"--{name.replace('_', '-')} differs from the checkpoint; use --fresh for a new scenario")
+        values[name] = value
+    values["city_position"] = None if values["city_position"] is None else tuple(values["city_position"])
+    values["unit_strengths"] = tuple(values["unit_strengths"])
+    values["unit_types"] = tuple(values["unit_types"])
+    return game.GameConfig(**values)
+
+
+def _restore_setting(args, saved, name, default):
+    previous = saved.get(name, default)
+    value = getattr(args, name)
+    if value is not None and name in saved and value != previous:
+        raise ValueError(f"--{name.replace('_', '-')} differs from the checkpoint; use --fresh")
+    setattr(args, name, previous if value is None else value)
 
 
 def build_agent(args, rng):
-    if args.model_path.exists() and not args.fresh:
-        agent = QLearningAgent.load(args.model_path, rng=rng)
-        if agent.action_count != ACTION_COUNT:
-            raise ValueError(
-                f"Saved model has {agent.action_count} actions, but this game expects {ACTION_COUNT}."
-            )
-        if args.epsilon is not None:
-            agent.epsilon = args.epsilon
+    loaded = args.model_path.exists() and not args.fresh
+    agent = QLearningAgent.load(args.model_path, rng=rng) if loaded else None
+    saved = agent.training_state if loaded else {}
+    _restore_setting(args, saved, "seed", 7)
+    _restore_setting(args, saved, "max_steps", 80)
+    _restore_setting(args, saved, "curriculum_episodes", 0)
+    _restore_setting(args, saved, "guided_exploration", 0.35)
+    _restore_setting(args, saved, "validation_episodes", 20)
+    _restore_setting(args, saved, "validation_seed", 200007)
+    if saved.get("no_guidance") and not args.no_guidance:
+        args.no_guidance = True
+    elif saved and args.no_guidance != saved.get("no_guidance", False):
+        raise ValueError("--no-guidance differs from the checkpoint; use --fresh")
+    config = config_from_args(args, saved.get("config"))
+    env = game.Game(config=config, seed=args.seed, ml_ai=True, render=False)
+    try:
+        schema, size, action_count = env.observation_schema, len(env.reset(seed=args.seed)), env.action_count
+    finally:
+        env.close()
+    if loaded:
+        if agent.action_count != action_count or agent.observation_schema != schema or agent.observation_size != size:
+            raise ValueError("Checkpoint uses a different action/observation format; use --fresh to retrain")
+        if args.state_precision is not None and args.state_precision != agent.state_precision:
+            raise ValueError("State precision cannot change on resume; use --fresh")
+        for name in ("learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min", "initial_q"):
+            if getattr(args, name) is not None:
+                setattr(agent, name, getattr(args, name))
     else:
-        agent = QLearningAgent(
-            ACTION_COUNT,
-            learning_rate=args.learning_rate,
-            discount_factor=args.discount_factor,
-            epsilon=1.0 if args.epsilon is None else args.epsilon,
-            epsilon_decay=args.epsilon_decay,
-            epsilon_min=args.epsilon_min,
-            state_precision=8 if args.state_precision is None else args.state_precision,
-            initial_q=-100.0 if args.initial_q is None else args.initial_q,
-            rng=rng,
-        )
-
-    agent.learning_rate = args.learning_rate
-    agent.discount_factor = args.discount_factor
-    agent.epsilon_decay = args.epsilon_decay
-    agent.epsilon_min = args.epsilon_min
-    if args.state_precision is not None:
-        agent.state_precision = args.state_precision
-    if args.initial_q is not None:
-        agent.initial_q = args.initial_q
+        rng.seed(args.seed)
+        defaults = dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
+                        epsilon_min=0.05, state_precision=100, initial_q=-100.0)
+        options = {name: default if getattr(args, name) is None else getattr(args, name)
+                   for name, default in defaults.items()}
+        agent = QLearningAgent(action_count, rng=rng, observation_schema=schema, observation_size=size, **options)
+    args.config = config
     return agent
 
 
-def choose_guided_action(rng):
-    city = next(obj for obj in game.GAME_OBJECTS if obj.__class__ == game.C_City)
-    units = [obj for obj in game.GAME_OBJECTS if obj.__class__ == game.C_Unit]
-    directions = [choose_guided_direction(unit, city, rng) for unit in units]
-
-    while len(directions) < 3:
-        directions.append("SPACE")
-
-    return ACTION_INDEX[tuple(directions[:3])]
+def episode_config(args, absolute_episode):
+    if not args.curriculum_episodes:
+        return args.config
+    progress = min(1.0, absolute_episode / max(1, args.curriculum_episodes - 1))
+    start_strength = min(18.0, args.config.city_strength)
+    return replace(args.config, city_strength=start_strength + (args.config.city_strength - start_strength) * progress)
 
 
-def choose_guided_direction(unit, city, rng):
-    if not unit.alive:
-        return "SPACE"
+@dataclass
+class EpisodeResult:
+    reward: float
+    outcome: str
+    steps: int
+    guidance_actions: int = 0
+    random_actions: int = 0
+    policy_actions: int = 0
 
-    distance_to_city = game.hex_distance([unit.x, unit.y], [city.x, city.y])
-    if distance_to_city <= 1 and unit.hp / unit.hp_max < 0.35:
-        return "SPACE"
+    @property
+    def won(self):
+        return self.outcome == "win"
 
-    parity = "EVEN" if unit.y % 2 == 0 else "ODD"
-    candidates = []
-
-    for direction in constants.MOVEMENT_ONE_UNIT:
-        dx, dy = constants.MOVEMENT_DIR[direction][parity]
-        next_x = unit.x + dx
-        next_y = unit.y + dy
-
-        if direction == "SPACE":
-            score = distance_to_city + 0.25
-        elif (int(next_x), int(next_y)) not in game.GAME_MAP.grid:
-            score = 999.0
-        else:
-            score = float(game.hex_distance([next_x, next_y], [city.x, city.y]))
-            occupant = game.map_check_for_creatures(next_x, next_y, exclude_object=unit)
-            if occupant and occupant.__class__ == game.C_Unit:
-                score += 5.0
-            elif occupant and occupant.__class__ == game.C_City:
-                score -= 0.5
-
-        candidates.append((score, direction))
-
-    best_score = min(score for score, _ in candidates)
-    best_directions = [direction for score, direction in candidates if score == best_score]
-    return rng.choice(best_directions)
+    def __iter__(self):
+        return iter((self.reward, self.won, self.steps))
 
 
-def run_episode(
-    env,
-    agent,
-    episode_number,
-    max_steps,
-    train,
-    render_delay_ms=0,
-    guided_exploration_rate=0.0,
-    use_guidance=True,
-):
-    env.game_initialize(ep_number=episode_number)
-    state = env.get_observation()
+def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
+                guided_exploration_rate=0.0, use_guidance=False, seed=None,
+                policy="learned", rng=None):
+    state = env.reset(seed=seed)
     total_reward = 0.0
-    won = False
+    outcome = "timeout"
+    counts = {"guided": 0, "random": 0, "policy": 0}
     steps_taken = 0
-
+    policy_rng = rng if rng is not None else agent.rng
     for step in range(max_steps):
-        fallback_action = choose_guided_action(agent.rng) if use_guidance else None
-        action = agent.choose_action(
-            state,
-            explore=train,
-            fallback_action=fallback_action,
-            guided_exploration_rate=guided_exploration_rate,
-        )
+        valid = env.valid_actions()
+        if policy == "heuristic":
+            action, source = env.guided_action(policy_rng), "guided"
+        elif policy == "random":
+            action, source = policy_rng.choice(valid), "random"
+        else:
+            fallback = env.guided_action(policy_rng) if use_guidance else None
+            action = agent.choose_action(state, explore=train, valid_actions=valid,
+                                         fallback_action=fallback,
+                                         guided_exploration_rate=guided_exploration_rate)
+            source = agent.last_action_source
         next_state, reward, done = env.step(action)
-
-        if train:
-            agent.learn(state, action, reward, next_state, done)
-
-        total_reward += reward
-        state = next_state
         steps_taken = step + 1
-
-        if render_delay_ms > 0 and env.render:
-            game.pygame.time.wait(render_delay_ms)
-
+        truncated = steps_taken == max_steps and not done
+        if train:
+            agent.learn(state, action, reward, next_state, done or truncated,
+                        next_valid_actions=[] if done or truncated else env.valid_actions())
+        counts[source] += 1
+        total_reward += float(reward)
+        state = next_state
         if done:
-            won = True
+            outcome = env.last_info.get("outcome", "loss")
+        if env.render and not env.render_frame(delay_ms=render_delay_ms):
+            outcome = "quit"
             break
-
+        if done:
+            break
     if train:
         agent.finish_episode()
+    return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"])
 
-    return total_reward, won, steps_taken
+
+def compare_policies(agent, args, *, count=None, seed=None, config=None, policies=None, render=False, verbose=True):
+    """Evaluate every policy on the same seeds without consuming training randomness."""
+    count = args.eval_episodes if count is None else count
+    seed = args.eval_seed if seed is None else seed
+    config = args.config if config is None else config
+    explicit_policies = policies is not None
+    policies = list(args.eval_policies if policies is None else policies)
+    if args.eval_guidance and not explicit_policies and "guided" not in policies:
+        policies.append("guided")
+    summaries = {}
+    original_rng = agent.rng
+    original_source = agent.last_action_source
+    original_size = agent.observation_size
+    try:
+        for policy in policies:
+            env = game.Game(config=config, seed=seed, ml_ai=True, render=render)
+            rows = []
+            try:
+                for index in range(count):
+                    local_rng = random.Random(seed + index)
+                    agent.rng = local_rng
+                    result = run_episode(env, agent, index, args.max_steps, train=False,
+                                         seed=seed + index, rng=local_rng, policy=policy,
+                                         use_guidance=policy == "guided", render_delay_ms=args.render_delay_ms)
+                    rows.append({"seed": seed + index, **asdict(result)})
+                    if verbose:
+                        print(f"{policy} eval {index + 1}/{count} | reward {result.reward:.2f} | "
+                              f"{result.outcome} | steps {result.steps}")
+                    if result.outcome == "quit":
+                        break
+            finally:
+                env.close()
+            completed = len(rows)
+            wins = sum(row["outcome"] == "win" for row in rows)
+            summaries[policy] = {
+                "episodes": completed, "wins": wins,
+                "losses": sum(row["outcome"] == "loss" for row in rows),
+                "timeouts": sum(row["outcome"] == "timeout" for row in rows),
+                "quits": sum(row["outcome"] == "quit" for row in rows),
+                "win_rate": wins / completed if completed else 0.0,
+                "average_reward": sum(row["reward"] for row in rows) / completed if completed else 0.0,
+                "average_steps": sum(row["steps"] for row in rows) / completed if completed else 0.0,
+                "episodes_detail": rows,
+            }
+            if verbose:
+                summary = summaries[policy]
+                print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}, "
+                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}")
+            if summaries[policy]["quits"]:
+                break
+    finally:
+        agent.rng = original_rng
+        agent.last_action_source = original_source
+        agent.observation_size = original_size
+    return summaries
+
+
+def _checkpoint_state(agent, args, rows, best_score=None):
+    state = dict(agent.training_state)
+    state.update(config=asdict(args.config), seed=args.seed, max_steps=args.max_steps,
+                 curriculum_episodes=args.curriculum_episodes, guided_exploration=args.guided_exploration,
+                 validation_episodes=args.validation_episodes, validation_seed=args.validation_seed,
+                 no_guidance=args.no_guidance, episodes_completed=agent.episodes_trained,
+                 checkpoint_episode=agent.episodes_trained, metrics=rows)
+    if best_score is not None:
+        state["best_validation_score"] = list(best_score)
+    agent.training_state = state
+
+
+def _best_path(path):
+    return path.with_name(path.stem + ".best" + path.suffix)
+
+
+def _save_checkpoint(agent, args, rows):
+    best_score = agent.training_state.get("best_validation_score")
+    if args.save_best:
+        summary = compare_policies(agent, args, count=args.validation_episodes, seed=args.validation_seed,
+                                   config=args.config, policies=["learned"], verbose=False)["learned"]
+        score = (summary["win_rate"], summary["average_reward"])
+        if best_score is None or score > tuple(best_score):
+            best_score = score
+            _checkpoint_state(agent, args, rows, best_score)
+            agent.save(_best_path(args.model_path))
+    _checkpoint_state(agent, args, rows, best_score)
+    agent.save(args.model_path)
 
 
 def train_agent(agent, args):
-    env = game.Game(ml_ai=True, render=args.render_training)
+    rows = list(agent.training_state.get("metrics", []))
     rewards = []
     wins = 0
-
-    for episode in range(args.episodes):
-        reward, won, steps = run_episode(
-            env,
-            agent,
-            episode,
-            args.max_steps,
-            train=True,
-            render_delay_ms=args.render_delay_ms,
-            guided_exploration_rate=args.guided_exploration,
-            use_guidance=not args.no_guidance,
-        )
-        rewards.append(reward)
-        wins += int(won)
-
-        if args.log_every and (episode == 0 or (episode + 1) % args.log_every == 0):
-            window = min(args.log_every, len(rewards))
-            average_reward = sum(rewards[-window:]) / window
-            print(
-                f"episode {episode + 1:4d}/{args.episodes} | "
-                f"avg reward {average_reward:7.2f} | "
-                f"wins {wins:4d} | "
-                f"epsilon {agent.epsilon:.3f} | "
-                f"last steps {steps:3d}"
-            )
-
+    start_episode = agent.episodes_trained
+    for offset in range(args.episodes):
+        episode = start_episode + offset
+        config = episode_config(args, episode)
+        env = game.Game(config=config, seed=args.seed + episode, ml_ai=True, render=args.render_training)
+        try:
+            result = run_episode(env, agent, episode, args.max_steps, train=True,
+                                 seed=args.seed + episode, render_delay_ms=args.render_delay_ms,
+                                 guided_exploration_rate=args.guided_exploration,
+                                 use_guidance=not args.no_guidance)
+        finally:
+            env.close()
+        rewards.append(result.reward)
+        wins += int(result.won)
+        rows.append(dict(episode=episode + 1, seed=args.seed + episode, reward=result.reward,
+                         outcome=result.outcome, steps=result.steps, epsilon=agent.epsilon,
+                         guidance_actions=result.guidance_actions, random_actions=result.random_actions,
+                         policy_actions=result.policy_actions, q_table_size=len(agent.q_table),
+                         city_strength=config.city_strength))
+        _checkpoint_state(agent, args, rows)
+        if args.log_every and (offset == 0 or (episode + 1) % args.log_every == 0):
+            window = rewards[-args.log_every:]
+            print(f"episode {episode + 1} | avg reward {sum(window) / len(window):.2f} | "
+                  f"wins {wins}/{len(rewards)} | epsilon {agent.epsilon:.3f} | "
+                  f"guided {result.guidance_actions}/{result.steps} | Q states {len(agent.q_table)}")
+        if args.checkpoint_every and (episode + 1) % args.checkpoint_every == 0:
+            if not args.no_save:
+                _save_checkpoint(agent, args, rows)
+            write_metrics(args.metrics_dir, rows, config=args.config)
+        if result.outcome == "quit":
+            break
     return rewards, wins
 
 
 def evaluate_agent(agent, args):
-    env = game.Game(ml_ai=True, render=args.render)
-    rewards = []
-    wins = 0
-
-    for episode in range(args.eval_episodes):
-        reward, won, steps = run_episode(
-            env,
-            agent,
-            episode,
-            args.max_steps,
-            train=False,
-            render_delay_ms=args.render_delay_ms,
-            guided_exploration_rate=0.0,
-            use_guidance=not args.no_guidance,
-        )
-        rewards.append(reward)
-        wins += int(won)
-        print(
-            f"eval {episode + 1:3d}/{args.eval_episodes} | "
-            f"reward {reward:7.2f} | "
-            f"won {won} | "
-            f"steps {steps:3d}"
-        )
-
-    if rewards:
-        print(f"evaluation win rate: {wins}/{args.eval_episodes}")
-        print(f"evaluation average reward: {sum(rewards) / len(rewards):.2f}")
+    return compare_policies(agent, args, render=args.render)
 
 
-def main():
-    args = parse_args()
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    rng = random.Random(args.seed)
+def _curve_svg(rows):
+    width, height, padding = 960, 640, 65
+    panels = (("reward", "Episode reward", "#2864dc"),
+              ("win_rate", "Rolling win rate (50 episodes)", "#199663"),
+              ("steps", "Episode length", "#b353ce"),
+              ("q_table_size", "Q-table states", "#ca7329"))
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" '
+             'aria-label="Training learning curves"><rect width="100%" height="100%" fill="white"/>',
+             '<style>text{font:14px sans-serif;fill:#222}.axis{stroke:#bbb;stroke-width:1}</style>']
+    for index, (field, label, color) in enumerate(panels):
+        origin_x = (index % 2) * width / 2 + padding
+        origin_y = (index // 2) * height / 2 + padding
+        plot_w, plot_h = width / 2 - padding - 30, height / 2 - padding - 55
+        parts.append(f'<text x="{origin_x}" y="{origin_y - 25}">{html.escape(label)}</text>')
+        parts.append(f'<path class="axis" fill="none" d="M{origin_x},{origin_y}v{plot_h}h{plot_w}"/>')
+        if not rows:
+            parts.append(f'<text x="{origin_x + 15}" y="{origin_y + 35}">No training episodes</text>')
+            continue
+        values = []
+        for position, row in enumerate(rows):
+            if field == "win_rate":
+                window = rows[max(0, position - 49):position + 1]
+                value = sum(item["outcome"] == "win" for item in window) / len(window)
+            else:
+                value = float(row[field])
+            values.append(value)
+        low, high = (0.0, 1.0) if field == "win_rate" else (min(values), max(values))
+        if low == high:
+            low, high = low - 0.5, high + 0.5
+        points = " ".join(f"{origin_x + plot_w * position / max(1, len(values) - 1):.2f},"
+                          f"{origin_y + plot_h * (1 - (value - low) / (high - low)):.2f}"
+                          for position, value in enumerate(values))
+        parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2"/>')
+        for value, y in ((high, origin_y), (low, origin_y + plot_h)):
+            parts.append(f'<text x="{origin_x - 8}" y="{y + 4}" text-anchor="end">{value:.3g}</text>')
+        parts.append(f'<text x="{origin_x}" y="{origin_y + plot_h + 24}">{rows[0]["episode"]}</text>')
+        parts.append(f'<text x="{origin_x + plot_w}" y="{origin_y + plot_h + 24}" '
+                     f'text-anchor="end">{rows[-1]["episode"]}</text>')
+        parts.append(f'<text x="{origin_x + plot_w / 2}" y="{origin_y + plot_h + 42}" '
+                     'text-anchor="middle">Episode</text>')
+    return "\n".join(parts + ["</svg>"])
 
-    agent = build_agent(args, rng)
 
-    if args.episodes > 0:
-        train_agent(agent, args)
+def write_metrics(directory, rows, evaluations=None, config=None):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "training.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    payload = {"format_version": 1, "config": asdict(config) if config is not None else None,
+               "training": rows, "evaluation": evaluations or {}}
+    (directory / "metrics.json").write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
+    (directory / "learning_curve.svg").write_text(_curve_svg(rows), encoding="utf-8")
 
-    if not args.no_save:
-        agent.save(args.model_path)
-        print(f"saved model to {args.model_path}")
 
-    if args.eval_episodes > 0:
-        evaluate_agent(agent, args)
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        agent = build_agent(args, random.Random())
+        if args.episodes:
+            train_agent(agent, args)
+        rows = agent.training_state.get("metrics", [])
+        if not args.no_save:
+            _save_checkpoint(agent, args, rows)
+            print(f"saved model to {args.model_path}")
+        evaluations = evaluate_agent(agent, args) if args.eval_episodes else {}
+        write_metrics(args.metrics_dir, rows, evaluations=evaluations, config=args.config)
+        print(f"metrics written to {args.metrics_dir}")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

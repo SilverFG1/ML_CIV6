@@ -196,6 +196,7 @@ class LearningAgentTests(unittest.TestCase):
             [], {**payload, "format_version": 3}, {**payload, "format_version": 2.0},
             {**payload, "rng_state": []}, {**payload, "training_state": []},
             {**payload, "training_state": {"bad": float("nan")}},
+            {**payload, "training_state": {"nested": [{"bad": float("inf")}]}},
             {**payload, "episodes_trained": -1}, {**payload, "observation_schema": 2},
             {**payload, "q_table": [{"state": [0], "values": [1, 2]}]},
             {**payload, "q_table": [{"state": [0], "values": [1, 2, 3, float("nan")]}]},
@@ -229,6 +230,17 @@ class LearningAgentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 QLearningAgent.load(path, rng=rng)
         self.assertEqual(before, rng.getstate())
+
+    def test_json_exponent_overflow_in_metadata_is_rejected(self):
+        agent = self.make_agent()
+        payload = agent._checkpoint_payload()
+        payload['training_state'] = {'nested': [{'bad': 1.0}]}
+        serialized = json.dumps(payload).replace('"bad": 1.0', '"bad": 1e309')
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            path = Path(folder) / 'overflow.json'
+            path.write_text(serialized, encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'finite'):
+                QLearningAgent.load(path)
 
     def test_failed_atomic_replace_preserves_previous_model_and_removes_temp(self):
         agent = self.make_agent()

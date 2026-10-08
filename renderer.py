@@ -18,8 +18,8 @@ class Renderer:
         self.size = max(20, min(96, int(1180 / (env.config.width + .5)),
                                int(720 / (env.config.height * .75 + .25))))
         self.margin = 24
-        width = int((env.config.width + .5) * self.size) + 2 * self.margin
-        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + 94
+        width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
+        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + 118
         self.surface = pygame.display.set_mode((width, height))
         pygame.display.set_caption('ML_CIV6 — training and evaluation')
         self.font = pygame.font.SysFont('Segoe UI', 16)
@@ -48,6 +48,18 @@ class Renderer:
     def _text(self, text, pos, color=(235, 235, 235), small=False):
         font = self.small_font if small else self.font
         self.surface.blit(font.render(text, True, color), pos)
+
+    def _wrapped_text(self, text, pos):
+        lines = ['']
+        for word in text.split():
+            proposed = (lines[-1] + ' ' + word).strip()
+            if lines[-1] and self.font.size(proposed)[0] > self.surface.get_width() - 2 * self.margin:
+                lines.append(word)
+            else:
+                lines[-1] = proposed
+        for index, line in enumerate(lines):
+            self._text(line, (pos[0], pos[1] + 22 * index))
+        return len(lines)
 
     def draw(self):
         p = self.pygame
@@ -81,7 +93,7 @@ class Renderer:
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
-        y = self.surface.get_height() - 87
+        y = self.surface.get_height() - 109
         city = self.env.city
         outcome = self.env.last_info['outcome']
         self._text(f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
@@ -90,9 +102,9 @@ class Renderer:
             controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot   R: restart   Esc: quit'
         else:
             controls = f'Space: pause   Right: one turn   +/-: speed   Esc: quit   Delay {self.delay_ms or 0}ms'
-        self._text(controls, (self.margin, y + 27))
+        control_lines = self._wrapped_text(controls, (self.margin, y + 27))
         if self.paused:
-            self._text('PAUSED', (self.margin, y + 54), (255, 220, 100))
+            self._text('PAUSED', (self.margin, y + 31 + 22 * control_lines), (255, 220, 100))
         p.display.flip()
 
     def _events(self):

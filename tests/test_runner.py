@@ -1,6 +1,8 @@
 """Runner regressions for fair evaluation, reporting, and exact continuation."""
 
 import csv
+import contextlib
+import io
 import json
 import random
 import tempfile
@@ -240,8 +242,59 @@ class RunnerTests(unittest.TestCase):
     def test_cli_rejects_invalid_ranges(self):
         for options in (("--episodes", "-1"), ("--max-steps", "0"), ("--guided-exploration", "1.1"),
                         ("--learning-rate", "0"), ("--curriculum-episodes", "-1")):
-            with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 run_game.parse_args(list(options))
+
+    def test_best_validation_settings_restore_and_reject_changes(self):
+        args = self.args('--validation-seed', '3000007', '--validation-episodes', '3')
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        restored_args = self.args()
+        self.make_agent(restored_args)
+        self.assertEqual(restored_args.validation_seed, 3000007)
+        self.assertEqual(restored_args.validation_episodes, 3)
+        for flags in [('--validation-seed', '9'), ('--validation-episodes', '8')]:
+            with self.assertRaisesRegex(ValueError, 'fresh'):
+                self.make_agent(self.args(*flags))
+
+    def test_mixed_unit_types_resume_and_evaluate(self):
+        args = self.args('--unit-count', '2', '--unit-types', 'warrior', 'archer')
+        agent = self.make_agent(args)
+        self.assertEqual(agent.action_count, 56)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        resumed = self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.unit_types, ('warrior', 'archer'))
+        self.assertEqual(resumed.action_count, 56)
+        evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
+        self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
+
+    def test_runner_rejects_corrupt_progress_metadata(self):
+        args = self.args()
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        original = json.loads(args.model_path.read_text(encoding='utf-8'))
+        for name, value in [('seed', 'bad'), ('max_steps', 0), ('episodes_completed', 999),
+                            ('metrics', {}), ('no_guidance', 'false'),
+                            ('best_validation_score', [2, 1])]:
+            payload = json.loads(json.dumps(original))
+            payload['training_state'][name] = value
+            args.model_path.write_text(json.dumps(payload), encoding='utf-8')
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'Checkpoint'):
+                self.make_agent(self.args())
+
+    def test_curriculum_preset_and_single_episode_target(self):
+        args = self.args('--difficulty', 'curriculum')
+        self.make_agent(args)
+        self.assertEqual(args.curriculum_episodes, 1000)
+        self.assertEqual(run_game.episode_config(args, 0).city_strength, 18)
+        self.assertEqual(run_game.episode_config(args, 999).city_strength, 38)
+        single = self.args('--difficulty', 'hard', '--curriculum-episodes', '1')
+        self.make_agent(single)
+        self.assertEqual(run_game.episode_config(single, 0).city_strength, 38)
 
 
 if __name__ == "__main__":

@@ -117,13 +117,70 @@ def _restore_setting(args, saved, name, default):
     setattr(args, name, previous if value is None else value)
 
 
+def _validate_training_state(agent):
+    """Check runner-owned progress before using it to resume an experiment."""
+    state = agent.training_state
+    if not state and agent.episodes_trained == 0:
+        return
+    required = ('config', 'seed', 'max_steps', 'curriculum_episodes', 'guided_exploration',
+                'no_guidance', 'episodes_completed', 'checkpoint_episode', 'metrics')
+    if any(name not in state for name in required):
+        raise ValueError('Checkpoint is missing training progress; use --fresh')
+    if not isinstance(state['config'], dict):
+        raise ValueError('Checkpoint config must be an object')
+    for name, minimum in [('seed', None), ('max_steps', 1), ('curriculum_episodes', 0),
+                          ('episodes_completed', 0), ('checkpoint_episode', 0),
+                          ('validation_seed', None), ('validation_episodes', 1)]:
+        if name not in state:
+            continue
+        value = state[name]
+        if isinstance(value, bool) or not isinstance(value, int) or (minimum is not None and value < minimum):
+            raise ValueError(f'Checkpoint {name} is invalid')
+    if state['episodes_completed'] != agent.episodes_trained or state['checkpoint_episode'] != agent.episodes_trained:
+        raise ValueError('Checkpoint episode counters disagree')
+    rate = state['guided_exploration']
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 <= rate <= 1:
+        raise ValueError('Checkpoint guided exploration must lie between 0 and 1')
+    if not isinstance(state['no_guidance'], bool):
+        raise ValueError('Checkpoint no_guidance must be a boolean')
+    rows = state['metrics']
+    if not isinstance(rows, list) or len(rows) != agent.episodes_trained:
+        raise ValueError('Checkpoint training history does not match episode count')
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != set(METRIC_FIELDS):
+            raise ValueError('Checkpoint contains an invalid training history row')
+        for name in ('reward', 'epsilon', 'city_strength'):
+            if isinstance(row[name], bool) or not isinstance(row[name], (int, float)):
+                raise ValueError(f'Checkpoint history {name} must be numeric')
+        if row['episode'] != index + 1 or row['seed'] != state['seed'] + index:
+            raise ValueError('Checkpoint training history has inconsistent episode seeds')
+        for name in ('episode', 'seed', 'steps', 'guidance_actions', 'random_actions', 'policy_actions', 'q_table_size'):
+            if isinstance(row[name], bool) or not isinstance(row[name], int):
+                raise ValueError(f'Checkpoint history {name} must be an integer')
+        if not 1 <= row['steps'] <= state['max_steps'] or any(row[name] < 0 for name in
+                ('guidance_actions', 'random_actions', 'policy_actions', 'q_table_size')):
+            raise ValueError('Checkpoint history contains invalid counts')
+        if row['guidance_actions'] + row['random_actions'] + row['policy_actions'] != row['steps']:
+            raise ValueError('Checkpoint history action counts disagree')
+        if row['outcome'] not in ('win', 'loss', 'timeout', 'quit') or not 0 <= row['epsilon'] <= 1:
+            raise ValueError('Checkpoint history contains invalid outcomes or exploration rates')
+    best = state.get('best_validation_score')
+    if best is not None and (not isinstance(best, list) or len(best) != 2
+                             or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in best)
+                             or not 0 <= best[0] <= 1):
+        raise ValueError('Checkpoint best validation score is invalid')
+
+
 def build_agent(args, rng):
     loaded = args.model_path.exists() and not args.fresh
     agent = QLearningAgent.load(args.model_path, rng=rng) if loaded else None
+    if loaded and agent.observation_schema is not None:
+        _validate_training_state(agent)
     saved = agent.training_state if loaded else {}
     _restore_setting(args, saved, "seed", 7)
     _restore_setting(args, saved, "max_steps", 80)
-    _restore_setting(args, saved, "curriculum_episodes", 0)
+    difficulty = args.difficulty or saved.get('config', {}).get('difficulty', 'normal')
+    _restore_setting(args, saved, "curriculum_episodes", 1000 if difficulty == 'curriculum' else 0)
     _restore_setting(args, saved, "guided_exploration", 0.35)
     _restore_setting(args, saved, "validation_episodes", 20)
     _restore_setting(args, saved, "validation_seed", 200007)
@@ -131,7 +188,10 @@ def build_agent(args, rng):
         args.no_guidance = True
     elif saved and args.no_guidance != saved.get("no_guidance", False):
         raise ValueError("--no-guidance differs from the checkpoint; use --fresh")
-    config = config_from_args(args, saved.get("config"))
+    try:
+        config = config_from_args(args, saved.get("config"))
+    except (TypeError, KeyError) as error:
+        raise ValueError(f'Invalid checkpoint scenario: {error}') from error
     env = game.Game(config=config, seed=args.seed, ml_ai=True, render=False)
     try:
         schema, size, action_count = env.observation_schema, len(env.reset(seed=args.seed)), env.action_count
@@ -159,7 +219,7 @@ def build_agent(args, rng):
 def episode_config(args, absolute_episode):
     if not args.curriculum_episodes:
         return args.config
-    progress = min(1.0, absolute_episode / max(1, args.curriculum_episodes - 1))
+    progress = 1.0 if args.curriculum_episodes == 1 else min(1.0, absolute_episode / (args.curriculum_episodes - 1))
     start_strength = min(18.0, args.config.city_strength)
     return replace(args.config, city_strength=start_strength + (args.config.city_strength - start_strength) * progress)
 
@@ -395,7 +455,7 @@ def _curve_svg(rows):
     return "\n".join(parts + ["</svg>"])
 
 
-def write_metrics(directory, rows, evaluations=None, config=None):
+def write_metrics(directory, rows, evaluations=None, config=None, settings=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "training.csv").open("w", encoding="utf-8", newline="") as handle:
@@ -403,6 +463,7 @@ def write_metrics(directory, rows, evaluations=None, config=None):
         writer.writeheader()
         writer.writerows(rows)
     payload = {"format_version": 1, "config": asdict(config) if config is not None else None,
+               "settings": settings or {},
                "training": rows, "evaluation": evaluations or {}}
     (directory / "metrics.json").write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
     (directory / "learning_curve.svg").write_text(_curve_svg(rows), encoding="utf-8")
@@ -419,7 +480,14 @@ def main(argv=None):
             _save_checkpoint(agent, args, rows)
             print(f"saved model to {args.model_path}")
         evaluations = evaluate_agent(agent, args) if args.eval_episodes else {}
-        write_metrics(args.metrics_dir, rows, evaluations=evaluations, config=args.config)
+        settings = {name: getattr(agent, name) for name in
+                    ('learning_rate', 'discount_factor', 'epsilon', 'epsilon_decay', 'epsilon_min',
+                     'state_precision', 'initial_q', 'episodes_trained', 'observation_schema')}
+        settings.update({name: getattr(args, name) for name in
+                         ('seed', 'max_steps', 'eval_seed', 'eval_episodes', 'eval_policies',
+                          'eval_guidance', 'validation_seed', 'validation_episodes',
+                          'curriculum_episodes', 'guided_exploration', 'no_guidance')})
+        write_metrics(args.metrics_dir, rows, evaluations=evaluations, config=args.config, settings=settings)
         print(f"metrics written to {args.metrics_dir}")
     except ValueError as error:
         raise SystemExit(str(error)) from error

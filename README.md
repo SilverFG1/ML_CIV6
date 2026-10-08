@@ -40,7 +40,7 @@ Continue the same model for another 500 training episodes:
 python run_game.py --episodes 500 --model-path runs/baseline/model.json --metrics-dir runs/resumed
 ```
 
-`--episodes` is the number of additional training episodes. An existing model loads automatically and restores its scenario, learning settings, progress, and random-generator states unless compatible options are explicitly supplied. `--fresh` starts a new model. `--no-save` disables checkpoint writes while retaining metrics output. The current model and observation formats are versioned; legacy models require `--fresh` because their states and actions are incompatible with the upgraded environment.
+`--episodes` is the number of additional training episodes. An existing model loads automatically and restores its scenario, learning settings, progress, seeds, and policy random-generator state. Compatible learning options can be explicitly overridden; scenario, seed, precision, and validation-set changes require `--fresh`. Resumption starts at an episode boundary. `--no-save` disables checkpoint writes while retaining metrics output. Legacy models require `--fresh` because their observations are incompatible with the upgraded environment.
 
 Evaluate a saved model without further training:
 
@@ -62,25 +62,34 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 
 | Option | Purpose |
 | --- | --- |
-| `--difficulty easy\|normal\|hard` | Choose terrain and combat settings. |
-| `--width`, `--height` | Set the map dimensions. |
+| `--difficulty easy\|normal\|hard\|curriculum` | Choose city strength: 18, 28, 38, or a 1,000-episode curriculum targeting 38. |
+| `--width`, `--height` | Set map dimensions from 3 to 32. |
 | `--unit-count` | Choose one to four starting units. |
+| `--unit-types warrior archer ...` | Set one type per unit; omitted types default to warriors. |
 | `--city-position X Y` | Set the city's map coordinate. |
 | `--unit-strengths N [N ...]`, `--city-strength` | Override unit and city combat strengths. |
-| `--ranged-strength` | Configure the ranged attack strength. |
+| `--ranged-strength` | Configure the city's ranged attack strength. |
 | `--wall-hp` | Set the city's initial wall health. |
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
 | `--no-city-healing` | Disable city healing. |
 | `--curriculum-episodes N` | Progress from easier scenarios to the selected difficulty over N training episodes. |
 
-The observation includes normalized absolute city/unit coordinates, health, survival, combat strengths, walls, and terrain. Legal-action masks exclude impossible choices and restrict dead units to waiting. Joint actions still grow exponentially: three units produce 343 combinations before masking, and four produce 2,401. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
+Warriors default to melee strength 20. Archers default to melee strength 12 and ranged strength 20. Archers have a `SHOOT` action at hex distance two, with no melee retaliation; ranged fire leaves the city at a minimum of one HP, so capture requires a melee action. Mountains block movement. Forests provide a defense bonus and add a movement-cost penalty. Terrain generation places units in the city's reachable component.
+
+The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
+
+For a mixed squad:
+
+```powershell
+python run_game.py --episodes 100 --unit-count 3 --unit-types warrior archer warrior --wall-hp 50 --forest-density 0.2 --mountain-density 0.1 --model-path runs/mixed/model.json --metrics-dir runs/mixed --fresh
+```
 
 ## Metrics and playback
 
 Each run writes to `--metrics-dir` (default `training_metrics`):
 
 - `training.csv`: episode-level training metrics, including reward, win/termination outcome, length, Q-table size, and guidance usage.
-- `metrics.json`: settings and evaluation summaries for comparing runs.
+- `metrics.json`: scenario and learning settings, seeds, training history, and evaluation summaries for comparing runs.
 - `learning_curve.svg`: training curves that open in a browser without extra plotting packages.
 
 Use separate output directories for experiments. Checkpoints save atomically; periodic saves preserve recoverable progress during long runs. `--checkpoint-every N` controls their interval.
@@ -92,6 +101,8 @@ python run_game.py --episodes 0 --eval-episodes 3 --eval-policies learned --mode
 ```
 
 During playback, **Space** pauses/resumes, **Right Arrow** advances one turn while paused, **+ / -** change playback speed, and **Esc** exits. `--render-training` also displays training turns.
+
+Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
 
 ## Verification
 

@@ -45,6 +45,33 @@ def _reject_nonfinite_json(value):
     raise ValueError(f"nonfinite JSON number {value}")
 
 
+def _validate_metadata(value, location="training_state", ancestors=None):
+    """Reject invalid JSON metadata, including numbers that overflow on parsing."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{location} must contain only finite numbers")
+        return
+    if not isinstance(value, (dict, list, tuple)):
+        raise ValueError(f"{location} must contain only JSON values")
+    ancestors = set() if ancestors is None else ancestors
+    if id(value) in ancestors:
+        raise ValueError(f"{location} must not contain circular references")
+    ancestors.add(id(value))
+    try:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{location} keys must be strings")
+                _validate_metadata(item, f"{location}.{key}", ancestors)
+        else:
+            for index, item in enumerate(value):
+                _validate_metadata(item, f"{location}[{index}]", ancestors)
+    finally:
+        ancestors.remove(id(value))
+
+
 class QLearningAgent:
     """Tabular Q-learning over normalized, discretized observations.
 
@@ -214,6 +241,7 @@ class QLearningAgent:
 
     def _checkpoint_payload(self):
         self._validate_configuration()
+        _validate_metadata(self.training_state)
         entries = []
         observed_size = self.observation_size
         for state, values in self.q_table.items():

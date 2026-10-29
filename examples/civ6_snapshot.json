@@ -1,0 +1,13 @@
+{
+  "schema": "civ6.live.v1",
+  "turn": 10,
+  "player_id": 0,
+  "turn_active": true,
+  "units": [
+    {"index": 0, "unit_id": 65536, "name": "Warrior", "x": 4, "y": 4, "hp": 100, "moves_remaining": 2}
+  ],
+  "overview": {"source": "Synthetic example for offline planning; not captured from a real game"},
+  "tiles": [],
+  "center": [4, 4],
+  "radius": 2
+}

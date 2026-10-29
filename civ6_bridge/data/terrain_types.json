@@ -1,0 +1,453 @@
+{
+  "features": {
+    "FEATURE_BARRIER_REEF": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_BARRIER_REEF",
+      "impassable": false,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_BARRIER_REEF_NAME",
+      "yields": {
+        "YIELD_FOOD": 3,
+        "YIELD_SCIENCE": 2
+      }
+    },
+    "FEATURE_CLIFFS_DOVER": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_CLIFFS_DOVER",
+      "impassable": false,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_CLIFFS_DOVER_NAME",
+      "yields": {
+        "YIELD_CULTURE": 3,
+        "YIELD_FOOD": 2,
+        "YIELD_GOLD": 3
+      }
+    },
+    "FEATURE_CRATER_LAKE": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_CRATER_LAKE",
+      "impassable": false,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_CRATER_LAKE_NAME",
+      "yields": {
+        "YIELD_FAITH": 5,
+        "YIELD_SCIENCE": 1
+      }
+    },
+    "FEATURE_DEAD_SEA": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_DEAD_SEA",
+      "impassable": false,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_DEAD_SEA_NAME",
+      "yields": {
+        "YIELD_CULTURE": 2,
+        "YIELD_FAITH": 2
+      }
+    },
+    "FEATURE_EVEREST": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_EVEREST",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_EVEREST_NAME",
+      "yields": {}
+    },
+    "FEATURE_FLOODPLAINS": {
+      "defense_modifier": -2,
+      "feature_type": "FEATURE_FLOODPLAINS",
+      "impassable": false,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_FLOODPLAINS_NAME",
+      "yields": {
+        "YIELD_FOOD": 3
+      }
+    },
+    "FEATURE_FOREST": {
+      "defense_modifier": 3,
+      "feature_type": "FEATURE_FOREST",
+      "impassable": false,
+      "movement_change": 1,
+      "name_key": "LOC_FEATURE_FOREST_NAME",
+      "yields": {
+        "YIELD_PRODUCTION": 1
+      }
+    },
+    "FEATURE_GALAPAGOS": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_GALAPAGOS",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_GALAPAGOS_NAME",
+      "yields": {}
+    },
+    "FEATURE_ICE": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_ICE",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_ICE_NAME",
+      "yields": {}
+    },
+    "FEATURE_JUNGLE": {
+      "defense_modifier": 3,
+      "feature_type": "FEATURE_JUNGLE",
+      "impassable": false,
+      "movement_change": 1,
+      "name_key": "LOC_FEATURE_JUNGLE_NAME",
+      "yields": {
+        "YIELD_FOOD": 1
+      }
+    },
+    "FEATURE_KILIMANJARO": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_KILIMANJARO",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_KILIMANJARO_NAME",
+      "yields": {}
+    },
+    "FEATURE_MARSH": {
+      "defense_modifier": -2,
+      "feature_type": "FEATURE_MARSH",
+      "impassable": false,
+      "movement_change": 1,
+      "name_key": "LOC_FEATURE_MARSH_NAME",
+      "yields": {
+        "YIELD_FOOD": 1
+      }
+    },
+    "FEATURE_OASIS": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_OASIS",
+      "impassable": false,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_OASIS_NAME",
+      "yields": {
+        "YIELD_FOOD": 3,
+        "YIELD_GOLD": 1
+      }
+    },
+    "FEATURE_PANTANAL": {
+      "defense_modifier": -2,
+      "feature_type": "FEATURE_PANTANAL",
+      "impassable": false,
+      "movement_change": 1,
+      "name_key": "LOC_FEATURE_PANTANAL_NAME",
+      "yields": {
+        "YIELD_CULTURE": 2,
+        "YIELD_FOOD": 2
+      }
+    },
+    "FEATURE_PIOPIOTAHI": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_PIOPIOTAHI",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_PIOPIOTAHI_NAME",
+      "yields": {}
+    },
+    "FEATURE_TORRES_DEL_PAINE": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_TORRES_DEL_PAINE",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_TORRES_DEL_PAINE_NAME",
+      "yields": {}
+    },
+    "FEATURE_TSINGY": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_TSINGY",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_TSINGY_NAME",
+      "yields": {}
+    },
+    "FEATURE_YOSEMITE": {
+      "defense_modifier": 0,
+      "feature_type": "FEATURE_YOSEMITE",
+      "impassable": true,
+      "movement_change": 0,
+      "name_key": "LOC_FEATURE_YOSEMITE_NAME",
+      "yields": {}
+    }
+  },
+  "schema": "civ6.terrain_catalog.v1",
+  "source": {
+    "files": [
+      "Base/Assets/Gameplay/Data/Terrains.xml",
+      "Base/Assets/Gameplay/Data/Features.xml"
+    ],
+    "kind": "base_game_xml",
+    "rules_scope": "base_game_reference",
+    "sha256": {
+      "Base/Assets/Gameplay/Data/Features.xml": "5aa83d0bc1771cb3c343aed518bdf8d9123557a07c5758892bbc2008a0a9e2af",
+      "Base/Assets/Gameplay/Data/Terrains.xml": "77fe03f55ef5116b4bacffb7a47b58d8eafab2147dc584b5d2415c080311391f"
+    }
+  },
+  "terrains": {
+    "TERRAIN_COAST": {
+      "base_type": "COAST",
+      "defense_modifier": 0,
+      "impassable": false,
+      "is_hills": false,
+      "is_mountain": false,
+      "is_shallow_water": true,
+      "is_water": true,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_COAST_NAME",
+      "terrain_class": "TERRAIN_CLASS_WATER",
+      "terrain_type": "TERRAIN_COAST",
+      "yields": {
+        "YIELD_FOOD": 1,
+        "YIELD_GOLD": 1
+      }
+    },
+    "TERRAIN_DESERT": {
+      "base_type": "DESERT",
+      "defense_modifier": 0,
+      "impassable": false,
+      "is_hills": false,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_DESERT_NAME",
+      "terrain_class": "TERRAIN_CLASS_DESERT",
+      "terrain_type": "TERRAIN_DESERT",
+      "yields": {}
+    },
+    "TERRAIN_DESERT_HILLS": {
+      "base_type": "DESERT",
+      "defense_modifier": 3,
+      "impassable": false,
+      "is_hills": true,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 2,
+      "name_key": "LOC_TERRAIN_DESERT_HILLS_NAME",
+      "terrain_class": "TERRAIN_CLASS_DESERT",
+      "terrain_type": "TERRAIN_DESERT_HILLS",
+      "yields": {
+        "YIELD_PRODUCTION": 1
+      }
+    },
+    "TERRAIN_DESERT_MOUNTAIN": {
+      "base_type": "DESERT",
+      "defense_modifier": 0,
+      "impassable": true,
+      "is_hills": false,
+      "is_mountain": true,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_DESERT_MOUNTAIN_NAME",
+      "terrain_class": "TERRAIN_CLASS_MOUNTAIN",
+      "terrain_type": "TERRAIN_DESERT_MOUNTAIN",
+      "yields": {}
+    },
+    "TERRAIN_GRASS": {
+      "base_type": "GRASS",
+      "defense_modifier": 0,
+      "impassable": false,
+      "is_hills": false,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_GRASS_NAME",
+      "terrain_class": "TERRAIN_CLASS_GRASS",
+      "terrain_type": "TERRAIN_GRASS",
+      "yields": {
+        "YIELD_FOOD": 2
+      }
+    },
+    "TERRAIN_GRASS_HILLS": {
+      "base_type": "GRASS",
+      "defense_modifier": 3,
+      "impassable": false,
+      "is_hills": true,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 2,
+      "name_key": "LOC_TERRAIN_GRASS_HILLS_NAME",
+      "terrain_class": "TERRAIN_CLASS_GRASS",
+      "terrain_type": "TERRAIN_GRASS_HILLS",
+      "yields": {
+        "YIELD_FOOD": 2,
+        "YIELD_PRODUCTION": 1
+      }
+    },
+    "TERRAIN_GRASS_MOUNTAIN": {
+      "base_type": "GRASS",
+      "defense_modifier": 0,
+      "impassable": true,
+      "is_hills": false,
+      "is_mountain": true,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_GRASS_MOUNTAIN_NAME",
+      "terrain_class": "TERRAIN_CLASS_MOUNTAIN",
+      "terrain_type": "TERRAIN_GRASS_MOUNTAIN",
+      "yields": {}
+    },
+    "TERRAIN_OCEAN": {
+      "base_type": "OCEAN",
+      "defense_modifier": 0,
+      "impassable": false,
+      "is_hills": false,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": true,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_OCEAN_NAME",
+      "terrain_class": "TERRAIN_CLASS_WATER",
+      "terrain_type": "TERRAIN_OCEAN",
+      "yields": {
+        "YIELD_FOOD": 1
+      }
+    },
+    "TERRAIN_PLAINS": {
+      "base_type": "PLAINS",
+      "defense_modifier": 0,
+      "impassable": false,
+      "is_hills": false,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_PLAINS_NAME",
+      "terrain_class": "TERRAIN_CLASS_PLAINS",
+      "terrain_type": "TERRAIN_PLAINS",
+      "yields": {
+        "YIELD_FOOD": 1,
+        "YIELD_PRODUCTION": 1
+      }
+    },
+    "TERRAIN_PLAINS_HILLS": {
+      "base_type": "PLAINS",
+      "defense_modifier": 3,
+      "impassable": false,
+      "is_hills": true,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 2,
+      "name_key": "LOC_TERRAIN_PLAINS_HILLS_NAME",
+      "terrain_class": "TERRAIN_CLASS_PLAINS",
+      "terrain_type": "TERRAIN_PLAINS_HILLS",
+      "yields": {
+        "YIELD_FOOD": 1,
+        "YIELD_PRODUCTION": 2
+      }
+    },
+    "TERRAIN_PLAINS_MOUNTAIN": {
+      "base_type": "PLAINS",
+      "defense_modifier": 0,
+      "impassable": true,
+      "is_hills": false,
+      "is_mountain": true,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_PLAINS_MOUNTAIN_NAME",
+      "terrain_class": "TERRAIN_CLASS_MOUNTAIN",
+      "terrain_type": "TERRAIN_PLAINS_MOUNTAIN",
+      "yields": {}
+    },
+    "TERRAIN_SNOW": {
+      "base_type": "SNOW",
+      "defense_modifier": 0,
+      "impassable": false,
+      "is_hills": false,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_SNOW_NAME",
+      "terrain_class": "TERRAIN_CLASS_SNOW",
+      "terrain_type": "TERRAIN_SNOW",
+      "yields": {}
+    },
+    "TERRAIN_SNOW_HILLS": {
+      "base_type": "SNOW",
+      "defense_modifier": 3,
+      "impassable": false,
+      "is_hills": true,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 2,
+      "name_key": "LOC_TERRAIN_SNOW_HILLS_NAME",
+      "terrain_class": "TERRAIN_CLASS_SNOW",
+      "terrain_type": "TERRAIN_SNOW_HILLS",
+      "yields": {
+        "YIELD_PRODUCTION": 1
+      }
+    },
+    "TERRAIN_SNOW_MOUNTAIN": {
+      "base_type": "SNOW",
+      "defense_modifier": 0,
+      "impassable": true,
+      "is_hills": false,
+      "is_mountain": true,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_SNOW_MOUNTAIN_NAME",
+      "terrain_class": "TERRAIN_CLASS_MOUNTAIN",
+      "terrain_type": "TERRAIN_SNOW_MOUNTAIN",
+      "yields": {}
+    },
+    "TERRAIN_TUNDRA": {
+      "base_type": "TUNDRA",
+      "defense_modifier": 0,
+      "impassable": false,
+      "is_hills": false,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_TUNDRA_NAME",
+      "terrain_class": "TERRAIN_CLASS_TUNDRA",
+      "terrain_type": "TERRAIN_TUNDRA",
+      "yields": {
+        "YIELD_FOOD": 1
+      }
+    },
+    "TERRAIN_TUNDRA_HILLS": {
+      "base_type": "TUNDRA",
+      "defense_modifier": 3,
+      "impassable": false,
+      "is_hills": true,
+      "is_mountain": false,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 2,
+      "name_key": "LOC_TERRAIN_TUNDRA_HILLS_NAME",
+      "terrain_class": "TERRAIN_CLASS_TUNDRA",
+      "terrain_type": "TERRAIN_TUNDRA_HILLS",
+      "yields": {
+        "YIELD_FOOD": 1,
+        "YIELD_PRODUCTION": 1
+      }
+    },
+    "TERRAIN_TUNDRA_MOUNTAIN": {
+      "base_type": "TUNDRA",
+      "defense_modifier": 0,
+      "impassable": true,
+      "is_hills": false,
+      "is_mountain": true,
+      "is_shallow_water": false,
+      "is_water": false,
+      "movement_cost": 1,
+      "name_key": "LOC_TERRAIN_TUNDRA_MOUNTAIN_NAME",
+      "terrain_class": "TERRAIN_CLASS_MOUNTAIN",
+      "terrain_type": "TERRAIN_TUNDRA_MOUNTAIN",
+      "yields": {}
+    }
+  }
+}

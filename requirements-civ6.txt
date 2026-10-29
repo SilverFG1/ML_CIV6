@@ -1,0 +1,7 @@
+# Optional live-game bridge, pinned to the API validated by this integration.
+# The tactical baseline uses local Python logic and requires no model API key.
+civ6-mcp @ https://github.com/lmwilki/civ6-mcp/archive/dd2019056371b92ea4854e879ddf05a8cad95e8a.zip
+# Compatible transitive versions preserve the existing typing-extensions baseline.
+typing-extensions==4.15.0
+anyio==4.14.2
+pydantic==2.13.5

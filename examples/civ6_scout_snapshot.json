@@ -1,0 +1,30 @@
+{
+  "schema": "civ6.live.v1",
+  "turn": 10,
+  "player_id": 0,
+  "turn_active": true,
+  "units": [
+    {
+      "index": 0,
+      "unit_id": 65536,
+      "name": "Scout",
+      "unit_type": "UNIT_SCOUT",
+      "x": 4,
+      "y": 4,
+      "hp": 100,
+      "moves_remaining": 3,
+      "max_moves": 3,
+      "base_combat_strength": 10,
+      "base_sight_range": 2,
+      "scout_moves": [
+        {"x": 5, "y": 4, "unrevealed_tiles": 4, "visible_threats": 0},
+        {"x": 4, "y": 5, "unrevealed_tiles": 7, "visible_threats": 1},
+        {"x": 3, "y": 4, "unrevealed_tiles": 2, "visible_threats": 0}
+      ]
+    }
+  ],
+  "overview": {"source": "Synthetic scout example for offline planning; not captured from a real game"},
+  "tiles": [],
+  "center": [4, 4],
+  "radius": 2
+}

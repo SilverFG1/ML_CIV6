@@ -285,6 +285,14 @@ class RunnerTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.args('--unit-count', '1', '--unit-types', 'cavalry')
 
+    def test_heavy_chariot_and_battering_ram_train_and_evaluate(self):
+        args = self.args('--unit-count', '2', '--unit-types', 'heavy_chariot', 'battering_ram', '--wall-hp', '20')
+        agent = self.make_agent(args)
+        self.assertEqual(agent.action_count, 49)
+        run_game.train_agent(agent, args)
+        evaluations = run_game.compare_policies(agent, args, verbose=False)
+        self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
+
     def test_runner_rejects_corrupt_progress_metadata(self):
         args = self.args()
         agent = self.make_agent(args)

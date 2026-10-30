@@ -4,11 +4,13 @@ import time
 
 import constants
 
-# Warriors share the plain unit sprite; other types get a coloured label.
-UNIT_LABEL_COLORS = {
-    'spearman': (170, 215, 255),
-    'slinger': (255, 190, 130),
-    'archer': (255, 235, 140),
+# Warriors share the plain unit sprite; other types get a short coloured label.
+UNIT_LABELS = {
+    'spearman': ('SPEARMAN', (170, 215, 255)),
+    'heavy_chariot': ('CHARIOT', (235, 160, 235)),
+    'slinger': ('SLINGER', (255, 190, 130)),
+    'archer': ('ARCHER', (255, 235, 140)),
+    'battering_ram': ('RAM', (200, 200, 200)),
 }
 
 
@@ -88,9 +90,9 @@ class Renderer:
             if obj.alive:
                 image = self.images['city' if obj is self.env.city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
-                label_color = UNIT_LABEL_COLORS.get(getattr(obj, 'unit_type', None))
-                if label_color is not None:
-                    self._text(obj.unit_type.upper(), (x + 2, y + 2), label_color, small=True)
+                label = UNIT_LABELS.get(getattr(obj, 'unit_type', None))
+                if label is not None:
+                    self._text(label[0], (x + 2, y + 2), label[1], small=True)
             else:
                 s = self.size
                 p.draw.line(self.surface, constants.COLOR_RED, (x + s / 3, y + s / 3),

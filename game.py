@@ -26,6 +26,7 @@ def hex_distance(first, second):
 class UnitSpec:
     """Default combat profile for a unit type."""
     strength: float
+    unit_class: str = 'melee'
     ranged_strength: float = 0
     attack_range: int = 1
 
@@ -33,15 +34,28 @@ class UnitSpec:
     def ranged(self):
         return self.ranged_strength > 0
 
+    @property
+    def support(self):
+        """Support units cannot attack or capture the city."""
+        return self.unit_class == 'support'
 
-# Spearmen and slingers use their Civ VI base strengths.
+
+# New unit types use their Civ VI base strengths. Archers keep this project's
+# original 12/20 values.
 UNIT_SPECS = {
     'warrior': UnitSpec(strength=20),
-    'spearman': UnitSpec(strength=25),
-    'slinger': UnitSpec(strength=5, ranged_strength=15, attack_range=1),
-    'archer': UnitSpec(strength=12, ranged_strength=20, attack_range=2),
+    'spearman': UnitSpec(strength=25, unit_class='anti_cavalry'),
+    'heavy_chariot': UnitSpec(strength=28, unit_class='heavy_cavalry'),
+    'slinger': UnitSpec(strength=5, unit_class='ranged', ranged_strength=15, attack_range=1),
+    'archer': UnitSpec(strength=12, unit_class='ranged', ranged_strength=20, attack_range=2),
+    'battering_ram': UnitSpec(strength=0, unit_class='support'),
 }
 UNIT_TYPES = tuple(UNIT_SPECS)
+
+# Melee attacks deal this share of their damage to walls. A battering ram next
+# to the city restores full wall damage for the classes it supports.
+MELEE_WALL_DAMAGE = 0.5
+RAM_SUPPORTED_CLASSES = ('melee', 'anti_cavalry')
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,8 @@ class GameConfig:
         if self.unit_types and (len(self.unit_types) != self.unit_count
                                or any(t not in UNIT_SPECS for t in self.unit_types)):
             raise ValueError(f'unit_types must name one of {", ".join(UNIT_TYPES)} for every unit')
+        if self.unit_types and all(UNIT_SPECS[t].support for t in self.unit_types):
+            raise ValueError('unit_types must include at least one unit that can attack')
         if self.difficulty not in ('easy', 'normal', 'hard', 'curriculum'):
             raise ValueError('Unknown difficulty')
         if self.city_position is not None:
@@ -134,6 +150,10 @@ class C_Unit(C_Sprite):
     def ranged(self):
         return UNIT_SPECS[self.unit_type].ranged
 
+    @property
+    def support(self):
+        return UNIT_SPECS[self.unit_type].support
+
     def move(self, dx, dy):
         if self.env is None:
             raise RuntimeError('Unit must belong to a Game before moving')
@@ -171,15 +191,22 @@ class C_City(C_Sprite):
         if self.env is not None and self.alive:
             self.env.city_turn()
 
-    def take_damage(self, damage, aggressor_alive=True):
+    def take_damage(self, damage, aggressor_alive=True, wall_multiplier=1.0):
+        """Walls absorb damage first, scaled by wall_multiplier; any excess hits the city."""
         if not self.alive:
             return
+        if not 0 < wall_multiplier <= 1:
+            raise ValueError('wall_multiplier must lie in (0, 1]')
         damage = max(0, float(damage))
-        wall_damage = min(self.wall_hp, damage)
-        if wall_damage:
-            self.wall_hp -= wall_damage
-            damage -= wall_damage
-            self._event('wall_damaged', amount=wall_damage)
+        if self.wall_hp > 0:
+            if damage * wall_multiplier < self.wall_hp:
+                wall_damage, damage = damage * wall_multiplier, 0
+            else:
+                wall_damage = self.wall_hp
+                damage -= wall_damage / wall_multiplier
+            if wall_damage:
+                self.wall_hp -= wall_damage
+                self._event('wall_damaged', amount=wall_damage)
         actual = min(self.hp if aggressor_alive else max(0, self.hp - 1), damage)
         if actual:
             self.hp -= actual
@@ -319,6 +346,8 @@ class Game:
                 cell = self.map.grid.get(destination)
                 if cell is None or cell.block_path or destination in remaining:
                     continue
+                if unit.support and destination == self.city.position:
+                    continue
                 final = unit.position if destination == self.city.position else destination
                 visit(index + 1, action + [direction], remaining | {final})
 
@@ -348,11 +377,14 @@ class Game:
             unit._event('invalid_move')
             return
         target = self.occupant(destination, exclude=unit)
-        if target is self.city:
+        if target is self.city and unit.support:
+            unit._event('invalid_move')
+        elif target is self.city:
             damage_out, damage_taken = attack(unit, self.city)
             unit._event('attacked')
             unit.take_damage(damage_taken)
-            self.city.take_damage(damage_out, aggressor_alive=unit.alive)
+            self.city.take_damage(damage_out, aggressor_alive=unit.alive,
+                                  wall_multiplier=self.melee_wall_multiplier(unit))
             if unit.alive:
                 unit.status = 'attacked'
         elif target is not None:
@@ -369,6 +401,15 @@ class Game:
             unit.status = 'alive'
             unit._event('moved', progress=distance_before - hex_distance(destination, self.city.position),
                         cost=cell.movement_cost)
+
+    def ram_in_position(self):
+        return any(u.alive and u.support and hex_distance(u.position, self.city.position) == 1
+                   for u in self.units)
+
+    def melee_wall_multiplier(self, unit):
+        if UNIT_SPECS[unit.unit_type].unit_class in RAM_SUPPORTED_CLASSES and self.ram_in_position():
+            return 1.0
+        return MELEE_WALL_DAMAGE
 
     def city_turn(self):
         if not self.city.alive:
@@ -402,7 +443,7 @@ class Game:
     def _outcome(self):
         if not self.city.alive or self.city.hp <= 0:
             return 'win'
-        if not any(u.alive and u.hp > 0 for u in self.units):
+        if not any(u.alive and u.hp > 0 and not u.support for u in self.units):
             return 'loss'
         return 'ongoing'
 
@@ -514,7 +555,12 @@ class Game:
                 destination = unit.x + dx, unit.y + dy
                 score += costs.get(destination, 10000)
                 if direction == 'SPACE':
-                    score += -2 if unit.hp < .35 * unit.hp_max else .3
+                    if unit.hp < .35 * unit.hp_max:
+                        score -= 2
+                    elif unit.support and hex_distance(unit.position, self.city.position) == 1:
+                        score -= 1
+                    else:
+                        score += .3
             scores.append((score, action))
         best = min(score for score, _ in scores)
         return rng.choice([action for score, action in scores if score == best])

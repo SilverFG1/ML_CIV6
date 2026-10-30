@@ -47,11 +47,11 @@ class RendererTests(unittest.TestCase):
         self.assertTrue(self.env.quit)
 
     def test_draws_every_unit_type(self):
-        env = Game(render=True, config=GameConfig(
-            unit_count=4, unit_types=('warrior', 'spearman', 'slinger', 'archer')))
-        env.reset(seed=7)
-        self.addCleanup(env.close)
-        self.assertTrue(env.render_frame())
+        for unit_types in [('warrior', 'spearman', 'slinger', 'archer'), ('heavy_chariot', 'battering_ram')]:
+            env = Game(render=True, config=GameConfig(unit_count=len(unit_types), unit_types=unit_types))
+            env.reset(seed=7)
+            self.assertTrue(env.render_frame())
+            env.close()
 
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))

@@ -220,7 +220,8 @@ class GameTests(unittest.TestCase):
         for kwargs in [{'width': 2}, {'unit_count': 0}, {'city_position': (99, 0)},
                        {'wall_hp': -1}, {'forest_density': .9},
                        {'unit_strengths': (20, 30)}, {'city_strength': float('nan')},
-                       {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)}]:
+                       {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)},
+                       {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -328,6 +329,83 @@ class GameTests(unittest.TestCase):
         self.assertEqual(env.actions[env.guided_action(random.Random(1))], ('SHOOT',))
         env.city.hp = 1
         self.assertEqual(env.actions[env.guided_action(random.Random(1))], ('W',))
+
+    def test_heavy_chariot_and_battering_ram_profiles(self):
+        env = self.make_env(unit_count=2, unit_types=('heavy_chariot', 'battering_ram'))
+        profiles = [(u.strength, u.strength_ranged, u.ranged, u.support) for u in env.units]
+        self.assertEqual(profiles, [(28, 0, False, False), (0, 0, False, True)])
+        self.assertEqual(env.action_count, 49)
+        spearman = self.make_env(unit_count=1, unit_types=('spearman',))
+        self.place(env, [(3, 4), (0, 0)])
+        self.place(spearman, [(3, 4)])
+        chariot_out, chariot_taken = attack(env.units[0], env.city, rng=random.Random(3))
+        spear_out, spear_taken = attack(spearman.units[0], spearman.city, rng=random.Random(3))
+        self.assertGreater(chariot_out, spear_out)
+        self.assertLess(chariot_taken, spear_taken)
+
+    def test_battering_ram_cannot_attack_or_capture(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_heals=False)
+        self.place(env, [(0, 0), (5, 4)])
+        actions = [env.actions[a] for a in env.valid_actions()]
+        self.assertNotIn('W', {a[1] for a in actions})
+        self.assertIn('SPACE', {a[1] for a in actions})
+        env.city.hp = 1
+        with patch('game.attack', return_value=(50, 0)) as mocked:
+            _, _, done = env.step(env.encode_action(['SPACE', 'W']))
+        mocked.assert_not_called()
+        self.assertFalse(done)
+        self.assertEqual(env.city.hp, 1)
+        self.assertEqual(env.units[1].position, (5, 4))
+        self.assertIn('invalid_move', [e['type'] for e in env.events])
+
+    def test_squad_with_only_a_ram_left_has_lost(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'))
+        env.units[0].death_unit()
+        _, _, done = env.step(self.wait(env))
+        self.assertTrue(done)
+        self.assertEqual(env.last_info['outcome'], 'loss')
+
+    def melee_wall_damage(self, unit_types, positions, actions, wall_hp=30):
+        env = self.make_env(unit_count=len(unit_types), unit_types=unit_types,
+                            wall_hp=wall_hp, city_heals=False)
+        self.place(env, positions)
+        with patch('game.attack', return_value=(20, 0)):
+            env.step(env.encode_action(actions))
+        return wall_hp - env.city.wall_hp, env.city.hp
+
+    def test_melee_does_half_damage_to_walls_without_an_adjacent_ram(self):
+        self.assertEqual(self.melee_wall_damage(('warrior',), [(3, 4)], ['E']), (10, 100))
+        ram_too_far = self.melee_wall_damage(('warrior', 'battering_ram'), [(3, 4), (6, 4)], ['E', 'SPACE'])
+        self.assertEqual(ram_too_far, (10, 100))
+        # Walls that break mid-attack pass the unspent damage to the city at full rate.
+        self.assertEqual(self.melee_wall_damage(('warrior',), [(3, 4)], ['E'], wall_hp=4), (4, 88))
+
+    def test_adjacent_ram_gives_melee_and_anti_cavalry_full_wall_damage(self):
+        for kind in ('warrior', 'spearman'):
+            with self.subTest(kind=kind):
+                result = self.melee_wall_damage((kind, 'battering_ram'), [(3, 4), (5, 4)], ['E', 'SPACE'])
+                self.assertEqual(result, (20, 100))
+        # The ram can move into place earlier in the same turn.
+        moved_in = self.melee_wall_damage(('battering_ram', 'warrior'), [(6, 4), (3, 4)], ['W', 'E'])
+        self.assertEqual(moved_in, (20, 100))
+
+    def test_ram_does_not_help_heavy_chariots(self):
+        result = self.melee_wall_damage(('heavy_chariot', 'battering_ram'), [(3, 4), (5, 4)], ['E', 'SPACE'])
+        self.assertEqual(result, (10, 100))
+
+    def test_ranged_attacks_still_do_full_wall_damage(self):
+        env = self.make_env(unit_count=1, unit_types=('archer',), wall_hp=30, city_heals=False)
+        self.place(env, [(6, 4)])
+        with patch('game.attack', return_value=(20, 0)):
+            env.step(env.encode_action(['SHOOT']))
+        self.assertEqual(env.city.wall_hp, 10)
+        with self.assertRaises(ValueError):
+            env.city.take_damage(5, wall_multiplier=0)
+
+    def test_heuristic_holds_ram_next_to_city(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_heals=False)
+        self.place(env, [(0, 0), (5, 4)])
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))][1], 'SPACE')
 
 
 if __name__ == '__main__':

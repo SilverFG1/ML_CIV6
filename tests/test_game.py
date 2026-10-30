@@ -10,7 +10,7 @@ import numpy as np
 
 import constants
 from class_hex import HexMap
-from game import Game, GameConfig, attack, hex_distance
+from game import C_Unit, Game, GameConfig, attack, hex_distance
 
 
 class GameTests(unittest.TestCase):
@@ -220,7 +220,7 @@ class GameTests(unittest.TestCase):
         for kwargs in [{'width': 2}, {'unit_count': 0}, {'city_position': (99, 0)},
                        {'wall_hp': -1}, {'forest_density': .9},
                        {'unit_strengths': (20, 30)}, {'city_strength': float('nan')},
-                       {'unit_types': ('archer',)}]:
+                       {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -255,6 +255,79 @@ class GameTests(unittest.TestCase):
             _, _, done = env.step(env.encode_action(['E']))
         self.assertTrue(done)
         self.assertEqual(env.last_info['outcome'], 'win')
+
+    def test_unit_types_use_their_default_strengths(self):
+        env = self.make_env(unit_count=4, unit_types=('warrior', 'spearman', 'slinger', 'archer'))
+        profiles = [(u.unit_type, u.strength, u.strength_ranged, u.attack_range, u.ranged) for u in env.units]
+        self.assertEqual(profiles, [('warrior', 20, 0, 1, False), ('spearman', 25, 0, 1, False),
+                                    ('slinger', 5, 15, 1, True), ('archer', 12, 20, 2, True)])
+        self.assertEqual(env.action_count, 7 * 7 * 8 * 8)
+        self.assertEqual([len(d) for d in env.unit_directions], [7, 7, 8, 8])
+        override = self.make_env(unit_count=2, unit_types=('spearman', 'slinger'), unit_strengths=(30, 9))
+        self.assertEqual([(u.strength, u.strength_ranged) for u in override.units], [(30, 0), (9, 15)])
+        with self.assertRaises(ValueError):
+            C_Unit(0, 0, unit_type='cavalry')
+
+    def test_existing_unit_types_keep_their_action_layout(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'archer'))
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,archer')
+        self.assertEqual(env.actions[-1], ('SPACE', 'SHOOT'))
+
+    def test_spearman_is_melee_only_and_hits_harder_than_a_warrior(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'spearman'), city_heals=False)
+        self.assertEqual(env.action_count, 49)
+        self.place(env, [(3, 4), (5, 4)])
+        warrior_out, warrior_taken = attack(env.units[0], env.city, rng=random.Random(3))
+        spear_out, spear_taken = attack(env.units[1], env.city, rng=random.Random(3))
+        self.assertGreater(spear_out, warrior_out)
+        self.assertLess(spear_taken, warrior_taken)
+        env.city.hp = 1
+        with patch('game.attack', return_value=(5, 0)):
+            _, _, done = env.step(env.encode_action(['SPACE', 'W']))
+        self.assertTrue(done)
+        self.assertEqual(env.last_info['outcome'], 'win')
+
+    def test_slinger_shoots_only_adjacent_city_without_retaliation(self):
+        env = self.make_env(unit_count=1, unit_types=('slinger',), city_heals=False)
+        self.assertEqual(env.action_count, 8)
+        shoot = env.encode_action(['SHOOT'])
+        self.place(env, [(6, 4)])
+        self.assertEqual(hex_distance(env.units[0].position, env.city.position), 2)
+        self.assertNotIn(shoot, env.valid_actions())
+        self.place(env, [(5, 4)])
+        self.assertIn(shoot, env.valid_actions())
+        with patch('game.attack', return_value=(30, 0)):
+            _, _, done = env.step(shoot)
+        self.assertFalse(done)
+        self.assertEqual(env.city.hp, 70)
+        self.assertEqual(env.units[0].hp, 100)
+        self.assertIn('ranged_attack', [e['type'] for e in env.events])
+        env.city.hp = 1
+        with patch('game.attack', return_value=(30, 0)):
+            env.step(shoot)
+        self.assertEqual(env.city.hp, 1)
+        self.assertTrue(env.city.alive)
+        with patch('game.attack', return_value=(5, 0)):
+            _, _, done = env.step(env.encode_action(['W']))
+        self.assertTrue(done)
+        self.assertEqual(env.last_info['outcome'], 'win')
+
+    def test_slinger_ranged_strength_sets_damage_and_melee_is_risky(self):
+        env = self.make_env(unit_count=2, unit_types=('slinger', 'archer'), city_heals=False)
+        self.place(env, [(5, 4), (6, 4)])
+        slinger_shot, _ = attack(env.units[0], env.city, ranged=True, rng=random.Random(5))
+        archer_shot, _ = attack(env.units[1], env.city, ranged=True, rng=random.Random(5))
+        self.assertLess(slinger_shot, archer_shot)
+        _, slinger_melee_taken = attack(env.units[0], env.city, rng=random.Random(5))
+        _, archer_melee_taken = attack(env.units[1], env.city, rng=random.Random(5))
+        self.assertGreater(slinger_melee_taken, archer_melee_taken)
+
+    def test_heuristic_slinger_shoots_until_city_can_be_captured(self):
+        env = self.make_env(unit_count=1, unit_types=('slinger',), city_heals=False)
+        self.place(env, [(5, 4)])
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))], ('SHOOT',))
+        env.city.hp = 1
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))], ('W',))
 
 
 if __name__ == '__main__':

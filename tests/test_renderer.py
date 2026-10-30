@@ -46,6 +46,26 @@ class RendererTests(unittest.TestCase):
         self.assertFalse(self.env.render_frame())
         self.assertTrue(self.env.quit)
 
+    def test_draws_every_unit_type(self):
+        env = Game(render=True, config=GameConfig(
+            unit_count=4, unit_types=('warrior', 'spearman', 'slinger', 'archer')))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        self.assertTrue(env.render_frame())
+
+    def test_human_slinger_shoots_adjacent_city(self):
+        env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.render_frame()
+        renderer = env._renderer
+        p = renderer.pygame
+        env.units[0].x, env.units[0].y = 5, 4
+        for key in [p.K_f, p.K_ESCAPE]:
+            p.event.post(p.event.Event(p.KEYDOWN, key=key))
+        renderer.human_loop()
+        self.assertIn('ranged_attack', [e['type'] for e in env.events])
+
     def test_human_can_change_unit_and_shoot(self):
         self.env.human = True
         self.env.render_frame()

@@ -55,7 +55,7 @@ def parse_args(argv=None):
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--no-city-healing", action="store_true")
     parser.add_argument("--unit-strengths", type=float, nargs="+")
-    parser.add_argument("--unit-types", choices=("warrior", "archer"), nargs="+")
+    parser.add_argument("--unit-types", choices=game.UNIT_TYPES, nargs="+")
     parser.add_argument("--difficulty", choices=tuple(DIFFICULTY_STRENGTHS))
     parser.add_argument("--curriculum-episodes", type=int,
                         help="ramp city strength from 18 to selected difficulty over N absolute episodes")

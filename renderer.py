@@ -4,6 +4,13 @@ import time
 
 import constants
 
+# Warriors share the plain unit sprite; other types get a coloured label.
+UNIT_LABEL_COLORS = {
+    'spearman': (170, 215, 255),
+    'slinger': (255, 190, 130),
+    'archer': (255, 235, 140),
+}
+
 
 class Renderer:
     def __init__(self, env):
@@ -81,8 +88,9 @@ class Renderer:
             if obj.alive:
                 image = self.images['city' if obj is self.env.city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
-                if getattr(obj, 'unit_type', None) == 'archer':
-                    self._text('ARCHER', (x + 2, y + 2), (255, 235, 140), small=True)
+                label_color = UNIT_LABEL_COLORS.get(getattr(obj, 'unit_type', None))
+                if label_color is not None:
+                    self._text(obj.unit_type.upper(), (x + 2, y + 2), label_color, small=True)
             else:
                 s = self.size
                 p.draw.line(self.surface, constants.COLOR_RED, (x + s / 3, y + s / 3),
@@ -99,7 +107,7 @@ class Renderer:
         self._text(f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
                    f'Walls {city.wall_hp:.0f}   {outcome.upper()}', (self.margin, y))
         if self.env.human:
-            controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot   R: restart   Esc: quit'
+            controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
         else:
             controls = f'Space: pause   Right: one turn   +/-: speed   Esc: quit   Delay {self.delay_ms or 0}ms'
         control_lines = self._wrapped_text(controls, (self.margin, y + 27))

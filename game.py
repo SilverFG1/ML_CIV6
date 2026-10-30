@@ -23,6 +23,28 @@ def hex_distance(first, second):
 
 
 @dataclass(frozen=True)
+class UnitSpec:
+    """Default combat profile for a unit type."""
+    strength: float
+    ranged_strength: float = 0
+    attack_range: int = 1
+
+    @property
+    def ranged(self):
+        return self.ranged_strength > 0
+
+
+# Spearmen and slingers use their Civ VI base strengths.
+UNIT_SPECS = {
+    'warrior': UnitSpec(strength=20),
+    'spearman': UnitSpec(strength=25),
+    'slinger': UnitSpec(strength=5, ranged_strength=15, attack_range=1),
+    'archer': UnitSpec(strength=12, ranged_strength=20, attack_range=2),
+}
+UNIT_TYPES = tuple(UNIT_SPECS)
+
+
+@dataclass(frozen=True)
 class GameConfig:
     width: int = 8
     height: int = 8
@@ -62,8 +84,8 @@ class GameConfig:
         if any(not math.isfinite(s) or not 0 < s <= 100 for s in self.unit_strengths):
             raise ValueError('unit strengths must be finite and in (0, 100]')
         if self.unit_types and (len(self.unit_types) != self.unit_count
-                               or any(t not in ('warrior', 'archer') for t in self.unit_types)):
-            raise ValueError('unit_types must contain warrior or archer for every unit')
+                               or any(t not in UNIT_SPECS for t in self.unit_types)):
+            raise ValueError(f'unit_types must name one of {", ".join(UNIT_TYPES)} for every unit')
         if self.difficulty not in ('easy', 'normal', 'hard', 'curriculum'):
             raise ValueError('Unknown difficulty')
         if self.city_position is not None:
@@ -101,10 +123,16 @@ class C_Sprite:
 
 class C_Unit(C_Sprite):
     def __init__(self, *args, strength_ranged=0, unit_type='warrior', **kwargs):
+        if unit_type not in UNIT_SPECS:
+            raise ValueError(f'Unknown unit type: {unit_type}')
         super().__init__(*args, **kwargs)
         self.strength_ranged = float(strength_ranged)
         self.unit_type = unit_type
-        self.attack_range = 2 if unit_type == 'archer' else 1
+        self.attack_range = UNIT_SPECS[unit_type].attack_range
+
+    @property
+    def ranged(self):
+        return UNIT_SPECS[self.unit_type].ranged
 
     def move(self, dx, dy):
         if self.env is None:
@@ -192,7 +220,7 @@ class Game:
         self.human, self.ml_ai, self.render = human, ml_ai, render
         self.rng = random.Random(seed)
         self.unit_types = tuple(self.config.unit_types or ('warrior',) * self.config.unit_count)
-        self.unit_directions = [constants.DIRECTIONS + (('SHOOT',) if kind == 'archer' else ())
+        self.unit_directions = [constants.DIRECTIONS + (('SHOOT',) if UNIT_SPECS[kind].ranged else ())
                                 for kind in self.unit_types]
         self.actions = tuple(itertools.product(*self.unit_directions))
         self.action_count = len(self.actions)
@@ -236,11 +264,11 @@ class Game:
                 cell.set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
         start_positions = self.rng.sample(sorted(component - {city_pos}), c.unit_count)
-        strengths = c.unit_strengths or tuple(12 if t == 'archer' else 20 for t in self.unit_types)
+        specs = [UNIT_SPECS[kind] for kind in self.unit_types]
+        strengths = c.unit_strengths or tuple(spec.strength for spec in specs)
         names = ('Otto', 'Fynn', 'Victor', 'Ada')
         self.units = [C_Unit(*pos, name_instance=names[i], strength=strengths[i], env=self,
-                             unit_type=self.unit_types[i],
-                             strength_ranged=20 if self.unit_types[i] == 'archer' else 0)
+                             unit_type=self.unit_types[i], strength_ranged=specs[i].ranged_strength)
                       for i, pos in enumerate(start_positions)]
         self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
                            wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
@@ -363,7 +391,7 @@ class Game:
     def shoot(self, unit):
         if not unit.alive or not self.city.alive:
             return
-        if unit.unit_type != 'archer' or hex_distance(unit.position, self.city.position) > unit.attack_range:
+        if not unit.ranged or hex_distance(unit.position, self.city.position) > unit.attack_range:
             unit._event('invalid_move')
             return
         damage, _ = attack(unit, self.city, ranged=True)

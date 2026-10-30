@@ -67,7 +67,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--difficulty easy\|normal\|hard\|curriculum` | Choose city strength: 18, 28, 38, or a 1,000-episode curriculum targeting 38. |
 | `--width`, `--height` | Set map dimensions from 3 to 32. |
 | `--unit-count` | Choose one to four starting units. |
-| `--unit-types warrior archer ...` | Set one type per unit; omitted types default to warriors. |
+| `--unit-types warrior spearman slinger archer ...` | Set one type per unit; omitted types default to warriors. |
 | `--city-position X Y` | Set the city's map coordinate. |
 | `--unit-strengths N [N ...]`, `--city-strength` | Override unit and city combat strengths. |
 | `--ranged-strength` | Configure the city's ranged attack strength. |
@@ -76,9 +76,18 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--no-city-healing` | Disable city healing. |
 | `--curriculum-episodes N` | Progress from easier scenarios to the selected difficulty over N training episodes. |
 
-Warriors default to melee strength 20. Archers default to melee strength 12 and ranged strength 20. Archers have a `SHOOT` action at hex distance two, with no melee retaliation; ranged fire leaves the city at a minimum of one HP, so capture requires a melee action. Mountains block movement. Forests provide a defense bonus and add a movement-cost penalty. Terrain generation places units in the city's reachable component.
+Each unit type has default strengths; `--unit-strengths` overrides the melee value only.
 
-The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
+| Unit | Melee | Ranged | Shooting range |
+| --- | --- | --- | --- |
+| `warrior` | 20 | — | — |
+| `spearman` | 25 | — | — |
+| `slinger` | 5 | 15 | 1 (adjacent) |
+| `archer` | 12 | 20 | 2 |
+
+Spearmen and slingers use their Civ VI base strengths. There is no cavalry here, so the spearman's anti-cavalry bonus does not apply; it is simply a stronger melee unit. Slingers and archers have a `SHOOT` action within their range, with no melee retaliation. A slinger's weak melee strength makes attacking the city in melee costly, so it should shoot from an adjacent tile. Ranged fire leaves the city at a minimum of one HP, so capture requires a melee action. Mountains block movement. Forests provide a defense bonus and add a movement-cost penalty. Terrain generation places units in the city's reachable component.
+
+The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
 
 For a mixed squad:
 
@@ -104,7 +113,7 @@ python run_game.py --episodes 0 --eval-episodes 3 --eval-policies learned --mode
 
 During playback, **Space** pauses/resumes, **Right Arrow** advances one turn while paused, **+ / -** change playback speed, and **Esc** exits. `--render-training` also displays training turns.
 
-Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
+Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer or slinger, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
 
 ## Verification
 

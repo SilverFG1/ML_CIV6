@@ -271,6 +271,20 @@ class RunnerTests(unittest.TestCase):
         evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
         self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
 
+    def test_spearman_and_slinger_resume_and_evaluate(self):
+        args = self.args('--unit-count', '2', '--unit-types', 'spearman', 'slinger')
+        agent = self.make_agent(args)
+        self.assertEqual(agent.action_count, 56)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        resumed = self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.unit_types, ('spearman', 'slinger'))
+        evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
+        self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args('--unit-count', '1', '--unit-types', 'cavalry')
+
     def test_runner_rejects_corrupt_progress_metadata(self):
         args = self.args()
         agent = self.make_agent(args)

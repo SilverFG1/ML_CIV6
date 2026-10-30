@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from game import Game, GameConfig
+from game import C_Raider, Game, GameConfig
 
 
 @unittest.skipUnless(importlib.util.find_spec('pygame'), 'optional pygame not installed')
@@ -63,6 +63,18 @@ class RendererTests(unittest.TestCase):
             city.death()
         env.step(env.encode_action(['SPACE'] * 3))
         self.assertEqual(env.last_info['outcome'], 'win')
+        self.assertTrue(env.render_frame())
+
+    def test_draws_capital_raiders_and_capital_loss(self):
+        env = Game(render=True, config=GameConfig(player_capital=True))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        free = next(position for position in sorted(env.map.grid) if env.occupant(position) is None)
+        env.raiders.append(C_Raider(*free, name_instance='Raider 1', strength=20, env=env))
+        self.assertTrue(env.render_frame())
+        env.capital.death()
+        env.step(env.encode_action(['SPACE'] * 3))
+        self.assertTrue(env.last_info['capital_lost'])
         self.assertTrue(env.render_frame())
 
     def test_human_slinger_shoots_adjacent_city(self):

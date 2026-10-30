@@ -89,6 +89,32 @@ def place_cities(capital, candidates, count, rng=None, fits=None):
     return positions
 
 
+# With player_capital set, the squad has its own capital to defend. Enemy cities
+# send raiders to capture it; losing it loses the game.
+PLAYER_CAPITAL_NAME = 'Otterholt'
+MAX_RAIDERS = 4
+RAID_THREAT_RADIUS = 3
+
+
+def place_capital(enemy_positions, candidates, rng=None, fits=None):
+    """Pick the player's capital: the site farthest from the nearest enemy city.
+
+    It must be at least MIN_CITY_DISTANCE from every enemy city and pass fits.
+    Ties are drawn at random when rng is given, otherwise the first in scan order.
+    Returns None when no site qualifies.
+    """
+    gaps = {}
+    for site in candidates:
+        gap = min(hex_distance(site, enemy) for enemy in enemy_positions)
+        if gap >= MIN_CITY_DISTANCE and (fits is None or fits(site)):
+            gaps[site] = gap
+    if not gaps:
+        return None
+    best = max(gaps.values())
+    farthest = sorted(site for site, gap in gaps.items() if gap == best)
+    return rng.choice(farthest) if rng is not None else farthest[0]
+
+
 @dataclass(frozen=True)
 class GameConfig:
     width: int = 8
@@ -105,6 +131,10 @@ class GameConfig:
     unit_types: tuple = ()
     difficulty: str = 'normal'
     city_count: int = 1
+    player_capital: bool = False
+    capital_strength: float = 28
+    raid_interval: int = 6
+    raider_strength: float = 20
 
     def __post_init__(self):
         for name in ('width', 'height'):
@@ -153,9 +183,22 @@ class GameConfig:
         def fits(site):
             return open_neighbors(site, lambda p: 0 <= p[0] < self.width and 0 <= p[1] < self.height) >= siege_room
 
-        if place_cities(capital, every_tile, self.city_count, fits=fits) is None:
+        if not isinstance(self.player_capital, bool):
+            raise ValueError('player_capital must be True or False')
+        for name in ('capital_strength', 'raider_strength'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or not 0 < value <= 100:
+                raise ValueError(f'{name} must be finite and in (0, 100]')
+        if (isinstance(self.raid_interval, bool) or not isinstance(self.raid_interval, int)
+                or not 0 <= self.raid_interval <= 1000):
+            raise ValueError('raid_interval must be an integer between 0 and 1000')
+        enemy_sites = place_cities(capital, every_tile, self.city_count, fits=fits)
+        if enemy_sites is None:
             raise ValueError(f'the map cannot fit {self.city_count} cities at least {MIN_CITY_DISTANCE} '
                              f'hexes apart, each with {siege_room} open neighboring tiles')
+        if self.player_capital and place_capital(enemy_sites, every_tile, fits=fits) is None:
+            raise ValueError(f"the map has no room for the player's capital at least {MIN_CITY_DISTANCE} "
+                             f'hexes from every enemy city')
 
 
 class C_Sprite:
@@ -183,6 +226,8 @@ class C_Sprite:
 
 
 class C_Unit(C_Sprite):
+    damage_event, death_event = 'unit_damaged', 'unit_died'
+
     def __init__(self, *args, strength_ranged=0, unit_type='warrior', **kwargs):
         if unit_type not in UNIT_SPECS:
             raise ValueError(f'Unknown unit type: {unit_type}')
@@ -209,7 +254,7 @@ class C_Unit(C_Sprite):
             return
         actual = min(self.hp, max(0, float(damage)))
         self.hp -= actual
-        self._event('unit_damaged', amount=actual)
+        self._event(self.damage_event, amount=actual)
         if self.hp <= 0:
             self.death_unit()
 
@@ -218,10 +263,18 @@ class C_Unit(C_Sprite):
             self.hp = 0
             self.alive = False
             self.status = 'dead'
-            self._event('unit_died')
+            self._event(self.death_event)
+
+
+class C_Raider(C_Unit):
+    """An enemy unit sent to capture the player's capital."""
+    damage_event, death_event = 'raider_damaged', 'raider_killed'
 
 
 class C_City(C_Sprite):
+    damage_event, wall_event, capture_event, heal_event = (
+        'city_damaged', 'wall_damaged', 'city_captured', 'city_healed')
+
     def __init__(self, x, y, sprite=None, name_instance='City', hp=100,
                  hp_max=100, wall_hp=0, strength=28, strength_ranged=0,
                  ranged_combat=False, heal=True, env=None):
@@ -251,12 +304,12 @@ class C_City(C_Sprite):
                 damage -= wall_damage / wall_multiplier
             if wall_damage:
                 self.wall_hp -= wall_damage
-                self._event('wall_damaged', amount=wall_damage)
+                self._event(self.wall_event, amount=wall_damage)
         actual = min(self.hp if aggressor_alive else max(0, self.hp - 1), damage)
         if actual:
             self.hp -= actual
             self.status = 'took damage'
-            self._event('city_damaged', amount=actual)
+            self._event(self.damage_event, amount=actual)
         if self.hp <= 0:
             self.death()
 
@@ -265,7 +318,13 @@ class C_City(C_Sprite):
             self.hp = 0
             self.alive = False
             self.status = 'dead'
-            self._event('city_captured')
+            self._event(self.capture_event)
+
+
+class C_Capital(C_City):
+    """The player's own capital; losing it loses the game."""
+    damage_event, wall_event, capture_event, heal_event = (
+        'capital_damaged', 'capital_wall_damaged', 'capital_captured', 'capital_healed')
 
 
 def attack(aggressor, target, ranged=False, rng=None):
@@ -301,24 +360,34 @@ class Game:
                                    + ','.join(self.unit_types))
         if self.config.city_count > 1:
             self.observation_schema += f':cities={self.config.city_count}'
+        if self.config.player_capital:
+            self.observation_schema += ':capital'
         self._renderer = None
         self.quit = False
         self.units = []
         self.cities = []
+        self.capital = None
+        self.raiders = []
         self.events = []
-        self.last_info = {'outcome': 'ongoing', 'events': [], 'cities_captured': 0}
+        self.last_info = {'outcome': 'ongoing', 'events': [], 'cities_captured': 0, 'capital_lost': False}
         self.turn_number = 0
         self._done = False
         self._valid_cache_key = None
 
     @property
     def city(self):
-        """The first city (the capital); single-city callers use this."""
+        """The first enemy city (the enemy capital); single-city callers use this."""
         return self.cities[0] if self.cities else None
 
     @property
     def objects(self):
-        return self.units + self.cities
+        return self.units + self.raiders + self.cities + ([self.capital] if self.capital is not None else [])
+
+    def living_raiders(self):
+        return [raider for raider in self.raiders if raider.alive]
+
+    def raider_at(self, position):
+        return next((r for r in self.raiders if r.alive and r.position == tuple(position)), None)
 
     def living_cities(self):
         return [city for city in self.cities if city.alive]
@@ -333,17 +402,23 @@ class Game:
         return min((hex_distance(position, city.position) for city in self.living_cities()), default=0)
 
     def shoot_target(self, unit):
-        """The closest living city in range; ties go to the city with the least HP plus walls."""
-        in_range = [(hex_distance(unit.position, city.position), city.hp + city.wall_hp, index, city)
+        """The closest enemy city or raider in range.
+
+        Ties go to the target with the least HP plus walls, then to raiders.
+        """
+        in_range = [(hex_distance(unit.position, city.position), city.hp + city.wall_hp, 1, index, city)
                     for index, city in enumerate(self.cities)
                     if city.alive and hex_distance(unit.position, city.position) <= unit.attack_range]
+        in_range += [(hex_distance(unit.position, raider.position), raider.hp, 0, index, raider)
+                     for index, raider in enumerate(self.raiders)
+                     if raider.alive and hex_distance(unit.position, raider.position) <= unit.attack_range]
         return min(in_range)[-1] if in_range else None
 
     def reset(self, seed=None):
         if seed is not None:
             self.rng.seed(seed)
         c = self.config
-        capital = tuple(c.city_position or (c.width // 2, c.height // 2))
+        enemy_capital = tuple(c.city_position or (c.width // 2, c.height // 2))
         self.map = HexMap(c.height, c.width)
 
         def passable(position):
@@ -361,22 +436,35 @@ class Game:
                 terrain = ('MOUNTAIN' if draw < c.mountain_density else
                            'FOREST' if draw < c.mountain_density + c.forest_density else 'GRASSLAND')
                 cell.set_terrain(terrain)
-            self.map.grid[capital].set_terrain('GRASSLAND')
-            component = self.map.reachable(capital)
-            adjacent = self.map.grid[capital].get_neighbors(self.map.grid)
-            if (len(component) >= c.unit_count + c.city_count
+            self.map.grid[enemy_capital].set_terrain('GRASSLAND')
+            component = self.map.reachable(enemy_capital)
+            adjacent = self.map.grid[enemy_capital].get_neighbors(self.map.grid)
+            if (len(component) >= c.unit_count + c.city_count + c.player_capital
                     and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3)):
-                city_positions = place_cities(capital, component, c.city_count, self.rng, fits)
-                if city_positions is not None:
+                city_positions = place_cities(enemy_capital, component, c.city_count, self.rng, fits)
+                home = None
+                if city_positions is not None and c.player_capital:
+                    home = place_capital(city_positions, component, self.rng, fits)
+                if city_positions is not None and (home is not None or not c.player_capital):
                     break
         else:
             for cell in self.map.grid.values():
                 cell.set_terrain('GRASSLAND')
-            component = self.map.reachable(capital)
-            city_positions = place_cities(capital, component, c.city_count, fits=fits)
-        for position in city_positions:
+            component = self.map.reachable(enemy_capital)
+            city_positions = place_cities(enemy_capital, component, c.city_count, fits=fits)
+            home = place_capital(city_positions, component, fits=fits) if c.player_capital else None
+        sites = city_positions + ([home] if home is not None else [])
+        for position in sites:
             self.map.grid[position].set_terrain('GRASSLAND')
-        start_positions = self.rng.sample(sorted(component - set(city_positions)), c.unit_count)
+        free = sorted(component - set(sites))
+        if home is None:
+            start_positions = self.rng.sample(free, c.unit_count)
+        else:
+            # The squad starts around its own capital.
+            nearby = sorted(free, key=lambda position: (hex_distance(position, home), position))
+            radius = max(2, hex_distance(nearby[c.unit_count - 1], home))
+            start_positions = self.rng.sample([p for p in nearby if hex_distance(p, home) <= radius],
+                                              c.unit_count)
         specs = [UNIT_SPECS[kind] for kind in self.unit_types]
         strengths = c.unit_strengths or tuple(spec.strength for spec in specs)
         names = ('Otto', 'Fynn', 'Victor', 'Ada')
@@ -387,12 +475,15 @@ class Game:
                               wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
                               ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self)
                        for i, position in enumerate(city_positions)]
+        self.capital = (C_Capital(*home, name_instance=PLAYER_CAPITAL_NAME, strength=c.capital_strength, env=self)
+                        if home is not None else None)
+        self.raiders = []
         self.turn_number = 0
         self.events = []
-        self.last_info = {'outcome': 'ongoing', 'events': [], 'cities_captured': 0}
+        self.last_info = {'outcome': 'ongoing', 'events': [], 'cities_captured': 0, 'capital_lost': False}
         self._done = self.quit = False
         self._valid_cache_key = None
-        self._path_costs = None
+        self._path_cache = {}
         return self.get_observation()
 
     def game_initialize(self, ep_number=0, seed=None):
@@ -409,7 +500,8 @@ class Game:
             raise RuntimeError('Call reset before using the environment')
         terrain = tuple(cell.terrain_type for cell in self.map.grid.values())
         key = (tuple((u.position, u.alive) for u in self.units),
-               tuple((city.position, city.alive) for city in self.cities), terrain)
+               tuple((city.position, city.alive) for city in self.cities),
+               tuple((raider.position, raider.alive) for raider in self.raiders), terrain)
         if key == self._valid_cache_key:
             return list(self._valid_cache)
         result = []
@@ -434,10 +526,12 @@ class Game:
                 cell = self.map.grid.get(destination)
                 if cell is None or cell.block_path or destination in remaining:
                     continue
-                attacks_city = self.city_at(destination) is not None
-                if unit.support and attacks_city:
+                if self.capital is not None and destination == self.capital.position:
                     continue
-                final = unit.position if attacks_city else destination
+                attacks = self.city_at(destination) is not None or self.raider_at(destination) is not None
+                if unit.support and attacks:
+                    continue
+                final = unit.position if attacks else destination
                 visit(index + 1, action + [direction], remaining | {final})
 
         visit(0, [], occupied)
@@ -466,8 +560,17 @@ class Game:
             unit._event('invalid_move')
             return
         target = self.occupant(destination, exclude=unit)
-        if isinstance(target, C_City) and unit.support:
+        if target is not None and target is self.capital:
+            unit._event('blocked_move')
+        elif isinstance(target, (C_City, C_Raider)) and unit.support:
             unit._event('invalid_move')
+        elif isinstance(target, C_Raider):
+            damage_out, damage_taken = attack(unit, target)
+            unit._event('attacked')
+            unit.take_damage(damage_taken)
+            target.take_damage(damage_out)
+            if unit.alive:
+                unit.status = 'attacked'
         elif isinstance(target, C_City):
             damage_out, damage_taken = attack(unit, target)
             unit._event('attacked')
@@ -519,6 +622,88 @@ class Game:
                         city.status = 'healed'
                         city._event('city_healed', amount=healed)
 
+    def raider_turn(self):
+        """Raiders next to the capital attack it. The rest march toward it, stepping around
+        the squad when they can and attacking a unit that blocks every way forward."""
+        costs = self._raider_costs()
+        for raider in self.living_raiders():
+            if not self.capital.alive:
+                break
+            if hex_distance(raider.position, self.capital.position) == 1:
+                damage_out, damage_taken = attack(raider, self.capital)
+                raider._event('raider_attacked')
+                raider.take_damage(damage_taken)
+                self.capital.take_damage(damage_out, aggressor_alive=raider.alive,
+                                         wall_multiplier=MELEE_WALL_DAMAGE)
+                continue
+            here = costs.get(raider.position, float('inf'))
+            steps, blockers = [], []
+            for order, direction in enumerate(constants.DIRECTIONS[:-1]):
+                dx, dy = constants.movement_delta(direction, raider.y)
+                destination = raider.x + dx, raider.y + dy
+                cost = costs.get(destination)
+                if cost is None or cost >= here:
+                    continue
+                occupant = self.occupant(destination)
+                if occupant is None:
+                    steps.append((cost, order, destination))
+                elif occupant in self.units:
+                    blockers.append((occupant.hp, self.units.index(occupant), occupant))
+            if steps:
+                raider.x, raider.y = min(steps)[2]
+            elif blockers:
+                defender = min(blockers)[-1]
+                damage_out, damage_taken = attack(raider, defender)
+                raider._event('raider_attacked')
+                defender.take_damage(damage_out)
+                raider.take_damage(damage_taken)
+
+    def raiding_city(self):
+        """The enemy city whose turn it is to raid this turn, or None.
+
+        Every raid_interval turns one city sends a raider, the cities taking turns in order,
+        so capturing cities slows the raids. A captured city's turn passes without a raid.
+        """
+        interval = self.config.raid_interval
+        if self.capital is None or not interval or self.turn_number % interval:
+            return None
+        city = self.cities[(self.turn_number // interval - 1) % len(self.cities)]
+        return city if city.alive else None
+
+    def spawn_raiders(self):
+        """Send a raider from the raiding city, on the free tile beside it nearest the capital."""
+        city = self.raiding_city()
+        if city is None or len(self.living_raiders()) >= MAX_RAIDERS:
+            return
+        costs = self._raider_costs()
+        sites = []
+        for order, direction in enumerate(constants.DIRECTIONS[:-1]):
+            dx, dy = constants.movement_delta(direction, city.y)
+            site = city.x + dx, city.y + dy
+            cell = self.map.grid.get(site)
+            if cell is not None and not cell.block_path and self.occupant(site) is None:
+                sites.append((costs.get(site, float('inf')), order, site))
+        if not sites:
+            return
+        slot = next((i for i, r in enumerate(self.raiders) if not r.alive), len(self.raiders))
+        raider = C_Raider(*min(sites)[2], name_instance=f'Raider {slot + 1}',
+                          strength=self.config.raider_strength, env=self)
+        if slot == len(self.raiders):
+            self.raiders.append(raider)
+        else:
+            self.raiders[slot] = raider
+        raider._event('raider_spawned')
+
+    def capital_turn(self):
+        """The capital heals 10 HP at the end of any turn with no raider next to it."""
+        capital = self.capital
+        if any(hex_distance(r.position, capital.position) == 1 for r in self.living_raiders()):
+            return
+        healed = min(10, capital.hp_max - capital.hp)
+        if healed > 0:
+            capital.hp += healed
+            capital._event(capital.heal_event, amount=healed)
+
     def shoot(self, unit):
         if not unit.alive or not self.living_cities():
             return
@@ -528,12 +713,17 @@ class Game:
             return
         damage, _ = attack(unit, target, ranged=True)
         unit._event('ranged_attack')
-        # Capturing requires a melee action; a ranged strike leaves at least 1 HP.
-        target.take_damage(damage, aggressor_alive=False)
+        if isinstance(target, C_Raider):
+            target.take_damage(damage)
+        else:
+            # Capturing requires a melee action; a ranged strike leaves at least 1 HP.
+            target.take_damage(damage, aggressor_alive=False)
 
     def _outcome(self):
         if all(not city.alive or city.hp <= 0 for city in self.cities):
             return 'win'
+        if self.capital is not None and not self.capital.alive:
+            return 'loss'
         if not any(u.alive and u.hp > 0 and not u.support for u in self.units):
             return 'loss'
         return 'ongoing'
@@ -552,6 +742,10 @@ class Game:
                 reward -= 3 * amount / self.city.hp_max
             elif kind == 'unit_damaged':
                 reward -= .5 * amount / 100
+            elif kind == 'capital_damaged':
+                reward -= 3 * amount / self.capital.hp_max
+            elif kind == 'raider_damaged':
+                reward += .5 * amount / 100
             elif kind == 'unit_died':
                 reward -= 5
             elif kind == 'unit_healed':
@@ -589,10 +783,16 @@ class Game:
                     break
             if self._outcome() == 'ongoing':
                 self.city_turn()
+            if self.capital is not None and self._outcome() == 'ongoing':
+                self.raider_turn()
+                if self._outcome() == 'ongoing':
+                    self.spawn_raiders()
+                    self.capital_turn()
         outcome = self._outcome()
         self._done = outcome != 'ongoing'
         self.last_info = {'outcome': outcome, 'events': [event.copy() for event in self.events],
-                          'turn': self.turn_number, 'cities_captured': self.cities_captured()}
+                          'turn': self.turn_number, 'cities_captured': self.cities_captured(),
+                          'capital_lost': self.capital is not None and not self.capital.alive}
         reward = self.get_rewards()
         return self.get_observation(), reward, self._done
 
@@ -609,6 +809,17 @@ class Game:
             values.extend([unit.x / (c.width - 1), unit.y / (c.height - 1),
                            unit.hp / unit.hp_max, float(unit.alive), unit.strength / 100,
                            float(unit.y % 2), unit.strength_ranged / 100, unit.attack_range / 2])
+        if self.capital is not None:
+            capital = self.capital
+            values.extend([capital.x / (c.width - 1), capital.y / (c.height - 1),
+                           capital.hp / capital.hp_max, capital.strength / 100])
+            for slot in range(MAX_RAIDERS):
+                raider = self.raiders[slot] if slot < len(self.raiders) else None
+                if raider is not None and raider.alive:
+                    values.extend([raider.x / (c.width - 1), raider.y / (c.height - 1),
+                                   raider.hp / raider.hp_max, 1.0])
+                else:
+                    values.extend([0.0, 0.0, 0.0, 0.0])
         values.extend(TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
                       for y in range(c.height) for x in range(c.width))
         return np.asarray(values, dtype=float)
@@ -620,17 +831,16 @@ class Game:
                     index, city) for index, city in enumerate(self.cities) if city.alive]
         return min(options)[-1] if options else None
 
-    def _distances(self, target=None):
-        """Path cost from every tile to the target city; other uncaptured cities block paths."""
-        target = target or self.target_city()
-        if target is None:
-            return {}
-        blocked = frozenset(city.position for city in self.living_cities() if city is not target)
-        key = (target.position, blocked, tuple(cell.terrain_type for cell in self.map.grid.values()))
-        if self._path_costs is not None and self._path_costs[0] == key:
-            return self._path_costs[1]
-        costs = {target.position: 0}
-        pending = [(0, target.position)]
+    def _path_costs_to(self, goal, blocked):
+        """Path cost from every tile to goal, never passing through blocked tiles."""
+        key = (goal, blocked, tuple(cell.terrain_type for cell in self.map.grid.values()))
+        if key in self._path_cache:
+            return self._path_cache[key]
+        if len(self._path_cache) >= 64:
+            # Raider targets move every turn; keep the cache small.
+            self._path_cache.clear()
+        costs = {goal: 0}
+        pending = [(0, goal)]
         while pending:
             cost, pos = heapq.heappop(pending)
             if cost != costs[pos]:
@@ -642,13 +852,60 @@ class Game:
                 if new_cost < costs.get(neighbor.index, float('inf')):
                     costs[neighbor.index] = new_cost
                     heapq.heappush(pending, (new_cost, neighbor.index))
-        self._path_costs = key, costs
+        self._path_cache[key] = costs
         return costs
+
+    def _distances(self, target=None):
+        """Path cost for the squad from every tile to the target (a city or a raider).
+
+        Uncaptured cities other than the target, and the player's capital, block paths.
+        """
+        target = target or self.target_city()
+        if target is None:
+            return {}
+        blocked = frozenset(city.position for city in self.living_cities() if city is not target)
+        if self.capital is not None:
+            blocked |= {self.capital.position}
+        return self._path_costs_to(target.position, blocked)
+
+    def _raider_costs(self):
+        """Path cost for raiders from every tile to the player's capital."""
+        return self._path_costs_to(self.capital.position,
+                                   frozenset(city.position for city in self.living_cities()))
+
+    def raid_damage(self, raider):
+        """Expected damage a raider deals the capital before the capital's counterattacks kill it."""
+        capital, average_roll = self.capital, 30 * .875
+        per_attack = average_roll * math.exp((raider.strength - capital.strength) / 25)
+        per_counter = average_roll * math.exp((capital.strength - raider.strength) / 25)
+        return per_attack * math.ceil(raider.hp / per_counter)
+
+    def threat(self):
+        """The raider the heuristic squad should stop first, or None while the capital can hold.
+
+        Only raiders within RAID_THREAT_RADIUS of the capital count, and the squad turns back
+        only when they could together destroy it (with a 25% safety margin). A nearly taken
+        enemy city is finished first.
+        """
+        if self.capital is None or not self.capital.alive:
+            return None
+        target = self.target_city()
+        if target is not None and target.hp + target.wall_hp <= 40:
+            return None
+        near = [(hex_distance(r.position, self.capital.position), r.hp, index, r)
+                for index, r in enumerate(self.raiders)
+                if r.alive and hex_distance(r.position, self.capital.position) <= RAID_THREAT_RADIUS]
+        if not near or 1.25 * sum(self.raid_damage(entry[-1]) for entry in near) < self.capital.hp:
+            return None
+        return min(near)[-1]
 
     def guided_action(self, rng=None):
         rng = rng or self.rng
         target = self.target_city()
-        costs = self._distances(target)
+        city_costs = self._distances(target)
+        # A raider closing on the capital comes before the siege. Rams cannot fight it.
+        threat = self.threat()
+        defense_costs = self._distances(threat) if threat is not None else None
         # After taking a city, regroup: hurt units rest, and the squad attacks the
         # next city together instead of one unit at a time.
         regroup = self.cities_captured() > 0 and target is not None
@@ -663,23 +920,26 @@ class Game:
             for unit, direction in zip(self.units, self.actions[action]):
                 if not unit.alive:
                     continue
+                defending = defense_costs is not None and not unit.support
+                costs = defense_costs if defending else city_costs
+                sieging = regroup and not defending
                 if direction == 'SHOOT':
-                    target = self.shoot_target(unit)
+                    shot = self.shoot_target(unit)
                     score += costs.get(unit.position, 10000) - 2
-                    if target.hp <= 1 and target.wall_hp == 0:
+                    if isinstance(shot, C_City) and shot.hp <= 1 and shot.wall_hp == 0:
                         score += 5
                     continue
                 dx, dy = constants.movement_delta(direction, unit.y)
                 destination = unit.x + dx, unit.y + dy
                 score += costs.get(destination, 10000)
-                if regroup and destination == target.position and not assembled:
+                if sieging and destination == target.position and not assembled:
                     score += 3
                 if direction == 'SPACE':
                     if unit.hp < .35 * unit.hp_max:
                         score -= 2
-                    elif regroup and unit.hp < .7 * unit.hp_max:
+                    elif sieging and unit.hp < .7 * unit.hp_max:
                         score -= 2
-                    elif regroup and not assembled and hex_distance(unit.position, target.position) == 1:
+                    elif sieging and not assembled and hex_distance(unit.position, target.position) == 1:
                         score -= 1
                     elif unit.support and target is not None and hex_distance(unit.position, target.position) == 1:
                         score -= 1

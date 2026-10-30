@@ -4,6 +4,8 @@ import time
 
 import constants
 
+RAIDER_COLOR = (255, 110, 100)
+
 # Warriors share the plain unit sprite; other types get a short coloured label.
 UNIT_LABELS = {
     'spearman': ('SPEARMAN', (170, 215, 255)),
@@ -86,15 +88,24 @@ class Renderer:
                                [(x + s * .2, y + s * .7), (x + s * .5, y + s * .2),
                                 (x + s * .8, y + s * .7)])
         cities = self.env.cities
+        capital = self.env.capital
+        towns = cities + ([capital] if capital is not None else [])
+        raiders = self.env.living_raiders()
         # Cities first, so a unit standing in a captured city is drawn on top.
-        for obj in cities + self.env.units:
+        for obj in towns + raiders + self.env.units:
             x, y = self._position(obj.position)
-            is_city = obj in cities
+            is_city = obj in towns
+            if obj in raiders:
+                p.draw.polygon(self.surface, RAIDER_COLOR, self._polygon(obj.position), 3)
             if obj.alive or is_city:
                 image = self.images['city' if is_city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
                 label = UNIT_LABELS.get(getattr(obj, 'unit_type', None))
-                if is_city and not obj.alive:
+                if obj is capital:
+                    label = ('CAPITAL', (150, 200, 255)) if obj.alive else ('LOST', RAIDER_COLOR)
+                elif obj in raiders:
+                    label = ('RAIDER', RAIDER_COLOR)
+                elif is_city and not obj.alive:
                     label = ('CAPTURED', (140, 230, 140))
                 if label is not None:
                     self._text(label[0], (x + 2, y + 2), label[1], small=True)
@@ -112,11 +123,18 @@ class Renderer:
         y = self.surface.get_height() - 109
         city = self.env.city
         outcome = self.env.last_info['outcome']
-        outcome = 'DOMINATION VICTORY' if outcome == 'win' else outcome.upper()
+        if outcome == 'win':
+            outcome = 'DOMINATION VICTORY'
+        elif outcome == 'loss' and capital is not None and not capital.alive:
+            outcome = 'CAPITAL LOST'
+        else:
+            outcome = outcome.upper()
         if len(cities) == 1:
             status = f'City {city.hp:.0f}/{city.hp_max:.0f}   Walls {city.wall_hp:.0f}'
         else:
             status = f'Cities captured {self.env.cities_captured()}/{len(cities)}'
+        if capital is not None:
+            status += f'   Capital {capital.hp:.0f}/{capital.hp_max:.0f}'
         self._text(f'Turn {self.env.turn_number}   {status}   {outcome}', (self.margin, y))
         if self.env.human:
             controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'

@@ -69,7 +69,10 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--unit-count` | Choose one to four starting units. |
 | `--unit-types warrior spearman heavy_chariot slinger archer battering_ram ...` | Set one type per unit; omitted types default to warriors. |
 | `--city-count N` | Choose one to four enemy cities; capture all of them for a domination victory. |
-| `--city-position X Y` | Set the capital's map coordinate (the first city; other cities are placed randomly). |
+| `--city-position X Y` | Set the enemy capital's map coordinate (the first city; other cities are placed randomly). |
+| `--player-capital` | Give the squad its own capital to defend against raiders; losing it loses the game. |
+| `--raid-interval N` | Turns between raids on the player's capital (default 6); 0 disables raids. |
+| `--capital-strength`, `--raider-strength` | Set the player's capital (default 28) and raider (default 20) combat strengths. |
 | `--unit-strengths N [N ...]`, `--city-strength` | Override unit and city combat strengths. |
 | `--ranged-strength` | Configure the city's ranged attack strength. |
 | `--wall-hp` | Set the city's initial wall health. |
@@ -114,13 +117,32 @@ Each enemy city is a rival civilization's capital. Capturing every one is a domi
 python run_game.py --episodes 500 --city-count 3 --difficulty easy --max-steps 200 --model-path runs/domination/model.json --metrics-dir runs/domination --fresh
 ```
 
-- The capital sits at `--city-position` (or the map center). Other cities are placed randomly at least three hexes apart, in reach of the squad, and with enough open tiles around them for a full siege.
+- The enemy capital sits at `--city-position` (or the map center). Other cities are placed randomly at least three hexes apart, in reach of the squad, and with enough open tiles around them for a full siege.
 - Every city that has not been captured shoots and heals on its own; all cities share the strength, wall, and ranged settings.
 - A captured city stops fighting and its tile opens to your units. Capturing a city before the last earns +5, and the last one earns the +10 victory reward.
 - Ranged units shoot the closest city in range; ties go to the city with the least health plus walls. A battering ram helps only against the city it stands next to.
 - Evaluation summaries add the average number of cities captured, which shows progress even when games time out.
 
 Domination is much harder than a single siege, because damage carries over between cities. With three units on normal difficulty, the built-in heuristic wins 65–73% of games against two to four cities, and most other games time out after a unit is lost. On easy difficulty, it wins every three-city game. Allow more turns with `--max-steps` for larger campaigns.
+
+## Defending your capital
+
+Add `--player-capital` to give the squad its own capital, Otterholt, which the enemy raids. Losing it loses the game. It combines with every other option, including domination:
+
+```powershell
+python run_game.py --episodes 500 --player-capital --model-path runs/capital/model.json --metrics-dir runs/capital --fresh
+```
+
+- The capital is placed as far from the enemy cities as the map allows, at least three hexes from each, and the squad starts around it. Your units cannot enter it.
+- It has 100 HP and strength 28 (`--capital-strength`). It hits back when attacked and heals 10 HP at the end of any turn with no raider next to it.
+- Every 6 turns (`--raid-interval`; 0 disables raids), an enemy city sends a raider (strength 20, `--raider-strength`) from a tile beside it. With several enemy cities, they take turns, so each city you capture slows the raids. At most four raiders are on the map at once.
+- Raiders march toward the capital and attack it once they reach it. They step around your units when they can, and attack a unit that blocks every way forward.
+- Move into a raider to attack it. Archers and slingers can also shoot raiders, and their shots can kill. Battering rams cannot fight raiders.
+- Damage to the capital costs 3 reward per 100 HP, damage dealt to raiders earns 0.5 per 100 HP, and losing the capital is a −10 loss.
+- The observation adds the capital's position, health, and strength, and the position and health of up to four raiders. Models trained with and without `--player-capital` are not interchangeable.
+- Evaluation summaries show how many losses came from losing the capital.
+
+Left undefended, the capital falls in every game, around turn 31. One raider cannot take a healthy capital, because the capital's counterattacks kill it first, so the built-in heuristic keeps attacking. It turns back only when nearby raiders could destroy the capital, unless the city it is besieging is nearly taken. With default settings it wins 84% of games against one enemy city and loses its capital in 7%; against three cities over 200 turns, it wins 41% (97% on easy difficulty).
 
 ## Metrics and playback
 

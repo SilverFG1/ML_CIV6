@@ -54,6 +54,12 @@ def parse_args(argv=None):
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
     parser.add_argument("--city-count", type=int, choices=range(1, game.MAX_CITIES + 1),
                         help="enemy capitals; capture them all for a domination victory (default: 1)")
+    parser.add_argument("--player-capital", action="store_true",
+                        help="give the squad its own capital to defend against raiders; losing it loses the game")
+    parser.add_argument("--raid-interval", type=int,
+                        help="turns between raids on the player's capital; 0 disables raids (default: 6)")
+    parser.add_argument("--capital-strength", type=float, help="player's capital combat strength (default: 28)")
+    parser.add_argument("--raider-strength", type=float, help="raider combat strength (default: 20)")
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--no-city-healing", action="store_true")
     parser.add_argument("--unit-strengths", type=float, nargs="+")
@@ -89,12 +95,14 @@ def config_from_args(args, saved=None):
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
                  "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
-                 "city_count"):
+                 "city_count", "raid_interval", "capital_strength", "raider_strength"):
         value = getattr(args, name)
         if value is not None:
             explicit[name] = tuple(value) if name in ("city_position", "unit_strengths", "unit_types") else value
     if args.no_city_healing:
         explicit["city_heals"] = False
+    if args.player_capital:
+        explicit["player_capital"] = True
     if args.difficulty is not None and args.city_strength is None:
         explicit["city_strength"] = DIFFICULTY_STRENGTHS[args.difficulty]
     elif not saved and args.city_strength is None:
@@ -236,6 +244,7 @@ class EpisodeResult:
     random_actions: int = 0
     policy_actions: int = 0
     cities_captured: int = 0
+    capital_lost: bool = False
 
     @property
     def won(self):
@@ -285,7 +294,7 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
     if train:
         agent.finish_episode()
     return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"],
-                         env.last_info.get("cities_captured", 0))
+                         env.last_info.get("cities_captured", 0), env.last_info.get("capital_lost", False))
 
 
 def compare_policies(agent, args, *, count=None, seed=None, config=None, policies=None, render=False, verbose=True):
@@ -332,13 +341,15 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 "average_steps": sum(row["steps"] for row in rows) / completed if completed else 0.0,
                 "average_cities_captured": (sum(row["cities_captured"] for row in rows) / completed
                                             if completed else 0.0),
+                "capital_losses": sum(row["capital_lost"] for row in rows),
                 "episodes_detail": rows,
             }
             if verbose:
                 summary = summaries[policy]
                 captured = (f", average cities captured {summary['average_cities_captured']:.2f}/{config.city_count}"
                             if config.city_count > 1 else "")
-                print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}, "
+                capital = f" (capital lost {summary['capital_losses']})" if config.player_capital else ""
+                print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}{capital}, "
                       f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}{captured}")
             if summaries[policy]["quits"]:
                 break

@@ -10,7 +10,7 @@ import numpy as np
 
 import constants
 from class_hex import HexMap
-from game import MIN_CITY_DISTANCE, C_Unit, Game, GameConfig, attack, hex_distance
+from game import MAX_RAIDERS, MIN_CITY_DISTANCE, C_Raider, C_Unit, Game, GameConfig, attack, hex_distance
 
 
 class GameTests(unittest.TestCase):
@@ -227,7 +227,10 @@ class GameTests(unittest.TestCase):
                        {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)},
                        {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')},
                        {'city_count': 0}, {'city_count': 5}, {'city_count': True},
-                       {'width': 3, 'height': 3, 'city_count': 2}]:
+                       {'width': 3, 'height': 3, 'city_count': 2},
+                       {'player_capital': 1}, {'capital_strength': 0}, {'raider_strength': 101},
+                       {'raid_interval': -1}, {'raid_interval': 2.5},
+                       {'player_capital': True, 'width': 3, 'height': 3}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -524,6 +527,183 @@ class GameTests(unittest.TestCase):
         self.assertIs(env.target_city(), env.cities[0])
         env.cities[0].death()
         self.assertIs(env.target_city(), env.cities[1])
+
+    # Player capital and raiders. capital_env pins the capital to (1, 6), four hexes
+    # from the enemy city at (4, 4), and turns raids off unless a test asks for them.
+    def capital_env(self, **kwargs):
+        env = self.make_env(**{'player_capital': True, 'raid_interval': 0, 'city_heals': False, **kwargs})
+        env.capital.x, env.capital.y = 1, 6
+        return env
+
+    def add_raider(self, env, position, hp=100):
+        raider = C_Raider(*position, name_instance=f'Raider {len(env.raiders) + 1}', hp=hp, strength=20, env=env)
+        env.raiders.append(raider)
+        return raider
+
+    def test_player_capital_is_off_by_default(self):
+        env = self.make_env()
+        self.assertIsNone(env.capital)
+        self.assertEqual(env.raiders, [])
+        self.assertEqual(env.get_observation().shape, (7 + 8 * 3 + 64,))
+        self.assertNotIn(':capital', env.observation_schema)
+        env.step(self.wait(env))
+        self.assertFalse(env.last_info['capital_lost'])
+
+    def test_player_capital_is_placed_away_from_enemies_with_the_squad_beside_it(self):
+        for seed in range(12):
+            env = Game(config=GameConfig(player_capital=True, city_count=2, forest_density=.2,
+                                         mountain_density=.1), seed=seed)
+            env.reset(seed=seed)
+            home = env.capital.position
+            self.assertEqual(env.capital.name_instance, 'Otterholt')
+            for city in env.cities:
+                self.assertGreaterEqual(hex_distance(home, city.position), MIN_CITY_DISTANCE)
+            open_tiles = [cell for cell in env.map.grid[home].get_neighbors(env.map.grid) if not cell.block_path]
+            self.assertGreaterEqual(len(open_tiles), 3)
+            self.assertIn(home, env.map.reachable(env.city.position))
+            self.assertTrue(all(hex_distance(u.position, home) <= 2 for u in env.units))
+            self.assertNotIn(home, [u.position for u in env.units])
+        self.assertEqual(env.get_observation().shape, (14 + 24 + 4 + 4 * MAX_RAIDERS + 64,))
+        self.assertTrue(env.observation_schema.endswith(':cities=2:capital'))
+
+    def test_units_cannot_enter_their_own_capital(self):
+        env = self.capital_env()
+        self.place(env, [(2, 6), (7, 0), (6, 0)])
+        blocked = env.encode_action(['W', 'SPACE', 'SPACE'])
+        self.assertNotIn(blocked, env.valid_actions())
+        env.step(blocked)
+        self.assertEqual(env.units[0].position, (2, 6))
+        self.assertIn('blocked_move', [e['type'] for e in env.events])
+
+    def test_raids_take_turns_between_enemy_cities(self):
+        env = self.capital_env(city_count=2, raid_interval=2)
+        expected = {1: None, 2: env.cities[0], 3: None, 4: env.cities[1], 6: env.cities[0]}
+        for turn, city in expected.items():
+            env.turn_number = turn
+            self.assertIs(env.raiding_city(), city)
+        env.cities[1].death()
+        env.turn_number = 4
+        self.assertIsNone(env.raiding_city())
+        env.turn_number = 2
+        env.spawn_raiders()
+        raider = env.raiders[0]
+        self.assertEqual(hex_distance(raider.position, env.cities[0].position), 1)
+        self.assertIn('raider_spawned', [e['type'] for e in env.events])
+        quiet = self.capital_env(raid_interval=0)
+        quiet.turn_number = 6
+        self.assertIsNone(quiet.raiding_city())
+
+    def test_raiders_are_capped_and_reuse_slots(self):
+        env = self.capital_env(raid_interval=1)
+        for position in [(7, 0), (7, 1), (7, 2), (7, 3)]:
+            self.add_raider(env, position)
+        env.turn_number = 1
+        env.spawn_raiders()
+        self.assertEqual(len(env.living_raiders()), MAX_RAIDERS)
+        env.raiders[1].death_unit()
+        env.spawn_raiders()
+        self.assertEqual(len(env.raiders), MAX_RAIDERS)
+        self.assertTrue(env.raiders[1].alive)
+        self.assertEqual(env.raiders[1].name_instance, 'Raider 2')
+        self.assertEqual(hex_distance(env.raiders[1].position, env.city.position), 1)
+
+    def test_raider_marches_on_the_capital_and_attacks_it(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        raider = self.add_raider(env, (4, 6))
+        distances = []
+        for _ in range(2):
+            env.step(self.wait(env))
+            distances.append(hex_distance(raider.position, env.capital.position))
+        self.assertEqual(distances, [2, 1])
+        with patch('game.attack', return_value=(10, 5)):
+            _, reward, done = env.step(self.wait(env))
+        self.assertFalse(done)
+        self.assertEqual((env.capital.hp, raider.hp), (90, 95))
+        # Turn cost, capital damage, and the damage the capital dealt back.
+        self.assertAlmostEqual(reward, -.05 - .3 + .025)
+        self.assertNotIn('capital_healed', [e['type'] for e in env.events])
+
+    def test_raider_steps_around_the_squad_but_attacks_a_full_blockade(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        costs = env._raider_costs()
+
+        def forward(position):
+            return [cell.index for cell in env.map.grid[position].get_neighbors(env.map.grid)
+                    if costs.get(cell.index, 1e9) < costs[position]]
+
+        start = next(p for p in sorted(costs) if hex_distance(p, env.capital.position) == 3
+                     and len(forward(p)) == 2 and env.occupant(p) is None
+                     and hex_distance(p, env.city.position) > 1)
+        first, second = sorted(forward(start), key=lambda p: costs[p])
+        raider = self.add_raider(env, start)
+        self.place(env, [first, (7, 0), (6, 0)])
+        env.step(self.wait(env))
+        self.assertEqual(raider.position, second)
+        self.assertEqual(env.units[0].hp, 100)
+        env.raiders.clear()
+        raider = self.add_raider(env, start)
+        self.place(env, [first, second, (6, 0)])
+        env.units[1].hp = 60
+        with patch('game.attack', return_value=(20, 5)):
+            env.step(self.wait(env))
+        self.assertEqual(raider.position, start)
+        self.assertEqual([u.hp for u in env.units[:2]], [100, 50])
+
+    def test_capital_heals_only_without_a_raider_beside_it(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        env.capital.hp = 50
+        env.step(self.wait(env))
+        self.assertEqual(env.capital.hp, 60)
+        self.assertIn('capital_healed', [e['type'] for e in env.events])
+        self.add_raider(env, (2, 6))
+        with patch('game.attack', return_value=(0, 0)):
+            env.step(self.wait(env))
+        self.assertEqual(env.capital.hp, 60)
+
+    def test_losing_the_capital_loses_the_game(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        self.add_raider(env, (2, 6))
+        env.capital.hp = 5
+        with patch('game.attack', return_value=(10, 0)):
+            _, reward, done = env.step(self.wait(env))
+        self.assertTrue(done)
+        self.assertEqual(env.last_info['outcome'], 'loss')
+        self.assertTrue(env.last_info['capital_lost'])
+        self.assertAlmostEqual(reward, -.05 - .15 - 10)
+
+    def test_squad_fights_raiders_in_melee_and_at_range(self):
+        env = self.capital_env()
+        self.place(env, [(4, 2), (7, 7), (6, 7)])
+        raider = self.add_raider(env, (3, 2))
+        with patch('game.attack', return_value=(30, 10)):
+            _, reward, _ = env.step(env.encode_action(['W', 'SPACE', 'SPACE']))
+        self.assertEqual((raider.hp, env.units[0].hp, env.units[0].position), (70, 90, (4, 2)))
+        self.assertNotEqual(raider.position, (3, 2))
+        self.assertAlmostEqual(reward, -.05 + .15 - .05)
+        archers = self.capital_env(unit_count=2, unit_types=('archer', 'battering_ram'))
+        self.place(archers, [(3, 0), (2, 2)])
+        raider = self.add_raider(archers, (3, 2), hp=20)
+        self.assertIs(archers.shoot_target(archers.units[0]), raider)
+        self.assertNotIn(archers.encode_action(['SPACE', 'E']), archers.valid_actions())
+        with patch('game.attack', return_value=(30, 0)):
+            archers.step(archers.encode_action(['SHOOT', 'SPACE']))
+        self.assertFalse(raider.alive)
+        self.assertIn('raider_killed', [e['type'] for e in archers.events])
+
+    def test_heuristic_defends_only_when_the_capital_could_fall(self):
+        env = self.capital_env()
+        self.place(env, [(3, 6), (7, 0), (6, 0)])
+        raider = self.add_raider(env, (2, 6))
+        self.assertIsNone(env.threat())
+        env.capital.hp = 60
+        self.assertIs(env.threat(), raider)
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))][0], 'W')
+        env.city.hp = 30
+        self.assertIsNone(env.threat())
 
 
 if __name__ == '__main__':

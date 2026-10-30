@@ -309,6 +309,23 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'fresh'):
             self.make_agent(self.args('--city-count', '3'))
 
+    def test_player_capital_scenario_reports_capital_losses(self):
+        args = self.args('--player-capital', '--raid-interval', '3')
+        agent = self.make_agent(args)
+        self.assertTrue(args.config.player_capital)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        evaluations = run_game.compare_policies(agent, args, verbose=False)
+        for summary in evaluations.values():
+            self.assertLessEqual(summary['capital_losses'], summary['losses'])
+            self.assertTrue(all('capital_lost' in row for row in summary['episodes_detail']))
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertTrue(resume_args.config.player_capital)
+        self.assertEqual(resume_args.config.raid_interval, 3)
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--raid-interval', '5'))
+
     def test_runner_rejects_corrupt_progress_metadata(self):
         args = self.args()
         agent = self.make_agent(args)

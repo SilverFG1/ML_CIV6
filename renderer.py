@@ -85,12 +85,17 @@ class Renderer:
                 p.draw.polygon(self.surface, (165, 175, 185),
                                [(x + s * .2, y + s * .7), (x + s * .5, y + s * .2),
                                 (x + s * .8, y + s * .7)])
-        for obj in self.env.objects:
+        cities = self.env.cities
+        # Cities first, so a unit standing in a captured city is drawn on top.
+        for obj in cities + self.env.units:
             x, y = self._position(obj.position)
-            if obj.alive:
-                image = self.images['city' if obj is self.env.city else 'unit']
+            is_city = obj in cities
+            if obj.alive or is_city:
+                image = self.images['city' if is_city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
                 label = UNIT_LABELS.get(getattr(obj, 'unit_type', None))
+                if is_city and not obj.alive:
+                    label = ('CAPTURED', (140, 230, 140))
                 if label is not None:
                     self._text(label[0], (x + 2, y + 2), label[1], small=True)
             else:
@@ -99,15 +104,20 @@ class Renderer:
                             (x + 2 * s / 3, y + 2 * s / 3), 3)
                 p.draw.line(self.surface, constants.COLOR_RED, (x + 2 * s / 3, y + s / 3),
                             (x + s / 3, y + 2 * s / 3), 3)
-            self._text(f'{obj.name_instance} {obj.hp:.0f}', (x + 2, y + self.size * .7), small=True)
+            walls = f' W{obj.wall_hp:.0f}' if is_city and obj.alive and obj.wall_hp > 0 and len(cities) > 1 else ''
+            self._text(f'{obj.name_instance} {obj.hp:.0f}{walls}', (x + 2, y + self.size * .7), small=True)
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
         y = self.surface.get_height() - 109
         city = self.env.city
         outcome = self.env.last_info['outcome']
-        self._text(f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
-                   f'Walls {city.wall_hp:.0f}   {outcome.upper()}', (self.margin, y))
+        outcome = 'DOMINATION VICTORY' if outcome == 'win' else outcome.upper()
+        if len(cities) == 1:
+            status = f'City {city.hp:.0f}/{city.hp_max:.0f}   Walls {city.wall_hp:.0f}'
+        else:
+            status = f'Cities captured {self.env.cities_captured()}/{len(cities)}'
+        self._text(f'Turn {self.env.turn_number}   {status}   {outcome}', (self.margin, y))
         if self.env.human:
             controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
         else:

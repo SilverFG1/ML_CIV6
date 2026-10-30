@@ -293,6 +293,22 @@ class RunnerTests(unittest.TestCase):
         evaluations = run_game.compare_policies(agent, args, verbose=False)
         self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
 
+    def test_domination_scenario_reports_cities_captured(self):
+        args = self.args('--city-count', '2')
+        agent = self.make_agent(args)
+        self.assertEqual(args.config.city_count, 2)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        evaluations = run_game.compare_policies(agent, args, verbose=False)
+        for summary in evaluations.values():
+            self.assertIn('average_cities_captured', summary)
+            self.assertTrue(all(0 <= row['cities_captured'] <= 2 for row in summary['episodes_detail']))
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.city_count, 2)
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--city-count', '3'))
+
     def test_runner_rejects_corrupt_progress_metadata(self):
         args = self.args()
         agent = self.make_agent(args)

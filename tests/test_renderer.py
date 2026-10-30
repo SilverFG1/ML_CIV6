@@ -53,6 +53,18 @@ class RendererTests(unittest.TestCase):
             self.assertTrue(env.render_frame())
             env.close()
 
+    def test_draws_captured_cities_and_domination_victory(self):
+        env = Game(render=True, config=GameConfig(city_count=3, wall_hp=20))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.cities[1].death()
+        self.assertTrue(env.render_frame())
+        for city in env.cities:
+            city.death()
+        env.step(env.encode_action(['SPACE'] * 3))
+        self.assertEqual(env.last_info['outcome'], 'win')
+        self.assertTrue(env.render_frame())
+
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))
         env.reset(seed=7)

@@ -57,6 +57,37 @@ UNIT_TYPES = tuple(UNIT_SPECS)
 MELEE_WALL_DAMAGE = 0.5
 RAM_SUPPORTED_CLASSES = ('melee', 'anti_cavalry')
 
+# Each enemy city is a rival civilization's capital. Capturing all of them is a
+# domination victory.
+CITY_NAMES = ('Ottertopia', 'Kelpford', 'Clamhaven', 'Driftwood')
+MAX_CITIES = len(CITY_NAMES)
+MIN_CITY_DISTANCE = 3
+
+
+def open_neighbors(position, passable):
+    """Count the neighboring tiles of position for which passable(tile) is true."""
+    x, y = position
+    return sum(passable((x + dx, y + dy)) for dx, dy in
+               (constants.movement_delta(direction, y) for direction in constants.DIRECTIONS[:-1]))
+
+
+def place_cities(capital, candidates, count, rng=None, fits=None):
+    """Pick count city sites, starting with capital, at least MIN_CITY_DISTANCE apart.
+
+    fits(site) can reject sites, e.g. ones without room for a siege. Sites are
+    drawn at random when rng is given, otherwise in a fixed scan order.
+    Returns None when the remaining cities do not fit.
+    """
+    positions = [tuple(capital)]
+    for _ in range(count - 1):
+        options = sorted(p for p in candidates
+                         if all(hex_distance(p, q) >= MIN_CITY_DISTANCE for q in positions)
+                         and (fits is None or fits(p)))
+        if not options:
+            return None
+        positions.append(rng.choice(options) if rng is not None else options[0])
+    return positions
+
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -73,6 +104,7 @@ class GameConfig:
     unit_strengths: tuple = ()
     unit_types: tuple = ()
     difficulty: str = 'normal'
+    city_count: int = 1
 
     def __post_init__(self):
         for name in ('width', 'height'):
@@ -111,6 +143,19 @@ class GameConfig:
             x, y = self.city_position
             if not (0 <= x < self.width and 0 <= y < self.height):
                 raise ValueError('city_position must lie inside the map')
+        if (isinstance(self.city_count, bool) or not isinstance(self.city_count, int)
+                or not 1 <= self.city_count <= MAX_CITIES):
+            raise ValueError(f'city_count must be between 1 and {MAX_CITIES}')
+        capital = self.city_position or (self.width // 2, self.height // 2)
+        every_tile = [(x, y) for y in range(self.height) for x in range(self.width)]
+        siege_room = min(self.unit_count, 3)
+
+        def fits(site):
+            return open_neighbors(site, lambda p: 0 <= p[0] < self.width and 0 <= p[1] < self.height) >= siege_room
+
+        if place_cities(capital, every_tile, self.city_count, fits=fits) is None:
+            raise ValueError(f'the map cannot fit {self.city_count} cities at least {MIN_CITY_DISTANCE} '
+                             f'hexes apart, each with {siege_room} open neighboring tiles')
 
 
 class C_Sprite:
@@ -254,26 +299,61 @@ class Game:
         self._action_index = {a: i for i, a in enumerate(self.actions)}
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types))
+        if self.config.city_count > 1:
+            self.observation_schema += f':cities={self.config.city_count}'
         self._renderer = None
         self.quit = False
         self.units = []
-        self.city = None
+        self.cities = []
         self.events = []
-        self.last_info = {'outcome': 'ongoing', 'events': []}
+        self.last_info = {'outcome': 'ongoing', 'events': [], 'cities_captured': 0}
         self.turn_number = 0
         self._done = False
         self._valid_cache_key = None
 
     @property
+    def city(self):
+        """The first city (the capital); single-city callers use this."""
+        return self.cities[0] if self.cities else None
+
+    @property
     def objects(self):
-        return self.units + [self.city] if self.city is not None else self.units
+        return self.units + self.cities
+
+    def living_cities(self):
+        return [city for city in self.cities if city.alive]
+
+    def cities_captured(self):
+        return sum(not city.alive for city in self.cities)
+
+    def city_at(self, position):
+        return next((city for city in self.cities if city.alive and city.position == tuple(position)), None)
+
+    def nearest_city_distance(self, position):
+        return min((hex_distance(position, city.position) for city in self.living_cities()), default=0)
+
+    def shoot_target(self, unit):
+        """The closest living city in range; ties go to the city with the least HP plus walls."""
+        in_range = [(hex_distance(unit.position, city.position), city.hp + city.wall_hp, index, city)
+                    for index, city in enumerate(self.cities)
+                    if city.alive and hex_distance(unit.position, city.position) <= unit.attack_range]
+        return min(in_range)[-1] if in_range else None
 
     def reset(self, seed=None):
         if seed is not None:
             self.rng.seed(seed)
         c = self.config
-        city_pos = tuple(c.city_position or (c.width // 2, c.height // 2))
+        capital = tuple(c.city_position or (c.width // 2, c.height // 2))
         self.map = HexMap(c.height, c.width)
+
+        def passable(position):
+            cell = self.map.grid.get(position)
+            return cell is not None and not cell.block_path
+
+        def fits(site):
+            # Room for a full siege, so the city can be stopped from healing.
+            return open_neighbors(site, passable) >= min(c.unit_count, 3)
+
         # Keep enough connected grassland for starting units and a possible siege.
         for _ in range(100):
             for cell in self.map.grid.values():
@@ -281,28 +361,35 @@ class Game:
                 terrain = ('MOUNTAIN' if draw < c.mountain_density else
                            'FOREST' if draw < c.mountain_density + c.forest_density else 'GRASSLAND')
                 cell.set_terrain(terrain)
-            self.map.grid[city_pos].set_terrain('GRASSLAND')
-            component = self.map.reachable(city_pos)
-            adjacent = self.map.grid[city_pos].get_neighbors(self.map.grid)
-            if len(component) >= c.unit_count + 1 and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3):
-                break
+            self.map.grid[capital].set_terrain('GRASSLAND')
+            component = self.map.reachable(capital)
+            adjacent = self.map.grid[capital].get_neighbors(self.map.grid)
+            if (len(component) >= c.unit_count + c.city_count
+                    and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3)):
+                city_positions = place_cities(capital, component, c.city_count, self.rng, fits)
+                if city_positions is not None:
+                    break
         else:
             for cell in self.map.grid.values():
                 cell.set_terrain('GRASSLAND')
-            component = self.map.reachable(city_pos)
-        start_positions = self.rng.sample(sorted(component - {city_pos}), c.unit_count)
+            component = self.map.reachable(capital)
+            city_positions = place_cities(capital, component, c.city_count, fits=fits)
+        for position in city_positions:
+            self.map.grid[position].set_terrain('GRASSLAND')
+        start_positions = self.rng.sample(sorted(component - set(city_positions)), c.unit_count)
         specs = [UNIT_SPECS[kind] for kind in self.unit_types]
         strengths = c.unit_strengths or tuple(spec.strength for spec in specs)
         names = ('Otto', 'Fynn', 'Victor', 'Ada')
         self.units = [C_Unit(*pos, name_instance=names[i], strength=strengths[i], env=self,
                              unit_type=self.unit_types[i], strength_ranged=specs[i].ranged_strength)
                       for i, pos in enumerate(start_positions)]
-        self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
-                           wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
-                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self)
+        self.cities = [C_City(*position, name_instance=CITY_NAMES[i], strength=c.city_strength,
+                              wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
+                              ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self)
+                       for i, position in enumerate(city_positions)]
         self.turn_number = 0
         self.events = []
-        self.last_info = {'outcome': 'ongoing', 'events': []}
+        self.last_info = {'outcome': 'ongoing', 'events': [], 'cities_captured': 0}
         self._done = self.quit = False
         self._valid_cache_key = None
         self._path_costs = None
@@ -321,7 +408,8 @@ class Game:
         if self.city is None:
             raise RuntimeError('Call reset before using the environment')
         terrain = tuple(cell.terrain_type for cell in self.map.grid.values())
-        key = (tuple((u.position, u.alive) for u in self.units), self.city.position, terrain)
+        key = (tuple((u.position, u.alive) for u in self.units),
+               tuple((city.position, city.alive) for city in self.cities), terrain)
         if key == self._valid_cache_key:
             return list(self._valid_cache)
         result = []
@@ -338,7 +426,7 @@ class Game:
             remaining = locations - {unit.position}
             for direction in self.unit_directions[index]:
                 if direction == 'SHOOT':
-                    if self.city.alive and hex_distance(unit.position, self.city.position) <= unit.attack_range:
+                    if self.shoot_target(unit) is not None:
                         visit(index + 1, action + [direction], locations)
                     continue
                 dx, dy = constants.movement_delta(direction, unit.y)
@@ -346,9 +434,10 @@ class Game:
                 cell = self.map.grid.get(destination)
                 if cell is None or cell.block_path or destination in remaining:
                     continue
-                if unit.support and destination == self.city.position:
+                attacks_city = self.city_at(destination) is not None
+                if unit.support and attacks_city:
                     continue
-                final = unit.position if destination == self.city.position else destination
+                final = unit.position if attacks_city else destination
                 visit(index + 1, action + [direction], remaining | {final})
 
         visit(0, [], occupied)
@@ -367,7 +456,7 @@ class Game:
             raise ValueError('Expected one valid direction per unit') from exc
 
     def move_unit(self, unit, delta):
-        if not unit.alive or not self.city.alive:
+        if not unit.alive or not self.living_cities():
             return
         dx, dy = delta
         destination = unit.x + dx, unit.y + dy
@@ -377,14 +466,14 @@ class Game:
             unit._event('invalid_move')
             return
         target = self.occupant(destination, exclude=unit)
-        if target is self.city and unit.support:
+        if isinstance(target, C_City) and unit.support:
             unit._event('invalid_move')
-        elif target is self.city:
-            damage_out, damage_taken = attack(unit, self.city)
+        elif isinstance(target, C_City):
+            damage_out, damage_taken = attack(unit, target)
             unit._event('attacked')
             unit.take_damage(damage_taken)
-            self.city.take_damage(damage_out, aggressor_alive=unit.alive,
-                                  wall_multiplier=self.melee_wall_multiplier(unit))
+            target.take_damage(damage_out, aggressor_alive=unit.alive,
+                               wall_multiplier=self.melee_wall_multiplier(unit, target))
             if unit.alive:
                 unit.status = 'attacked'
         elif target is not None:
@@ -396,52 +485,54 @@ class Game:
                 unit.status = 'healed'
                 unit._event('unit_healed', amount=healed)
         else:
-            distance_before = hex_distance(unit.position, self.city.position)
+            distance_before = self.nearest_city_distance(unit.position)
             unit.x, unit.y = destination
             unit.status = 'alive'
-            unit._event('moved', progress=distance_before - hex_distance(destination, self.city.position),
+            unit._event('moved', progress=distance_before - self.nearest_city_distance(destination),
                         cost=cell.movement_cost)
 
-    def ram_in_position(self):
-        return any(u.alive and u.support and hex_distance(u.position, self.city.position) == 1
+    def ram_in_position(self, city=None):
+        city = city or self.city
+        return any(u.alive and u.support and hex_distance(u.position, city.position) == 1
                    for u in self.units)
 
-    def melee_wall_multiplier(self, unit):
-        if UNIT_SPECS[unit.unit_type].unit_class in RAM_SUPPORTED_CLASSES and self.ram_in_position():
+    def melee_wall_multiplier(self, unit, city=None):
+        if UNIT_SPECS[unit.unit_type].unit_class in RAM_SUPPORTED_CLASSES and self.ram_in_position(city):
             return 1.0
         return MELEE_WALL_DAMAGE
 
     def city_turn(self):
-        if not self.city.alive:
-            return
-        if self.city.ranged_combat:
-            targets = [u for u in self.units if u.alive and hex_distance(u.position, self.city.position) <= 2]
-            if targets:
-                target = self.rng.choice(targets)
-                damage, _ = attack(self.city, target, ranged=True)
-                target.take_damage(damage)
-        if self.city.heal:
-            besiegers = sum(u.alive and hex_distance(u.position, self.city.position) == 1 for u in self.units)
-            if besiegers < min(3, self.config.unit_count):
-                healed = min(10, self.city.hp_max - self.city.hp)
-                if healed > 0:
-                    self.city.hp += healed
-                    self.city.status = 'healed'
-                    self.city._event('city_healed', amount=healed)
+        """Each city that has not been captured shoots and heals."""
+        for city in self.living_cities():
+            if city.ranged_combat:
+                targets = [u for u in self.units if u.alive and hex_distance(u.position, city.position) <= 2]
+                if targets:
+                    target = self.rng.choice(targets)
+                    damage, _ = attack(city, target, ranged=True)
+                    target.take_damage(damage)
+            if city.heal:
+                besiegers = sum(u.alive and hex_distance(u.position, city.position) == 1 for u in self.units)
+                if besiegers < min(3, self.config.unit_count):
+                    healed = min(10, city.hp_max - city.hp)
+                    if healed > 0:
+                        city.hp += healed
+                        city.status = 'healed'
+                        city._event('city_healed', amount=healed)
 
     def shoot(self, unit):
-        if not unit.alive or not self.city.alive:
+        if not unit.alive or not self.living_cities():
             return
-        if not unit.ranged or hex_distance(unit.position, self.city.position) > unit.attack_range:
+        target = self.shoot_target(unit) if unit.ranged else None
+        if target is None:
             unit._event('invalid_move')
             return
-        damage, _ = attack(unit, self.city, ranged=True)
+        damage, _ = attack(unit, target, ranged=True)
         unit._event('ranged_attack')
         # Capturing requires a melee action; a ranged strike leaves at least 1 HP.
-        self.city.take_damage(damage, aggressor_alive=False)
+        target.take_damage(damage, aggressor_alive=False)
 
     def _outcome(self):
-        if not self.city.alive or self.city.hp <= 0:
+        if all(not city.alive or city.hp <= 0 for city in self.cities):
             return 'win'
         if not any(u.alive and u.hp > 0 and not u.support for u in self.units):
             return 'loss'
@@ -469,9 +560,13 @@ class Game:
                 reward -= .2
             elif kind == 'moved':
                 reward += .05 * event['progress'] - .01 * (event['cost'] - 1)
+        # Each city captured before the last earns 5; the last one brings the 10-point victory.
+        captures = sum(event['type'] == 'city_captured' for event in self.events)
         if self.last_info['outcome'] == 'win':
-            reward += 10
-        elif self.last_info['outcome'] == 'loss':
+            reward += 10 + 5 * max(0, captures - 1)
+        else:
+            reward += 5 * captures
+        if self.last_info['outcome'] == 'loss':
             reward -= 10
         return float(reward)
 
@@ -490,14 +585,14 @@ class Game:
                     self.shoot(unit)
                 else:
                     self.move_unit(unit, constants.movement_delta(direction, unit.y))
-                if not self.city.alive:
+                if not self.living_cities():
                     break
             if self._outcome() == 'ongoing':
                 self.city_turn()
         outcome = self._outcome()
         self._done = outcome != 'ongoing'
         self.last_info = {'outcome': outcome, 'events': [event.copy() for event in self.events],
-                          'turn': self.turn_number}
+                          'turn': self.turn_number, 'cities_captured': self.cities_captured()}
         reward = self.get_rewards()
         return self.get_observation(), reward, self._done
 
@@ -505,10 +600,11 @@ class Game:
         if self.city is None:
             raise RuntimeError('Call reset before get_observation')
         c = self.config
-        city = self.city
-        values = [city.x / (c.width - 1), city.y / (c.height - 1),
-                  city.hp / city.hp_max, city.wall_hp / 1000,
-                  city.strength / 100, city.strength_ranged / 100, float(city.heal)]
+        values = []
+        for city in self.cities:
+            values.extend([city.x / (c.width - 1), city.y / (c.height - 1),
+                           city.hp / city.hp_max, city.wall_hp / 1000,
+                           city.strength / 100, city.strength_ranged / 100, float(city.heal)])
         for unit in self.units:
             values.extend([unit.x / (c.width - 1), unit.y / (c.height - 1),
                            unit.hp / unit.hp_max, float(unit.alive), unit.strength / 100,
@@ -517,18 +613,30 @@ class Game:
                       for y in range(c.height) for x in range(c.width))
         return np.asarray(values, dtype=float)
 
-    def _distances(self):
-        key = (self.city.position, tuple(cell.terrain_type for cell in self.map.grid.values()))
+    def target_city(self):
+        """The city the heuristic squad focuses on: the weakest, then the closest to the squad."""
+        attackers = [u for u in self.units if u.alive and not u.support]
+        options = [(city.hp + city.wall_hp, sum(hex_distance(u.position, city.position) for u in attackers),
+                    index, city) for index, city in enumerate(self.cities) if city.alive]
+        return min(options)[-1] if options else None
+
+    def _distances(self, target=None):
+        """Path cost from every tile to the target city; other uncaptured cities block paths."""
+        target = target or self.target_city()
+        if target is None:
+            return {}
+        blocked = frozenset(city.position for city in self.living_cities() if city is not target)
+        key = (target.position, blocked, tuple(cell.terrain_type for cell in self.map.grid.values()))
         if self._path_costs is not None and self._path_costs[0] == key:
             return self._path_costs[1]
-        costs = {self.city.position: 0}
-        pending = [(0, self.city.position)]
+        costs = {target.position: 0}
+        pending = [(0, target.position)]
         while pending:
             cost, pos = heapq.heappop(pending)
             if cost != costs[pos]:
                 continue
             for neighbor in self.map.grid[pos].get_neighbors(self.map.grid):
-                if neighbor.block_path:
+                if neighbor.block_path or neighbor.index in blocked:
                     continue
                 new_cost = cost + self.map.grid[pos].movement_cost
                 if new_cost < costs.get(neighbor.index, float('inf')):
@@ -539,7 +647,16 @@ class Game:
 
     def guided_action(self, rng=None):
         rng = rng or self.rng
-        costs = self._distances()
+        target = self.target_city()
+        costs = self._distances(target)
+        # After taking a city, regroup: hurt units rest, and the squad attacks the
+        # next city together instead of one unit at a time.
+        regroup = self.cities_captured() > 0 and target is not None
+        if regroup:
+            attackers = [u for u in self.units if u.alive and not u.support]
+            adjacent = sum(hex_distance(u.position, target.position) == 1 for u in attackers)
+            slots = sum(not cell.block_path for cell in self.map.grid[target.position].get_neighbors(self.map.grid))
+            assembled = adjacent >= min(3, len(attackers), slots)
         scores = []
         for action in self.valid_actions():
             score = 0
@@ -547,17 +664,24 @@ class Game:
                 if not unit.alive:
                     continue
                 if direction == 'SHOOT':
+                    target = self.shoot_target(unit)
                     score += costs.get(unit.position, 10000) - 2
-                    if self.city.hp <= 1 and self.city.wall_hp == 0:
+                    if target.hp <= 1 and target.wall_hp == 0:
                         score += 5
                     continue
                 dx, dy = constants.movement_delta(direction, unit.y)
                 destination = unit.x + dx, unit.y + dy
                 score += costs.get(destination, 10000)
+                if regroup and destination == target.position and not assembled:
+                    score += 3
                 if direction == 'SPACE':
                     if unit.hp < .35 * unit.hp_max:
                         score -= 2
-                    elif unit.support and hex_distance(unit.position, self.city.position) == 1:
+                    elif regroup and unit.hp < .7 * unit.hp_max:
+                        score -= 2
+                    elif regroup and not assembled and hex_distance(unit.position, target.position) == 1:
+                        score -= 1
+                    elif unit.support and target is not None and hex_distance(unit.position, target.position) == 1:
                         score -= 1
                     else:
                         score += .3

@@ -68,7 +68,8 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--width`, `--height` | Set map dimensions from 3 to 32. |
 | `--unit-count` | Choose one to four starting units. |
 | `--unit-types warrior spearman heavy_chariot slinger archer battering_ram ...` | Set one type per unit; omitted types default to warriors. |
-| `--city-position X Y` | Set the city's map coordinate. |
+| `--city-count N` | Choose one to four enemy cities; capture all of them for a domination victory. |
+| `--city-position X Y` | Set the capital's map coordinate (the first city; other cities are placed randomly). |
 | `--unit-strengths N [N ...]`, `--city-strength` | Override unit and city combat strengths. |
 | `--ranged-strength` | Configure the city's ranged attack strength. |
 | `--wall-hp` | Set the city's initial wall health. |
@@ -104,6 +105,22 @@ For a walled siege with a battering ram:
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman battering_ram --wall-hp 50 --model-path runs/siege/model.json --metrics-dir runs/siege --fresh
 ```
+
+## Domination victory
+
+Each enemy city is a rival civilization's capital. Capturing every one is a domination victory and ends the game as a win; with the default single city, this is the same as capturing it. Use `--city-count 2` to `4` for a longer campaign:
+
+```powershell
+python run_game.py --episodes 500 --city-count 3 --difficulty easy --max-steps 200 --model-path runs/domination/model.json --metrics-dir runs/domination --fresh
+```
+
+- The capital sits at `--city-position` (or the map center). Other cities are placed randomly at least three hexes apart, in reach of the squad, and with enough open tiles around them for a full siege.
+- Every city that has not been captured shoots and heals on its own; all cities share the strength, wall, and ranged settings.
+- A captured city stops fighting and its tile opens to your units. Capturing a city before the last earns +5, and the last one earns the +10 victory reward.
+- Ranged units shoot the closest city in range; ties go to the city with the least health plus walls. A battering ram helps only against the city it stands next to.
+- Evaluation summaries add the average number of cities captured, which shows progress even when games time out.
+
+Domination is much harder than a single siege, because damage carries over between cities. With three units on normal difficulty, the built-in heuristic wins 65–73% of games against two to four cities, and most other games time out after a unit is lost. On easy difficulty, it wins every three-city game. Allow more turns with `--max-steps` for larger campaigns.
 
 ## Metrics and playback
 

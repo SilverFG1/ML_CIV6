@@ -10,7 +10,7 @@ import numpy as np
 
 import constants
 from class_hex import HexMap
-from game import C_Unit, Game, GameConfig, attack, hex_distance
+from game import MIN_CITY_DISTANCE, C_Unit, Game, GameConfig, attack, hex_distance
 
 
 class GameTests(unittest.TestCase):
@@ -23,6 +23,10 @@ class GameTests(unittest.TestCase):
     def place(self, env, positions):
         for unit, pos in zip(env.units, positions):
             unit.x, unit.y = pos
+
+    def place_cities(self, env, positions):
+        for city, pos in zip(env.cities, positions):
+            city.x, city.y = pos
 
     def wait(self, env):
         return env.encode_action(['SPACE'] * len(env.units))
@@ -221,7 +225,9 @@ class GameTests(unittest.TestCase):
                        {'wall_hp': -1}, {'forest_density': .9},
                        {'unit_strengths': (20, 30)}, {'city_strength': float('nan')},
                        {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)},
-                       {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')}]:
+                       {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')},
+                       {'city_count': 0}, {'city_count': 5}, {'city_count': True},
+                       {'width': 3, 'height': 3, 'city_count': 2}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -406,6 +412,118 @@ class GameTests(unittest.TestCase):
         env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_heals=False)
         self.place(env, [(0, 0), (5, 4)])
         self.assertEqual(env.actions[env.guided_action(random.Random(1))][1], 'SPACE')
+
+    def test_single_city_game_keeps_its_layout(self):
+        env = self.make_env()
+        self.assertEqual(env.cities, [env.city])
+        self.assertEqual(env.city.name_instance, 'Ottertopia')
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior')
+        self.assertEqual(env.last_info['cities_captured'], 0)
+
+    def test_multiple_cities_are_spaced_reachable_and_besiegeable(self):
+        for seed in range(12):
+            env = Game(config=GameConfig(city_count=3, forest_density=.2, mountain_density=.15), seed=seed)
+            env.reset(seed=seed)
+            positions = [city.position for city in env.cities]
+            self.assertEqual([c.name_instance for c in env.cities], ['Ottertopia', 'Kelpford', 'Clamhaven'])
+            self.assertEqual(positions[0], (4, 4))
+            for i, first in enumerate(positions):
+                for second in positions[i + 1:]:
+                    self.assertGreaterEqual(hex_distance(first, second), MIN_CITY_DISTANCE)
+                open_tiles = [cell for cell in env.map.grid[first].get_neighbors(env.map.grid) if not cell.block_path]
+                self.assertGreaterEqual(len(open_tiles), 3)
+            self.assertTrue(set(positions) <= env.map.reachable(positions[0]))
+            self.assertFalse({u.position for u in env.units} & set(positions))
+            self.assertIn(env.guided_action(), env.valid_actions())
+        self.assertEqual(env.get_observation().shape, (7 * 3 + 8 * 3 + 64,))
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior:cities=3')
+
+    def test_domination_requires_capturing_every_city(self):
+        env = self.make_env(unit_count=2, city_count=2, city_heals=False, ranged_strength=20)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(3, 4), (6, 6)])
+        env.city.hp = 1
+        with patch('game.attack', return_value=(5, 0)):
+            _, reward, done = env.step(env.encode_action(['E', 'W']))
+        self.assertFalse(done)
+        self.assertFalse(env.city.alive)
+        self.assertEqual(env.last_info['outcome'], 'ongoing')
+        self.assertEqual(env.last_info['cities_captured'], 1)
+        # Turn cost, city damage, capture bonus, and the other unit's step toward the next city.
+        self.assertAlmostEqual(reward, -.05 + .03 + 5 + .05)
+        # Later units still act, and the captured city no longer shoots.
+        self.assertEqual(env.units[1].position, (5, 6))
+        self.assertEqual(env.units[0].hp, 100)
+        # A captured city's tile is open to the squad.
+        self.assertIn(env.encode_action(['E', 'SPACE']), env.valid_actions())
+        env.step(env.encode_action(['E', 'SPACE']))
+        self.assertEqual(env.units[0].position, (4, 4))
+        self.place(env, [(2, 1), (6, 6)])
+        env.cities[1].hp = 1
+        with patch('game.attack', return_value=(5, 0)):
+            _, reward, done = env.step(env.encode_action(['W', 'SPACE']))
+        self.assertTrue(done)
+        self.assertEqual(env.last_info['outcome'], 'win')
+        self.assertEqual(env.last_info['cities_captured'], 2)
+        self.assertAlmostEqual(reward, -.05 + .03 + 10)
+
+    def test_every_uncaptured_city_shoots_and_heals(self):
+        env = self.make_env(unit_count=2, city_count=2, ranged_strength=20)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(2, 4), (1, 3)])
+        for city in env.cities:
+            city.hp = 50
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(self.wait(env))
+        self.assertEqual([u.hp for u in env.units], [95, 95])
+        self.assertEqual([c.hp for c in env.cities], [60, 60])
+        env.cities[1].death()
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(self.wait(env))
+        # Both units heal back to full; only the capital still shoots.
+        self.assertEqual([u.hp for u in env.units], [95, 100])
+        self.assertEqual([c.hp for c in env.cities], [70, 0])
+
+    def test_shot_hits_closest_city_then_weakest(self):
+        env = self.make_env(unit_count=1, unit_types=('archer',), city_count=2, city_heals=False)
+        self.place_cities(env, [(4, 4), (4, 0)])
+        self.place(env, [(3, 2)])
+        env.cities[1].hp = 50
+        self.assertIs(env.shoot_target(env.units[0]), env.cities[1])
+        env.cities[0].hp = 40
+        self.assertIs(env.shoot_target(env.units[0]), env.cities[0])
+        with patch('game.attack', return_value=(10, 0)):
+            env.step(env.encode_action(['SHOOT']))
+        self.assertEqual([c.hp for c in env.cities], [30, 50])
+        self.place(env, [(4, 1)])
+        self.assertIs(env.shoot_target(env.units[0]), env.cities[1])
+
+    def test_ram_only_helps_against_the_city_it_is_next_to(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_count=2,
+                            wall_hp=30, city_heals=False)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(2, 1), (5, 4)])
+        with patch('game.attack', return_value=(20, 0)):
+            env.step(env.encode_action(['W', 'SPACE']))
+        self.assertEqual(env.cities[1].wall_hp, 20)
+        self.place(env, [(2, 1), (1, 2)])
+        with patch('game.attack', return_value=(20, 0)):
+            env.step(env.encode_action(['W', 'SPACE']))
+        self.assertEqual(env.cities[1].wall_hp, 0)
+
+    def test_heuristic_focuses_on_one_city(self):
+        env = self.make_env(unit_count=3, city_count=2, city_heals=False)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(0, 7), (1, 7), (2, 7)])
+        env.cities[1].hp = 20
+        self.assertIs(env.target_city(), env.cities[1])
+        costs = env._distances(env.target_city())
+        self.assertEqual(costs[(1, 1)], 0)
+        self.assertNotIn((4, 4), costs)
+        env.cities[0].hp = 10
+        self.assertIs(env.target_city(), env.cities[0])
+        env.cities[0].death()
+        self.assertIs(env.target_city(), env.cities[1])
 
 
 if __name__ == '__main__':

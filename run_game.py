@@ -52,6 +52,8 @@ def parse_args(argv=None):
                        ("ranged-strength", float), ("mountain-density", float), ("forest-density", float)):
         parser.add_argument("--" + flag, type=kind)
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
+    parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
+                        help=f"rivers to generate along hex sides (0-{game.MAX_RIVERS}, default: 0)")
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--no-city-healing", action="store_true")
     parser.add_argument("--unit-strengths", type=float, nargs="+")
@@ -86,7 +88,8 @@ def config_from_args(args, saved=None):
     values.update(saved)
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
-                 "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty"):
+                 "ranged_strength", "mountain_density", "forest_density", "river_count", "unit_strengths",
+                 "unit_types", "difficulty"):
         value = getattr(args, name)
         if value is not None:
             explicit[name] = tuple(value) if name in ("city_position", "unit_strengths", "unit_types") else value

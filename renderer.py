@@ -3,6 +3,7 @@
 import time
 
 import constants
+from class_hex import direction_between
 
 # Warriors share the plain unit sprite; other types get a short coloured label.
 UNIT_LABELS = {
@@ -12,6 +13,9 @@ UNIT_LABELS = {
     'archer': ('ARCHER', (255, 235, 140)),
     'battering_ram': ('RAM', (200, 200, 200)),
 }
+RIVER_COLOR = (64, 140, 225)
+# Polygon corner indices (from _polygon) for the side facing each neighbour.
+SIDE_CORNERS = {'NE': (0, 1), 'E': (1, 2), 'SE': (2, 3), 'SW': (3, 4), 'W': (4, 5), 'NW': (5, 0)}
 
 
 class Renderer:
@@ -85,6 +89,7 @@ class Renderer:
                 p.draw.polygon(self.surface, (165, 175, 185),
                                [(x + s * .2, y + s * .7), (x + s * .5, y + s * .2),
                                 (x + s * .8, y + s * .7)])
+        self._draw_rivers()
         for obj in self.env.objects:
             x, y = self._position(obj.position)
             if obj.alive:
@@ -116,6 +121,16 @@ class Renderer:
         if self.paused:
             self._text('PAUSED', (self.margin, y + 31 + 22 * control_lines), (255, 220, 100))
         p.display.flip()
+
+    def _draw_rivers(self):
+        width = max(3, self.size // 12)
+        for edge in sorted(self.env.map.rivers, key=sorted):
+            origin, neighbor = sorted(edge)
+            polygon = self._polygon(origin)
+            start, end = (polygon[i] for i in SIDE_CORNERS[direction_between(origin, neighbor)])
+            self.pygame.draw.line(self.surface, RIVER_COLOR, start, end, width)
+            for point in (start, end):  # Round the joints between river segments.
+                self.pygame.draw.circle(self.surface, RIVER_COLOR, point, width / 2)
 
     def _events(self):
         advance = False

@@ -57,6 +57,11 @@ UNIT_TYPES = tuple(UNIT_SPECS)
 MELEE_WALL_DAMAGE = 0.5
 RAM_SUPPORTED_CLASSES = ('melee', 'anti_cavalry')
 
+# Civ VI river defense: a defender gains this much strength against melee
+# attacks from across a river. Ranged attacks are unaffected.
+RIVER_DEFENSE_BONUS = 5
+MAX_RIVERS = 10
+
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -70,6 +75,7 @@ class GameConfig:
     city_heals: bool = True
     mountain_density: float = 0
     forest_density: float = 0
+    river_count: int = 0
     unit_strengths: tuple = ()
     unit_types: tuple = ()
     difficulty: str = 'normal'
@@ -93,6 +99,9 @@ class GameConfig:
                 raise ValueError(f'{name} must be between 0 and 1')
         if self.mountain_density + self.forest_density > 0.8:
             raise ValueError('combined terrain density must be at most 0.8')
+        if (isinstance(self.river_count, bool) or not isinstance(self.river_count, int)
+                or not 0 <= self.river_count <= MAX_RIVERS):
+            raise ValueError(f'river_count must be an integer between 0 and {MAX_RIVERS}')
         if self.unit_strengths and len(self.unit_strengths) != self.unit_count:
             raise ValueError('unit_strengths must contain one strength for every unit')
         if any(not math.isfinite(s) or not 0 < s <= 100 for s in self.unit_strengths):
@@ -230,11 +239,14 @@ def attack(aggressor, target, ranged=False, rng=None):
     defense = target.strength
     if isinstance(target, C_Unit) and target.env is not None:
         defense += target.env.map.grid[target.position].defense_bonus
-    strength_diff = offense - defense
+    river_defense = 0
+    if not ranged and aggressor.env is not None and aggressor.env.map.has_river(aggressor.position, target.position):
+        river_defense = RIVER_DEFENSE_BONUS
+    strength_diff = offense - defense - river_defense
     damage_out = round(rng.randint(24, 36) * math.exp(strength_diff / 25) * rng.uniform(.75, 1))
     if ranged:
         return damage_out, 0
-    retaliation_diff = target.strength - aggressor.strength
+    retaliation_diff = target.strength + river_defense - aggressor.strength
     if aggressor.env is not None:
         retaliation_diff -= aggressor.env.map.grid[aggressor.position].defense_bonus
     damage_taken = round(rng.randint(24, 36) * math.exp(retaliation_diff / 25) * rng.uniform(.75, 1))
@@ -252,8 +264,11 @@ class Game:
         self.actions = tuple(itertools.product(*self.unit_directions))
         self.action_count = len(self.actions)
         self._action_index = {a: i for i, a in enumerate(self.actions)}
+        # River features are appended only when rivers are on, so river-free
+        # scenarios keep their earlier observation format and checkpoints.
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
-                                   + ','.join(self.unit_types))
+                                   + ','.join(self.unit_types)
+                                   + (':rivers' if self.config.river_count else ''))
         self._renderer = None
         self.quit = False
         self.units = []
@@ -290,6 +305,8 @@ class Game:
             for cell in self.map.grid.values():
                 cell.set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
+        # Rivers never block movement, so they cannot disconnect the start area.
+        self.map.generate_rivers(c.river_count, self.rng)
         start_positions = self.rng.sample(sorted(component - {city_pos}), c.unit_count)
         specs = [UNIT_SPECS[kind] for kind in self.unit_types]
         strengths = c.unit_strengths or tuple(spec.strength for spec in specs)
@@ -397,10 +414,11 @@ class Game:
                 unit._event('unit_healed', amount=healed)
         else:
             distance_before = hex_distance(unit.position, self.city.position)
+            origin = unit.position
             unit.x, unit.y = destination
             unit.status = 'alive'
             unit._event('moved', progress=distance_before - hex_distance(destination, self.city.position),
-                        cost=cell.movement_cost)
+                        cost=self.map.movement_cost(origin, destination))
 
     def ram_in_position(self):
         return any(u.alive and u.support and hex_distance(u.position, self.city.position) == 1
@@ -515,10 +533,14 @@ class Game:
                            float(unit.y % 2), unit.strength_ranged / 100, unit.attack_range / 2])
         values.extend(TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
                       for y in range(c.height) for x in range(c.width))
+        if c.river_count:
+            values.extend(float(flag) for y in range(c.height) for x in range(c.width)
+                          for flag in self.map.river_flags((x, y)))
         return np.asarray(values, dtype=float)
 
     def _distances(self):
-        key = (self.city.position, tuple(cell.terrain_type for cell in self.map.grid.values()))
+        key = (self.city.position, tuple(cell.terrain_type for cell in self.map.grid.values()),
+               frozenset(self.map.rivers))
         if self._path_costs is not None and self._path_costs[0] == key:
             return self._path_costs[1]
         costs = {self.city.position: 0}
@@ -530,7 +552,7 @@ class Game:
             for neighbor in self.map.grid[pos].get_neighbors(self.map.grid):
                 if neighbor.block_path:
                     continue
-                new_cost = cost + self.map.grid[pos].movement_cost
+                new_cost = cost + self.map.movement_cost(neighbor.index, pos)
                 if new_cost < costs.get(neighbor.index, float('inf')):
                     costs[neighbor.index] = new_cost
                     heapq.heappush(pending, (new_cost, neighbor.index))
@@ -554,6 +576,9 @@ class Game:
                 dx, dy = constants.movement_delta(direction, unit.y)
                 destination = unit.x + dx, unit.y + dy
                 score += costs.get(destination, 10000)
+                if destination == self.city.position and self.map.has_river(unit.position, destination):
+                    # Prefer to attack from a bank that the river does not separate from the city.
+                    score += 1.5
                 if direction == 'SPACE':
                     if unit.hp < .35 * unit.hp_max:
                         score -= 2

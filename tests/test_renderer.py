@@ -5,6 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+from class_hex import direction_between
 from game import Game, GameConfig
 
 
@@ -52,6 +53,21 @@ class RendererTests(unittest.TestCase):
             env.reset(seed=7)
             self.assertTrue(env.render_frame())
             env.close()
+
+    def test_draws_rivers_along_tile_sides(self):
+        from renderer import RIVER_COLOR, SIDE_CORNERS
+        env = Game(render=True, config=GameConfig(unit_count=1, river_count=2))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        colors = []
+        for edge in env.map.rivers:
+            origin, neighbor = sorted(edge)
+            polygon = renderer._polygon(origin)
+            (x1, y1), (x2, y2) = (polygon[i] for i in SIDE_CORNERS[direction_between(origin, neighbor)])
+            colors.append(tuple(renderer.surface.get_at((int((x1 + x2) / 2), int((y1 + y2) / 2))))[:3])
+        self.assertGreater(colors.count(RIVER_COLOR), len(colors) // 2)
 
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))

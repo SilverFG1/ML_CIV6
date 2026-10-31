@@ -226,7 +226,9 @@ class GameTests(unittest.TestCase):
                        {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')},
                        {'river_count': -1}, {'river_count': 11}, {'river_count': True},
                        {'river_count': 1.5}, {'walls': 'medieval'}, {'walls': None},
-                       {'walls': ['ancient']}]:
+                       {'walls': ['ancient']}, {'land_types': ('lava',)},
+                       {'land_types': ('plains', 'plains')}, {'land_types': 5}, {'hills_density': 1.5},
+                       {'water_density': -.1}, {'mountain_density': .3, 'water_density': .3, 'forest_density': .3}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -572,6 +574,80 @@ class GameTests(unittest.TestCase):
                 with patch('game.attack', return_value=(20, 0)):
                     env.step(env.encode_action(['E'] + ['SPACE'] * (len(unit_types) - 1)))
                 self.assertEqual((env.city.wall_hp, env.city.hp), (wall_hp, 100))
+
+    def terrain_env(self, **kwargs):
+        options = dict(land_types=('grassland', 'plains', 'desert', 'tundra', 'snow'), hills_density=.3,
+                       water_density=.15, mountain_density=.05, forest_density=.25)
+        options.update(kwargs)
+        return self.make_env(**options)
+
+    def test_new_terrain_options_generate_valid_reproducible_maps(self):
+        env = self.terrain_env()
+        self.assertTrue(env.config.extended_terrain)
+        self.assertFalse(self.make_env(land_types=('grassland',)).config.extended_terrain)
+        seen = set()
+        for seed in range(15):
+            env.reset(seed=seed)
+            city = env.map.grid[env.city.position]
+            self.assertEqual((city.spec.elevation, city.feature), ('FLAT', None))
+            self.assertFalse(city.block_path)
+            for unit in env.units:
+                self.assertFalse(env.map.grid[unit.position].block_path)
+                self.assertIn(unit.position, env.map.reachable(env.city.position))
+            for cell in env.map.grid.values():
+                seen.add(cell.terrain_type)
+                if cell.feature:
+                    self.assertIn(cell.spec.land_type, ('GRASSLAND', 'PLAINS', 'TUNDRA'))
+            self.assertIn(env.guided_action(), env.valid_actions())
+        self.assertTrue({'PLAINS', 'DESERT_HILLS', 'COAST', 'SNOW'} <= seen)
+        other = self.terrain_env()
+        for seed in (3, 4):
+            env.reset(seed=seed)
+            other.reset(seed=seed)
+            self.assertEqual([(c.terrain_type, c.feature) for c in env.map.grid.values()],
+                             [(c.terrain_type, c.feature) for c in other.map.grid.values()])
+
+    def test_extended_terrain_observation_reports_combat_properties(self):
+        env = self.terrain_env(unit_count=1)
+        base = 7 + 8
+        observation = env.get_observation()
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior:terrain')
+        self.assertEqual(observation.shape, (base + 3 * 64,))
+        env.map.grid[(0, 0)].set_terrain('PLAINS_HILLS')
+        env.map.grid[(0, 0)].set_feature('FOREST')
+        env.map.grid[(1, 0)].set_terrain('OCEAN')
+        env.map.grid[(2, 0)].set_terrain('DESERT')
+        tiles = env.get_observation()[base:].reshape(8, 8, 3)
+        self.assertEqual(tiles[0, 0].tolist(), [0, 1, 1])
+        self.assertEqual(tiles[0, 1].tolist(), [1, 0, 0])
+        self.assertEqual(tiles[0, 2].tolist(), [0, 0, 0])
+
+    def test_hills_and_forest_protect_units_and_cost_movement(self):
+        env = self.make_env(unit_count=1, city_heals=False, ranged_strength=20)
+        self.place(env, [(3, 4)])
+        damage = []
+        for terrain, feature in (('GRASSLAND', None), ('GRASSLAND_HILLS', None), ('GRASSLAND_HILLS', 'FOREST')):
+            env.map.grid[(3, 4)].set_terrain(terrain)
+            env.map.grid[(3, 4)].set_feature(feature)
+            damage.append(attack(env.city, env.units[0], ranged=True, rng=random.Random(2))[0])
+        self.assertGreater(damage[0], damage[1])
+        self.assertGreater(damage[1], damage[2])
+        env.map.grid[(2, 4)].set_terrain('PLAINS_HILLS')
+        env.map.grid[(2, 3)].set_terrain('TUNDRA_HILLS')
+        env.map.grid[(2, 3)].set_feature('FOREST')
+        self.assertEqual(env.map.movement_cost((3, 4), (2, 4)), 2)
+        self.assertEqual(env.map.movement_cost((2, 4), (2, 3)), 3)
+        env.step(env.encode_action(['W']))
+        self.assertEqual(next(e['cost'] for e in env.events if e['type'] == 'moved'), 2)
+        env.step(env.encode_action(['NE']))
+        self.assertEqual(env.units[0].position, (2, 3))
+        self.assertEqual(next(e['cost'] for e in env.events if e['type'] == 'moved'), 3)
+
+    def test_units_cannot_enter_water(self):
+        env = self.make_env(unit_count=1)
+        self.place(env, [(0, 0)])
+        env.map.grid[(1, 0)].set_terrain('COAST')
+        self.assertNotIn(env.encode_action(['E']), env.valid_actions())
 
 
 if __name__ == '__main__':

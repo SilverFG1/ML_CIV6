@@ -81,6 +81,35 @@ class RendererTests(unittest.TestCase):
             corners = [tuple(renderer.surface.get_at((int(x), int(y))))[:3] for x, y in renderer._wall_ring()]
             self.assertGreater(corners.count(color), 3)
 
+    def test_draws_every_terrain_and_toggles_yields(self):
+        from class_hex import TERRAINS
+        from renderer import LAND_COLORS, MOUNTAIN_COLOR, WATER_COLORS, YIELD_COLORS
+        env = Game(render=True, config=GameConfig(width=20, height=4, unit_count=1, city_position=(19, 3)))
+        env.reset(seed=1)
+        self.addCleanup(env.close)
+        env.units[0].x, env.units[0].y = 18, 3
+        names = list(TERRAINS)
+        for x, name in enumerate(names):
+            env.map.grid[(x, 0)].set_terrain(name)
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        size = renderer.size
+        for x, name in enumerate(names):
+            spec = TERRAINS[name]
+            expected = (WATER_COLORS[name] if spec.water else MOUNTAIN_COLOR
+                        if spec.land_type is None or spec.elevation == 'MOUNTAIN' else LAND_COLORS[spec.land_type])
+            left, top = renderer._position((x, 0))
+            with self.subTest(terrain=name):
+                self.assertEqual(tuple(renderer.surface.get_at((left + size // 2, top + int(size * .88))))[:3], expected)
+        left, top = renderer._position((0, 0))  # Grassland: two food dots.
+        dot = (int(left + size / 2 - 1.25 * max(2, size // 19)), int(top + size * .2))
+        self.assertEqual(tuple(renderer.surface.get_at(dot))[:3], YIELD_COLORS['food'])
+        p = renderer.pygame
+        p.event.post(p.event.Event(p.KEYDOWN, key=p.K_y))
+        self.assertTrue(env.render_frame())
+        self.assertFalse(renderer.show_yields)
+        self.assertEqual(tuple(renderer.surface.get_at(dot))[:3], LAND_COLORS['GRASSLAND'])
+
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))
         env.reset(seed=7)

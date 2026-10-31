@@ -13,6 +13,7 @@ from learning_ai import QLearningAgent
 
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
+TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types")
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
                  "random_actions", "policy_actions", "q_table_size", "city_strength")
@@ -49,9 +50,12 @@ def parse_args(argv=None):
     parser.add_argument("--no-guidance", action="store_true", help="train without heuristic fallback")
     parser.add_argument("--log-every", type=int, default=50)
     for flag, kind in (("width", int), ("height", int), ("city-strength", float), ("wall-hp", float),
-                       ("ranged-strength", float), ("mountain-density", float), ("forest-density", float)):
+                       ("ranged-strength", float), ("mountain-density", float), ("forest-density", float),
+                       ("hills-density", float), ("water-density", float)):
         parser.add_argument("--" + flag, type=kind)
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
+    parser.add_argument("--land-types", nargs="+", choices=game.LAND_TYPES,
+                        help="Civ VI land types to fill the map with, in regions (default: grassland)")
     parser.add_argument("--walls", choices=game.WALL_TYPES,
                         help="city walls; ancient gives 100 wall HP and a 15-strength ranged strike")
     parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
@@ -74,7 +78,7 @@ def parse_args(argv=None):
     if args.curriculum_episodes is not None and args.curriculum_episodes < 0:
         parser.error("--curriculum-episodes must be non-negative")
     for name in ("epsilon", "epsilon_decay", "epsilon_min", "guided_exploration", "discount_factor",
-                 "mountain_density", "forest_density"):
+                 "mountain_density", "forest_density", "hills_density", "water_density"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 1:
             parser.error(f"--{name.replace('_', '-')} must lie between 0 and 1")
@@ -90,11 +94,11 @@ def config_from_args(args, saved=None):
     values.update(saved)
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp", "walls",
-                 "ranged_strength", "mountain_density", "forest_density", "river_count", "unit_strengths",
-                 "unit_types", "difficulty"):
+                 "ranged_strength", "mountain_density", "forest_density", "land_types", "hills_density",
+                 "water_density", "river_count", "unit_strengths", "unit_types", "difficulty"):
         value = getattr(args, name)
         if value is not None:
-            explicit[name] = tuple(value) if name in ("city_position", "unit_strengths", "unit_types") else value
+            explicit[name] = tuple(value) if name in TUPLE_SETTINGS else value
     if args.no_city_healing:
         explicit["city_heals"] = False
     if args.difficulty is not None and args.city_strength is None:
@@ -103,7 +107,7 @@ def config_from_args(args, saved=None):
         values["city_strength"] = DIFFICULTY_STRENGTHS[values["difficulty"]]
     for name, value in explicit.items():
         old = values.get(name)
-        if name in ("city_position", "unit_strengths", "unit_types") and old is not None:
+        if name in TUPLE_SETTINGS and old is not None:
             old = tuple(old)
         if saved and old != value:
             raise ValueError(f"--{name.replace('_', '-')} differs from the checkpoint; use --fresh for a new scenario")
@@ -111,6 +115,7 @@ def config_from_args(args, saved=None):
     values["city_position"] = None if values["city_position"] is None else tuple(values["city_position"])
     values["unit_strengths"] = tuple(values["unit_strengths"])
     values["unit_types"] = tuple(values["unit_types"])
+    values["land_types"] = tuple(values["land_types"])
     return game.GameConfig(**values)
 
 

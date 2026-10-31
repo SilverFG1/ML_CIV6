@@ -9,17 +9,8 @@ import random
 import numpy as np
 
 import constants
-from class_hex import HexMap, TERRAIN_CODES
-
-
-def hex_coords(position):
-    x, y = position
-    q = x - (y - y % 2) // 2
-    return q, -q - y, y
-
-
-def hex_distance(first, second):
-    return max(abs(a - b) for a, b in zip(hex_coords(first), hex_coords(second)))
+from class_hex import LAND_TYPES, HexMap, hex_distance, terrain_code
+from class_hex import hex_coords  # noqa: F401  Kept importable from game, where it used to live.
 
 
 @dataclass(frozen=True)
@@ -93,6 +84,9 @@ class GameConfig:
     city_heals: bool = True
     mountain_density: float = 0
     forest_density: float = 0
+    land_types: tuple = ()
+    hills_density: float = 0
+    water_density: float = 0
     river_count: int = 0
     unit_strengths: tuple = ()
     unit_types: tuple = ()
@@ -119,12 +113,19 @@ class GameConfig:
                 raise ValueError(f'{name} must be finite and between 0 and 100')
         if not math.isfinite(self.wall_hp) or not 0 <= self.wall_hp <= 1000:
             raise ValueError('wall_hp must be finite and between 0 and 1000')
-        for name in ('mountain_density', 'forest_density'):
+        for name in ('mountain_density', 'forest_density', 'hills_density', 'water_density'):
             value = getattr(self, name)
             if not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f'{name} must be between 0 and 1')
-        if self.mountain_density + self.forest_density > 0.8:
-            raise ValueError('combined terrain density must be at most 0.8')
+        if self.mountain_density + self.water_density + self.forest_density > 0.8:
+            raise ValueError('combined mountain, water and forest density must be at most 0.8')
+        try:
+            object.__setattr__(self, 'land_types', tuple(self.land_types))
+        except TypeError as exc:
+            raise ValueError('land_types must be a sequence of land type names') from exc
+        if (any(not isinstance(name, str) or name not in LAND_TYPES for name in self.land_types)
+                or len(set(self.land_types)) != len(self.land_types)):
+            raise ValueError(f'land_types must name distinct types from {", ".join(LAND_TYPES)}')
         if (isinstance(self.river_count, bool) or not isinstance(self.river_count, int)
                 or not 0 <= self.river_count <= MAX_RIVERS):
             raise ValueError(f'river_count must be an integer between 0 and {MAX_RIVERS}')
@@ -146,6 +147,11 @@ class GameConfig:
             x, y = self.city_position
             if not (0 <= x < self.width and 0 <= y < self.height):
                 raise ValueError('city_position must lie inside the map')
+
+    @property
+    def extended_terrain(self):
+        """Whether maps can hold terrain beyond the original grassland, forest and mountains."""
+        return bool(self.hills_density or self.water_density or set(self.land_types) - {'grassland'})
 
 
 class C_Sprite:
@@ -294,6 +300,7 @@ class Game:
         # scenarios keep their earlier observation format and checkpoints.
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
+                                   + (':terrain' if self.config.extended_terrain else '')
                                    + (':rivers' if self.config.river_count else ''))
         self._renderer = None
         self.quit = False
@@ -315,12 +322,14 @@ class Game:
         c = self.config
         city_pos = tuple(c.city_position or (c.width // 2, c.height // 2))
         self.map = HexMap(c.height, c.width)
-        # Keep enough connected grassland for starting units and a possible siege.
+        # Keep enough connected open land for starting units and a possible siege.
+        blocked_density = c.mountain_density + c.water_density
         for _ in range(100):
             for cell in self.map.grid.values():
                 draw = self.rng.random()
                 terrain = ('MOUNTAIN' if draw < c.mountain_density else
-                           'FOREST' if draw < c.mountain_density + c.forest_density else 'GRASSLAND')
+                           'COAST' if draw < blocked_density else
+                           'FOREST' if draw < blocked_density + c.forest_density else 'GRASSLAND')
                 cell.set_terrain(terrain)
             self.map.grid[city_pos].set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
@@ -331,6 +340,11 @@ class Game:
             for cell in self.map.grid.values():
                 cell.set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
+        if c.extended_terrain:
+            # None of these steps block movement, so the start area stays connected.
+            self.map.assign_land_types(c.land_types or LAND_TYPES[:1], self.rng)
+            self.map.raise_hills(c.hills_density, self.rng, keep_flat={city_pos})
+            self.map.classify_water()
         # Rivers never block movement, so they cannot disconnect the start area.
         self.map.generate_rivers(c.river_count, self.rng)
         start_positions = self.rng.sample(sorted(component - {city_pos}), c.unit_count)
@@ -557,15 +571,22 @@ class Game:
             values.extend([unit.x / (c.width - 1), unit.y / (c.height - 1),
                            unit.hp / unit.hp_max, float(unit.alive), unit.strength / 100,
                            float(unit.y % 2), unit.strength_ranged / 100, unit.attack_range / 2])
-        values.extend(TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
-                      for y in range(c.height) for x in range(c.width))
+        cells = [self.map.grid[(x, y)] for y in range(c.height) for x in range(c.width)]
+        if c.extended_terrain:
+            # Combat-relevant properties: impassable, extra movement cost, defense bonus.
+            for cell in cells:
+                blocked = cell.block_path
+                values.extend([float(blocked), 0.0 if blocked else (cell.movement_cost - 1) / 2,
+                               0.0 if blocked else cell.defense_bonus / 6])
+        else:
+            values.extend(terrain_code(cell) / 2 for cell in cells)
         if c.river_count:
             values.extend(float(flag) for y in range(c.height) for x in range(c.width)
                           for flag in self.map.river_flags((x, y)))
         return np.asarray(values, dtype=float)
 
     def _distances(self):
-        key = (self.city.position, tuple(cell.terrain_type for cell in self.map.grid.values()),
+        key = (self.city.position, tuple((cell.terrain_type, cell.feature) for cell in self.map.grid.values()),
                frozenset(self.map.rivers))
         if self._path_costs is not None and self._path_costs[0] == key:
             return self._path_costs[1]

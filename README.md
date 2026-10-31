@@ -1,6 +1,6 @@
 # ML_CIV6
 
-A small Civ-inspired hex-grid combat environment and tabular Q-learning experiment, originally inspired by [this Civilization VI machine-learning video](https://www.youtube.com/watch?v=kjA9LxLx9IQ). Units move, heal, fight, and attempt to capture a defended city. The simulation supports configurable terrain, rivers, city walls (including Civ VI Ancient Walls), ranged units, and difficulty presets. It implements a limited combat scenario rather than the full Civilization VI ruleset.
+A small Civ-inspired hex-grid combat environment and tabular Q-learning experiment, originally inspired by [this Civilization VI machine-learning video](https://www.youtube.com/watch?v=kjA9LxLx9IQ). Units move, heal, fight, and attempt to capture a defended city. The simulation supports Civ VI terrain types with their yields, rivers, city walls (including Civ VI Ancient Walls), ranged units, and difficulty presets. It implements a limited combat scenario rather than the full Civilization VI ruleset.
 
 An optional [real Civilization VI integration](docs/REAL_CIV6.md) now provides structured observations, saved snapshots, a basic tactical controller, and individual unit commands through FireTuner. Start with `python run_civ6.py doctor`. Orders are previewed until `--execute` is supplied. This first milestone controls a local player's units; full-game strategy and training the learner against the real game remain future work.
 
@@ -74,6 +74,8 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--wall-hp` | Set the city's initial wall health. |
 | `--walls none\|ancient` | Give the city Civ VI Ancient Walls: 100 wall health and a ranged strike. |
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
+| `--land-types grassland plains desert tundra snow` | Fill the map with these Civ VI land types, in regions (default: grassland). |
+| `--hills-density`, `--water-density` | Turn this share of land into hills, or of all tiles into water. |
 | `--river-count N` | Generate up to 10 rivers along tile edges (default 0). |
 | `--no-city-healing` | Disable city healing. |
 | `--curriculum-episodes N` | Progress from easier scenarios to the selected difficulty over N training episodes. |
@@ -93,16 +95,43 @@ Spearmen, heavy chariots, slingers, and battering rams use their Civ VI base str
 
 Walls absorb damage before the city does. Melee attacks deal half damage to walls; once the walls break, the rest of the attack hits the city at full strength. A living battering ram next to the city restores full wall damage for warriors and spearmen, but not for heavy chariots or for ranged units attacking in melee. Ranged attacks always deal full damage to walls. Battering rams cannot attack or capture the city, have no combat strength when the city shoots them, and a squad whose only survivors are rams has lost. Mountains block movement. Forests provide a defense bonus and add a movement-cost penalty. Terrain generation places units in the city's reachable component.
 
+### Terrain and yields
+
+The map uses Civ VI's base-game terrain rules, taken from the same catalog as the [real-game bridge](docs/REAL_CIV6.md) (`civ6_bridge/data/terrain_types.json`). There are five land types, each flat, hills, or mountain, plus coast and ocean. Forest is a separate feature on top of the terrain, as in Civ VI.
+
+| Terrain | Flat | Hills | Mountain |
+| --- | --- | --- | --- |
+| Grassland | 2 food | 2 food, 1 production | none |
+| Plains | 1 food, 1 production | 1 food, 2 production | none |
+| Desert | none | 1 production | none |
+| Tundra | 1 food | 1 food, 1 production | none |
+| Snow | none | 1 production | none |
+| Coast | 1 food, 1 gold | — | — |
+| Ocean | 1 food | — | — |
+
+- **Hills** cost two movement points and give units +3 defense.
+- **Forest** adds 1 production, one movement point, and +3 defense. It grows on grassland, plains, and tundra, flat or hills, but not desert or snow. A forest on hills costs three movement points and gives +6 defense.
+- **Mountains** are impassable. **Water** is impassable too, because units cannot embark.
+- **Yields** are attached to every tile (`cell.yields`, e.g. `{'food': 2, 'production': 1}`) and shown as dots near the top of each tile: green food, orange production, yellow gold. Press **Y** to hide or show them. The simulation has no economy yet, so yields do not change combat, rewards, or the observation.
+
+By default every map is grassland, forest, and mountains, exactly as before. `--land-types` splits the map into regions around randomly placed centres. `--hills-density` raises that share of flat land into hills; the city's tile stays flat. `--water-density` turns that share of tiles into water, which counts against the same 0.8 limit as mountains and forests. Water next to land becomes coast and water further out becomes ocean. Rivers never run alongside water.
+
 Ancient Walls (`--walls ancient`) follow Civ VI. They give the city 100 wall health ("outer defense") and a ranged strike that hits one unit within two tiles each turn. In Civ VI that strike matches the defender's strongest ranged unit, or 15 without one; this city has no units, so it uses 15. `--wall-hp` and `--ranged-strength` override these values. Ancient Walls add no combat strength to the city, and battering rams work against them. They make a siege much harder: over 200 heuristic games at normal difficulty, three warriors never win, while two spearmen, an archer, and a ram win 133. The renderer draws intact walls as a stone ring around the city and broken walls as ruined towers.
 
 Rivers run along the edges between tiles, not across tiles. Each river starts at a random edge and winds across the map until it leaves the map or joins another river. Rivers never block movement. As in Civ VI, a city attacked in melee from across a river gets +5 combat strength for that attack ("river defense"). The attacker deals less damage and takes more in return. Ranged attacks are unaffected. In Civ VI, crossing a river uses all of a unit's remaining movement. Every unit here already moves one hex per turn, so a crossing instead costs two movement points, like entering a forest. That cost feeds the movement penalty and the heuristic's path costs. The heuristic also prefers to attack from a tile that is on the city's side of the river.
 
-The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. With rivers enabled, it also has three river flags per tile, for the tile's east, southeast, and southwest edges, and the observation schema ends in `:rivers`. Scenarios without rivers keep the earlier observation format, so existing models still load. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
+The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. With any of `--land-types`, `--hills-density`, or `--water-density`, each tile instead reports three combat properties: impassable, extra movement cost, and defense bonus, and the observation schema includes `:terrain`. With rivers enabled, it also has three river flags per tile, for the tile's east, southeast, and southwest edges, and the observation schema ends in `:rivers`. Scenarios without these options keep the earlier observation format, so existing models still load. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
 
 For a mixed squad:
 
 ```powershell
 python run_game.py --episodes 100 --unit-count 3 --unit-types warrior archer warrior --wall-hp 50 --forest-density 0.2 --mountain-density 0.1 --model-path runs/mixed/model.json --metrics-dir runs/mixed --fresh
+```
+
+For varied Civ VI terrain:
+
+```powershell
+python run_game.py --episodes 200 --unit-count 2 --land-types grassland plains desert --hills-density 0.2 --water-density 0.1 --forest-density 0.15 --model-path runs/terrain/model.json --metrics-dir runs/terrain --fresh
 ```
 
 For a siege across rivers:
@@ -139,9 +168,9 @@ Render evaluation after training or replay a saved policy:
 python run_game.py --episodes 0 --eval-episodes 3 --eval-policies learned --model-path runs/baseline/model.json --metrics-dir runs/playback --render --render-delay-ms 100
 ```
 
-During playback, **Space** pauses/resumes, **Right Arrow** advances one turn while paused, **+ / -** change playback speed, and **Esc** exits. `--render-training` also displays training turns.
+During playback, **Space** pauses/resumes, **Right Arrow** advances one turn while paused, **+ / -** change playback speed, **Y** toggles yield dots, and **Esc** exits. `--render-training` also displays training turns.
 
-Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer or slinger, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
+Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer or slinger, **Y** toggles yield dots, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
 
 ## Verification
 

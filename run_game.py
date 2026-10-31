@@ -52,6 +52,8 @@ def parse_args(argv=None):
                        ("ranged-strength", float), ("mountain-density", float), ("forest-density", float)):
         parser.add_argument("--" + flag, type=kind)
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
+    parser.add_argument("--walls", choices=game.WALL_TYPES,
+                        help="city walls; ancient gives 100 wall HP and a 15-strength ranged strike")
     parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
                         help=f"rivers to generate along hex sides (0-{game.MAX_RIVERS}, default: 0)")
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
@@ -87,7 +89,7 @@ def config_from_args(args, saved=None):
     values = asdict(game.GameConfig())
     values.update(saved)
     explicit = {}
-    for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
+    for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp", "walls",
                  "ranged_strength", "mountain_density", "forest_density", "river_count", "unit_strengths",
                  "unit_types", "difficulty"):
         value = getattr(args, name)

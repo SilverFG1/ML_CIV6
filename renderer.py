@@ -16,6 +16,9 @@ UNIT_LABELS = {
 RIVER_COLOR = (64, 140, 225)
 # Polygon corner indices (from _polygon) for the side facing each neighbour.
 SIDE_CORNERS = {'NE': (0, 1), 'E': (1, 2), 'SE': (2, 3), 'SW': (3, 4), 'W': (4, 5), 'NW': (5, 0)}
+WALL_COLOR = (196, 184, 156)
+RUINED_WALL_COLOR = (112, 102, 90)
+WALL_OUTLINE = (70, 62, 52)
 
 
 class Renderer:
@@ -104,6 +107,8 @@ class Renderer:
                             (x + 2 * s / 3, y + 2 * s / 3), 3)
                 p.draw.line(self.surface, constants.COLOR_RED, (x + 2 * s / 3, y + s / 3),
                             (x + s / 3, y + 2 * s / 3), 3)
+            if obj is self.env.city:
+                self._draw_walls()
             self._text(f'{obj.name_instance} {obj.hp:.0f}', (x + 2, y + self.size * .7), small=True)
         if self.env.human:
             unit = self.env.units[self.selected_unit]
@@ -111,8 +116,10 @@ class Renderer:
         y = self.surface.get_height() - 109
         city = self.env.city
         outcome = self.env.last_info['outcome']
+        walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
+                 if self.env.config.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
         self._text(f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
-                   f'Walls {city.wall_hp:.0f}   {outcome.upper()}', (self.margin, y))
+                   f'{walls}   {outcome.upper()}', (self.margin, y))
         if self.env.human:
             controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
         else:
@@ -131,6 +138,30 @@ class Renderer:
             self.pygame.draw.line(self.surface, RIVER_COLOR, start, end, width)
             for point in (start, end):  # Round the joints between river segments.
                 self.pygame.draw.circle(self.surface, RIVER_COLOR, point, width / 2)
+
+    def _wall_ring(self):
+        """Corners of the city's walls, just inside its tile."""
+        polygon = self._polygon(self.env.city.position)
+        cx = sum(x for x, _ in polygon) / 6
+        cy = sum(y for _, y in polygon) / 6
+        return [(cx + (x - cx) * .9, cy + (y - cy) * .9) for x, y in polygon]
+
+    def _draw_walls(self):
+        """A stone ring with corner towers; broken walls leave only ruined towers."""
+        city = self.env.city
+        if city.wall_hp_max <= 0:
+            return
+        ring = self._wall_ring()
+        intact = city.wall_hp > 0
+        color = WALL_COLOR if intact else RUINED_WALL_COLOR
+        if intact:
+            self.pygame.draw.polygon(self.surface, WALL_OUTLINE, ring, max(5, self.size // 10))
+            self.pygame.draw.polygon(self.surface, color, ring, max(3, self.size // 14))
+        half = max(3, self.size // 16)
+        for x, y in ring:
+            tower = self.pygame.Rect(int(x - half), int(y - half), 2 * half, 2 * half)
+            self.pygame.draw.rect(self.surface, color, tower)
+            self.pygame.draw.rect(self.surface, WALL_OUTLINE, tower, 1)
 
     def _events(self):
         advance = False

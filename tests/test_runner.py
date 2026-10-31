@@ -310,6 +310,23 @@ class RunnerTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             run_game.parse_args(['--river-count', '11'])
 
+    def test_ancient_walls_resume_and_reject_changes(self):
+        args = self.args('--walls', 'ancient', '--unit-count', '2', '--unit-types', 'warrior', 'archer')
+        agent = self.make_agent(args)
+        self.assertEqual((args.config.wall_hp, args.config.ranged_strength), (100, 15))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, args.config)
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--walls', 'none'))
+        custom = self.args('--walls', 'ancient', '--wall-hp', '60', '--fresh')
+        self.make_agent(custom)
+        self.assertEqual((custom.config.wall_hp, custom.config.ranged_strength), (60, 15))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--walls', 'medieval'])
+
     def test_checkpoint_without_river_setting_resumes_without_rivers(self):
         args = self.args()
         agent = self.make_agent(args)

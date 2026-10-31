@@ -3,6 +3,7 @@
 import random
 import subprocess
 from collections import Counter
+from dataclasses import asdict
 import sys
 import unittest
 from unittest.mock import patch
@@ -224,7 +225,8 @@ class GameTests(unittest.TestCase):
                        {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)},
                        {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')},
                        {'river_count': -1}, {'river_count': 11}, {'river_count': True},
-                       {'river_count': 1.5}]:
+                       {'river_count': 1.5}, {'walls': 'medieval'}, {'walls': None},
+                       {'walls': ['ancient']}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -531,6 +533,45 @@ class GameTests(unittest.TestCase):
             env = self.make_env(width=3, height=3, unit_count=2, river_count=10)
             env.reset(seed=seed)
             self.assertIn(env.guided_action(), env.valid_actions())
+
+    def test_ancient_walls_give_outer_defense_and_a_ranged_strike(self):
+        self.assertFalse(self.make_env().city.ranged_combat)
+        env = self.make_env(walls='ancient', unit_count=1, city_heals=False)
+        self.assertEqual((env.city.wall_hp, env.city.wall_hp_max), (100, 100))
+        self.assertTrue(env.city.ranged_combat)
+        self.assertEqual(env.city.strength_ranged, 15)
+        self.assertEqual(env.city.strength, 28)
+        observation = env.get_observation()
+        self.assertEqual(observation.shape, (7 + 8 + 64,))
+        self.assertAlmostEqual(observation[3], .1)
+        self.assertAlmostEqual(observation[5], .15)
+        self.place(env, [(6, 4)])
+        with patch('game.attack', return_value=(12, 0)) as mocked:
+            env.step(self.wait(env))
+        mocked.assert_called_once_with(env.city, env.units[0], ranged=True)
+        self.assertEqual(env.units[0].hp, 88)
+        self.place(env, [(7, 4)])
+        with patch('game.attack', return_value=(12, 0)) as mocked:
+            env.step(self.wait(env))
+        mocked.assert_not_called()
+
+    def test_ancient_wall_defaults_can_be_overridden(self):
+        config = GameConfig(walls='ancient', wall_hp=60, ranged_strength=25)
+        self.assertEqual((config.wall_hp, config.ranged_strength), (60, 25))
+        ancient = GameConfig(walls='ancient')
+        self.assertEqual(GameConfig(**asdict(ancient)), ancient)
+        self.assertEqual(GameConfig(wall_hp=40).walls, 'none')
+
+    def test_battering_rams_breach_ancient_walls(self):
+        for unit_types, positions, wall_hp in ((('warrior',), [(3, 4)], 90),
+                                               (('warrior', 'battering_ram'), [(3, 4), (5, 4)], 80)):
+            with self.subTest(unit_types=unit_types):
+                env = self.make_env(unit_count=len(unit_types), unit_types=unit_types,
+                                    walls='ancient', city_heals=False)
+                self.place(env, positions)
+                with patch('game.attack', return_value=(20, 0)):
+                    env.step(env.encode_action(['E'] + ['SPACE'] * (len(unit_types) - 1)))
+                self.assertEqual((env.city.wall_hp, env.city.hp), (wall_hp, 100))
 
 
 if __name__ == '__main__':

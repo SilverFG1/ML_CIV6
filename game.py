@@ -64,6 +64,23 @@ MAX_RIVERS = 10
 
 
 @dataclass(frozen=True)
+class WallSpec:
+    """City walls: their outer defense (wall HP) and the ranged strike they give the city."""
+    hp: float = 0
+    ranged_strength: float = 0
+
+
+# Civ VI Ancient Walls give 100 outer defense and let the city shoot units
+# within two tiles. The strike matches the owner's strongest ranged unit, or 15
+# without one; the city here has no units, so it uses 15.
+WALL_SPECS = {
+    'none': WallSpec(),
+    'ancient': WallSpec(hp=100, ranged_strength=15),
+}
+WALL_TYPES = tuple(WALL_SPECS)
+
+
+@dataclass(frozen=True)
 class GameConfig:
     width: int = 8
     height: int = 8
@@ -71,6 +88,7 @@ class GameConfig:
     city_position: tuple | None = None
     city_strength: float = 28
     wall_hp: float = 0
+    walls: str = 'none'
     ranged_strength: float = 0
     city_heals: bool = True
     mountain_density: float = 0
@@ -81,6 +99,14 @@ class GameConfig:
     difficulty: str = 'normal'
 
     def __post_init__(self):
+        if not isinstance(self.walls, str) or self.walls not in WALL_SPECS:
+            raise ValueError(f'walls must be one of {", ".join(WALL_TYPES)}')
+        # Walls supply their defaults for wall HP and ranged strength left at zero.
+        spec = WALL_SPECS[self.walls]
+        if spec.hp and not self.wall_hp:
+            object.__setattr__(self, 'wall_hp', spec.hp)
+        if spec.ranged_strength and not self.ranged_strength:
+            object.__setattr__(self, 'ranged_strength', spec.ranged_strength)
         for name in ('width', 'height'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 3 <= value <= 32:

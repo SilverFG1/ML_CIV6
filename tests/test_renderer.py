@@ -69,6 +69,18 @@ class RendererTests(unittest.TestCase):
             colors.append(tuple(renderer.surface.get_at((int((x1 + x2) / 2), int((y1 + y2) / 2))))[:3])
         self.assertGreater(colors.count(RIVER_COLOR), len(colors) // 2)
 
+    def test_draws_intact_and_broken_ancient_walls(self):
+        from renderer import RUINED_WALL_COLOR, WALL_COLOR
+        env = Game(render=True, config=GameConfig(unit_count=1, walls='ancient'))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        for wall_hp, color in ((100, WALL_COLOR), (0, RUINED_WALL_COLOR)):
+            env.city.wall_hp = wall_hp
+            self.assertTrue(env.render_frame())
+            renderer = env._renderer
+            corners = [tuple(renderer.surface.get_at((int(x), int(y))))[:3] for x, y in renderer._wall_ring()]
+            self.assertGreater(corners.count(color), 3)
+
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))
         env.reset(seed=7)

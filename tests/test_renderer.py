@@ -110,6 +110,22 @@ class RendererTests(unittest.TestCase):
         self.assertFalse(renderer.show_yields)
         self.assertEqual(tuple(renderer.surface.get_at(dot))[:3], LAND_COLORS['GRASSLAND'])
 
+    def test_draws_buildings_and_lists_them_in_the_status(self):
+        from renderer import GRANARY_COLOR, MONUMENT_COLOR
+        self.env.render_frame()
+        self.assertNotIn('Monument', self.env._renderer.status_text())
+        env = Game(render=True, config=GameConfig(unit_count=1, walls='ancient', buildings=('monument', 'granary')))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        size = renderer.size
+        self.assertIn('Monument, Granary (+1 food, +2 culture, +2 housing)', renderer.status_text())
+        for name, height, color in (('monument', .1, MONUMENT_COLOR), ('granary', .05, GRANARY_COLOR)):
+            x, base = renderer.building_spot(name)
+            with self.subTest(building=name):
+                self.assertEqual(tuple(renderer.surface.get_at((int(x), int(base - size * height))))[:3], color)
+
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))
         env.reset(seed=7)

@@ -9,7 +9,7 @@ import random
 import numpy as np
 
 import constants
-from class_hex import LAND_TYPES, HexMap, hex_distance, terrain_code
+from class_hex import LAND_TYPES, YIELD_TYPES, HexMap, hex_distance, terrain_code
 from class_hex import hex_coords  # noqa: F401  Kept importable from game, where it used to live.
 
 
@@ -72,6 +72,26 @@ WALL_TYPES = tuple(WALL_SPECS)
 
 
 @dataclass(frozen=True)
+class BuildingSpec:
+    """A Civ VI city-centre building: production cost, yields and housing."""
+    civ6_type: str
+    cost: int
+    yields: tuple = ()  # (yield type, amount) pairs
+    housing: int = 0
+    technology: str | None = None
+
+
+# Base-game values from CivFanatics. Some wikis list a later cost of 50 for both.
+# Neither building affects combat, and the simulation has no economy yet.
+BUILDING_SPECS = {
+    'monument': BuildingSpec('BUILDING_MONUMENT', cost=60, yields=(('culture', 2),)),
+    'granary': BuildingSpec('BUILDING_GRANARY', cost=65, yields=(('food', 1),), housing=2,
+                            technology='TECH_POTTERY'),
+}
+BUILDING_TYPES = tuple(BUILDING_SPECS)
+
+
+@dataclass(frozen=True)
 class GameConfig:
     width: int = 8
     height: int = 8
@@ -80,6 +100,7 @@ class GameConfig:
     city_strength: float = 28
     wall_hp: float = 0
     walls: str = 'none'
+    buildings: tuple = ()
     ranged_strength: float = 0
     city_heals: bool = True
     mountain_density: float = 0
@@ -93,6 +114,13 @@ class GameConfig:
     difficulty: str = 'normal'
 
     def __post_init__(self):
+        try:
+            object.__setattr__(self, 'buildings', tuple(self.buildings))
+        except TypeError as exc:
+            raise ValueError('buildings must be a sequence of building names') from exc
+        if (any(not isinstance(name, str) or name not in BUILDING_SPECS for name in self.buildings)
+                or len(set(self.buildings)) != len(self.buildings)):
+            raise ValueError(f'buildings must name distinct buildings from {", ".join(BUILDING_TYPES)}')
         if not isinstance(self.walls, str) or self.walls not in WALL_SPECS:
             raise ValueError(f'walls must be one of {", ".join(WALL_TYPES)}')
         # Walls supply their defaults for wall HP and ranged strength left at zero.
@@ -220,13 +248,29 @@ class C_Unit(C_Sprite):
 class C_City(C_Sprite):
     def __init__(self, x, y, sprite=None, name_instance='City', hp=100,
                  hp_max=100, wall_hp=0, strength=28, strength_ranged=0,
-                 ranged_combat=False, heal=True, env=None):
+                 ranged_combat=False, heal=True, env=None, buildings=()):
         super().__init__(x, y, sprite, name_instance, hp, hp_max, strength, env)
+        if any(name not in BUILDING_SPECS for name in buildings):
+            raise ValueError(f'buildings must be among {", ".join(BUILDING_TYPES)}')
+        self.buildings = tuple(buildings)
         self.wall_hp = float(wall_hp)
         self.wall_hp_max = float(wall_hp)
         self.strength_ranged = float(strength_ranged)
         self.ranged_combat = ranged_combat
         self.heal = heal
+
+    @property
+    def building_yields(self):
+        """Yields added by the city's buildings, e.g. {'food': 1, 'culture': 2}."""
+        totals = {}
+        for name in self.buildings:
+            for kind, amount in BUILDING_SPECS[name].yields:
+                totals[kind] = totals.get(kind, 0) + amount
+        return {kind: totals[kind] for kind in YIELD_TYPES if totals.get(kind)}
+
+    @property
+    def building_housing(self):
+        return sum(BUILDING_SPECS[name].housing for name in self.buildings)
 
     def take_turn(self):
         if self.env is not None and self.alive:
@@ -356,7 +400,8 @@ class Game:
                       for i, pos in enumerate(start_positions)]
         self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
                            wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
-                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self)
+                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
+                           buildings=c.buildings)
         self.turn_number = 0
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}

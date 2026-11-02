@@ -13,7 +13,7 @@ from learning_ai import QLearningAgent
 
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
-TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types")
+TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types", "buildings")
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
                  "random_actions", "policy_actions", "q_table_size", "city_strength")
@@ -56,6 +56,8 @@ def parse_args(argv=None):
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
     parser.add_argument("--land-types", nargs="+", choices=game.LAND_TYPES,
                         help="Civ VI land types to fill the map with, in regions (default: grassland)")
+    parser.add_argument("--buildings", nargs="+", choices=game.BUILDING_TYPES,
+                        help="city buildings: monument (+2 culture), granary (+1 food, +2 housing)")
     parser.add_argument("--walls", choices=game.WALL_TYPES,
                         help="city walls; ancient gives 100 wall HP and a 15-strength ranged strike")
     parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
@@ -94,7 +96,7 @@ def config_from_args(args, saved=None):
     values.update(saved)
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp", "walls",
-                 "ranged_strength", "mountain_density", "forest_density", "land_types", "hills_density",
+                 "buildings", "ranged_strength", "mountain_density", "forest_density", "land_types", "hills_density",
                  "water_density", "river_count", "unit_strengths", "unit_types", "difficulty"):
         value = getattr(args, name)
         if value is not None:
@@ -116,6 +118,7 @@ def config_from_args(args, saved=None):
     values["unit_strengths"] = tuple(values["unit_strengths"])
     values["unit_types"] = tuple(values["unit_types"])
     values["land_types"] = tuple(values["land_types"])
+    values["buildings"] = tuple(values["buildings"])
     return game.GameConfig(**values)
 
 

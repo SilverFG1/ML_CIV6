@@ -344,6 +344,19 @@ class RunnerTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 run_game.parse_args(list(flags))
 
+    def test_buildings_resume_and_reject_changes(self):
+        args = self.args('--buildings', 'monument', 'granary')
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.buildings, ('monument', 'granary'))
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--buildings', 'monument'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--buildings', 'library'])
+
     def test_checkpoint_without_river_setting_resumes_without_rivers(self):
         args = self.args()
         agent = self.make_agent(args)

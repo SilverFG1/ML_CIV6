@@ -24,6 +24,9 @@ MOUNTAIN_COLOR, PEAK_COLOR = (99, 109, 121), (165, 175, 185)
 FOREST_COLOR = (42, 89, 56)
 YIELD_COLORS = {'food': (104, 200, 88), 'production': (214, 130, 56), 'gold': (240, 206, 72),
                 'science': (90, 160, 235), 'culture': (190, 110, 220), 'faith': (236, 236, 236)}
+MONUMENT_COLOR, GRANARY_COLOR, GRANARY_ROOF = (214, 208, 196), (206, 164, 92), (150, 104, 56)
+# Horizontal position of each building's icon on the city tile.
+BUILDING_SPOTS = {'monument': .24, 'granary': .76}
 WALL_COLOR = (196, 184, 156)
 RUINED_WALL_COLOR = (112, 102, 90)
 WALL_OUTLINE = (70, 62, 52)
@@ -74,12 +77,13 @@ class Renderer:
         font = self.small_font if small else self.font
         self.surface.blit(font.render(text, True, color), pos)
 
-    def _wrapped_text(self, text, pos):
+    def _wrapped_text(self, text, pos, separator='   '):
+        """Draw text over several lines, breaking only between separator-delimited fields."""
         lines = ['']
-        for word in text.split():
-            proposed = (lines[-1] + ' ' + word).strip()
+        for field in text.split(separator):
+            proposed = lines[-1] + separator + field if lines[-1] else field
             if lines[-1] and self.font.size(proposed)[0] > self.surface.get_width() - 2 * self.margin:
-                lines.append(word)
+                lines.append(field)
             else:
                 lines[-1] = proposed
         for index, line in enumerate(lines):
@@ -111,17 +115,14 @@ class Renderer:
                             (x + s / 3, y + 2 * s / 3), 3)
             if obj is self.env.city:
                 self._draw_walls()
+                self._draw_buildings()
             self._text(f'{obj.name_instance} {obj.hp:.0f}', (x + 2, y + self.size * .7), small=True)
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
         y = self.surface.get_height() - 109
-        city = self.env.city
-        outcome = self.env.last_info['outcome']
-        walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
-                 if self.env.config.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
-        self._text(f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
-                   f'{walls}   {outcome.upper()}', (self.margin, y))
+        status_lines = self._wrapped_text(self.status_text(), (self.margin, y))
+        y += 22 * (status_lines - 1)
         if self.env.human:
             controls = ('Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   '
                         'Y: yields   R: restart   Esc: quit')
@@ -132,6 +133,43 @@ class Renderer:
         if self.paused:
             self._text('PAUSED', (self.margin, y + 31 + 22 * control_lines), (255, 220, 100))
         p.display.flip()
+
+    def status_text(self):
+        city = self.env.city
+        walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
+                 if self.env.config.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
+        text = (f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   {walls}   '
+                f'{self.env.last_info["outcome"].upper()}')
+        if city.buildings:
+            effects = [f'+{amount} {kind}' for kind, amount in city.building_yields.items()]
+            if city.building_housing:
+                effects.append(f'+{city.building_housing} housing')
+            names = ', '.join(name.title() for name in city.buildings)
+            text += f'   {names} ({", ".join(effects)})'
+        return text
+
+    def building_spot(self, name):
+        """Centre-bottom point of a building's icon on the city tile."""
+        x, y = self._position(self.env.city.position)
+        return x + self.size * BUILDING_SPOTS[name], y + self.size * .52
+
+    def _draw_buildings(self):
+        p, s = self.pygame, self.size
+        outline = (40, 36, 32)
+        for name in self.env.city.buildings:
+            cx, base = self.building_spot(name)
+            if name == 'monument':
+                obelisk = [(cx - s * .05, base), (cx - s * .03, base - s * .2), (cx, base - s * .25),
+                           (cx + s * .03, base - s * .2), (cx + s * .05, base)]
+                p.draw.polygon(self.surface, MONUMENT_COLOR, obelisk)
+                p.draw.polygon(self.surface, outline, obelisk, 1)
+            elif name == 'granary':
+                body = p.Rect(int(cx - s * .07), int(base - s * .11), int(s * .14), int(s * .11))
+                p.draw.rect(self.surface, GRANARY_COLOR, body)
+                p.draw.rect(self.surface, outline, body, 1)
+                roof = [(cx - s * .09, base - s * .11), (cx, base - s * .2), (cx + s * .09, base - s * .11)]
+                p.draw.polygon(self.surface, GRANARY_ROOF, roof)
+                p.draw.polygon(self.surface, outline, roof, 1)
 
     def _draw_tile(self, cell):
         p, s = self.pygame, self.size

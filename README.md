@@ -73,6 +73,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--ranged-strength` | Configure the city's ranged attack strength. |
 | `--wall-hp` | Set the city's initial wall health. |
 | `--walls none\|ancient` | Give the city Civ VI Ancient Walls: 100 wall health and a ranged strike. |
+| `--buildings monument granary` | Give the city a Monument (+2 culture) and/or a Granary (+1 food, +2 housing). |
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
 | `--land-types grassland plains desert tundra snow` | Fill the map with these Civ VI land types, in regions (default: grassland). |
 | `--hills-density`, `--water-density` | Turn this share of land into hills, or of all tiles into water. |
@@ -95,6 +96,23 @@ Spearmen, heavy chariots, slingers, and battering rams use their Civ VI base str
 
 Walls absorb damage before the city does. Melee attacks deal half damage to walls; once the walls break, the rest of the attack hits the city at full strength. A living battering ram next to the city restores full wall damage for warriors and spearmen, but not for heavy chariots or for ranged units attacking in melee. Ranged attacks always deal full damage to walls. Battering rams cannot attack or capture the city, have no combat strength when the city shoots them, and a squad whose only survivors are rams has lost. Mountains block movement. Forests provide a defense bonus and add a movement-cost penalty. Terrain generation places units in the city's reachable component.
 
+Ancient Walls (`--walls ancient`) follow Civ VI. They give the city 100 wall health ("outer defense") and a ranged strike that hits one unit within two tiles each turn. In Civ VI that strike matches the defender's strongest ranged unit, or 15 without one; this city has no units, so it uses 15. `--wall-hp` and `--ranged-strength` override these values. Ancient Walls add no combat strength to the city, and battering rams work against them. They make a siege much harder: over 200 heuristic games at normal difficulty, three warriors never win, while two spearmen, an archer, and a ram win 133. The renderer draws intact walls as a stone ring around the city and broken walls as ruined towers.
+
+Rivers run along the edges between tiles, not across tiles. Each river starts at a random edge and winds across the map until it leaves the map or joins another river. Rivers never block movement. As in Civ VI, a city attacked in melee from across a river gets +5 combat strength for that attack ("river defense"). The attacker deals less damage and takes more in return. Ranged attacks are unaffected. In Civ VI, crossing a river uses all of a unit's remaining movement. Every unit here already moves one hex per turn, so a crossing instead costs two movement points, like entering a forest. That cost feeds the movement penalty and the heuristic's path costs. The heuristic also prefers to attack from a tile that is on the city's side of the river.
+
+The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. With any of `--land-types`, `--hills-density`, or `--water-density`, each tile instead reports three combat properties: impassable, extra movement cost, and defense bonus, and the observation schema includes `:terrain`. With rivers enabled, it also has three river flags per tile, for the tile's east, southeast, and southwest edges, and the observation schema ends in `:rivers`. Scenarios without these options keep the earlier observation format, so existing models still load. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
+
+### City buildings
+
+`--buildings` gives the city Civ VI city-centre buildings, with their base-game values:
+
+| Building | Effect | Production cost | Requires |
+| --- | --- | --- | --- |
+| Monument | +2 culture | 60 | — |
+| Granary | +1 food, +2 housing | 65 | Pottery |
+
+Some wikis list a later cost of 50 for both; the simulator records cost but has no production yet. The city exposes the totals as `city.building_yields` (e.g. `{'food': 1, 'culture': 2}`) and `city.building_housing`. The renderer draws an obelisk (Monument) and a small barn (Granary) on the city tile and lists the buildings and their effects in the status line. As in Civ VI, neither building affects combat, and the simulation has no economy yet, so they do not change rewards or the observation; a run with them plays out exactly like one without.
+
 ### Terrain and yields
 
 The map uses Civ VI's base-game terrain rules, taken from the same catalog as the [real-game bridge](docs/REAL_CIV6.md) (`civ6_bridge/data/terrain_types.json`). There are five land types, each flat, hills, or mountain, plus coast and ocean. Forest is a separate feature on top of the terrain, as in Civ VI.
@@ -116,11 +134,7 @@ The map uses Civ VI's base-game terrain rules, taken from the same catalog as th
 
 By default every map is grassland, forest, and mountains, exactly as before. `--land-types` splits the map into regions around randomly placed centres. `--hills-density` raises that share of flat land into hills; the city's tile stays flat. `--water-density` turns that share of tiles into water, which counts against the same 0.8 limit as mountains and forests. Water next to land becomes coast and water further out becomes ocean. Rivers never run alongside water.
 
-Ancient Walls (`--walls ancient`) follow Civ VI. They give the city 100 wall health ("outer defense") and a ranged strike that hits one unit within two tiles each turn. In Civ VI that strike matches the defender's strongest ranged unit, or 15 without one; this city has no units, so it uses 15. `--wall-hp` and `--ranged-strength` override these values. Ancient Walls add no combat strength to the city, and battering rams work against them. They make a siege much harder: over 200 heuristic games at normal difficulty, three warriors never win, while two spearmen, an archer, and a ram win 133. The renderer draws intact walls as a stone ring around the city and broken walls as ruined towers.
-
-Rivers run along the edges between tiles, not across tiles. Each river starts at a random edge and winds across the map until it leaves the map or joins another river. Rivers never block movement. As in Civ VI, a city attacked in melee from across a river gets +5 combat strength for that attack ("river defense"). The attacker deals less damage and takes more in return. Ranged attacks are unaffected. In Civ VI, crossing a river uses all of a unit's remaining movement. Every unit here already moves one hex per turn, so a crossing instead costs two movement points, like entering a forest. That cost feeds the movement penalty and the heuristic's path costs. The heuristic also prefers to attack from a tile that is on the city's side of the river.
-
-The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. With any of `--land-types`, `--hills-density`, or `--water-density`, each tile instead reports three combat properties: impassable, extra movement cost, and defense bonus, and the observation schema includes `:terrain`. With rivers enabled, it also has three river flags per tile, for the tile's east, southeast, and southwest edges, and the observation schema ends in `:rivers`. Scenarios without these options keep the earlier observation format, so existing models still load. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
+### Example scenarios
 
 For a mixed squad:
 

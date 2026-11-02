@@ -12,7 +12,7 @@ import numpy as np
 
 import constants
 from class_hex import HexMap, _edge_corners
-from game import C_Unit, Game, GameConfig, attack, hex_distance
+from game import BUILDING_SPECS, C_City, C_Unit, Game, GameConfig, attack, hex_distance
 
 
 class GameTests(unittest.TestCase):
@@ -228,7 +228,8 @@ class GameTests(unittest.TestCase):
                        {'river_count': 1.5}, {'walls': 'medieval'}, {'walls': None},
                        {'walls': ['ancient']}, {'land_types': ('lava',)},
                        {'land_types': ('plains', 'plains')}, {'land_types': 5}, {'hills_density': 1.5},
-                       {'water_density': -.1}, {'mountain_density': .3, 'water_density': .3, 'forest_density': .3}]:
+                       {'water_density': -.1}, {'mountain_density': .3, 'water_density': .3, 'forest_density': .3},
+                       {'buildings': ('library',)}, {'buildings': ('monument', 'monument')}, {'buildings': 5}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -648,6 +649,32 @@ class GameTests(unittest.TestCase):
         self.place(env, [(0, 0)])
         env.map.grid[(1, 0)].set_terrain('COAST')
         self.assertNotIn(env.encode_action(['E']), env.valid_actions())
+
+    def test_monument_and_granary_add_yields_and_housing(self):
+        self.assertEqual((BUILDING_SPECS['monument'].cost, BUILDING_SPECS['granary'].cost), (60, 65))
+        self.assertEqual(BUILDING_SPECS['granary'].technology, 'TECH_POTTERY')
+        for buildings, yields, housing in [((), {}, 0), (('monument',), {'culture': 2}, 0),
+                                           (('granary',), {'food': 1}, 2),
+                                           (('granary', 'monument'), {'food': 1, 'culture': 2}, 2)]:
+            with self.subTest(buildings=buildings):
+                env = self.make_env(buildings=buildings)
+                self.assertEqual(env.city.buildings, buildings)
+                self.assertEqual((env.city.building_yields, env.city.building_housing), (yields, housing))
+        with self.assertRaises(ValueError):
+            C_City(0, 0, buildings=('library',))
+
+    def test_buildings_do_not_change_play(self):
+        def trace(buildings):
+            env = self.make_env(forest_density=.2, wall_hp=30, ranged_strength=15, buildings=buildings)
+            rng = random.Random(5)
+            steps = [(env.observation_schema, env.get_observation().tolist())]
+            for _ in range(30):
+                observation, reward, done = env.step(env.guided_action(rng))
+                steps.append((observation.tolist(), reward, done, env.events))
+                if done:
+                    break
+            return steps
+        self.assertEqual(trace(('monument', 'granary')), trace(()))
 
 
 if __name__ == '__main__':

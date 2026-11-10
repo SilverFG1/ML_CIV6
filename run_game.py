@@ -13,7 +13,7 @@ from learning_ai import QLearningAgent
 
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
-TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types", "buildings")
+TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types", "buildings", "build_queue")
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
                  "random_actions", "policy_actions", "q_table_size", "city_strength")
@@ -58,6 +58,13 @@ def parse_args(argv=None):
                         help="Civ VI land types to fill the map with, in regions (default: grassland)")
     parser.add_argument("--buildings", nargs="+", choices=game.BUILDING_TYPES,
                         help="city buildings: monument (+2 culture), granary (+1 food, +2 housing)")
+    parser.add_argument("--economy", action="store_true",
+                        help="run the city's economy: growth, production of --build-queue, and border growth")
+    parser.add_argument("--city-population", type=int, choices=range(1, game.MAX_CITY_POPULATION + 1), metavar="N",
+                        help=f"starting city population with --economy (1-{game.MAX_CITY_POPULATION}, default: 1)")
+    parser.add_argument("--build-queue", nargs="+", choices=game.BUILD_ITEMS,
+                        help="what the city builds, in order, with --economy (default: "
+                             + " ".join(game.DEFAULT_BUILD_QUEUE) + ")")
     parser.add_argument("--walls", choices=game.WALL_TYPES,
                         help="city walls; ancient gives 100 wall HP and a 15-strength ranged strike")
     parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
@@ -97,12 +104,15 @@ def config_from_args(args, saved=None):
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp", "walls",
                  "buildings", "ranged_strength", "mountain_density", "forest_density", "land_types", "hills_density",
-                 "water_density", "river_count", "unit_strengths", "unit_types", "difficulty"):
+                 "water_density", "river_count", "unit_strengths", "unit_types", "difficulty",
+                 "city_population", "build_queue"):
         value = getattr(args, name)
         if value is not None:
             explicit[name] = tuple(value) if name in TUPLE_SETTINGS else value
     if args.no_city_healing:
         explicit["city_heals"] = False
+    if args.economy:
+        explicit["economy"] = True
     if args.difficulty is not None and args.city_strength is None:
         explicit["city_strength"] = DIFFICULTY_STRENGTHS[args.difficulty]
     elif not saved and args.city_strength is None:
@@ -119,6 +129,7 @@ def config_from_args(args, saved=None):
     values["unit_types"] = tuple(values["unit_types"])
     values["land_types"] = tuple(values["land_types"])
     values["buildings"] = tuple(values["buildings"])
+    values["build_queue"] = tuple(values["build_queue"])
     return game.GameConfig(**values)
 
 

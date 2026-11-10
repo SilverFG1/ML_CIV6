@@ -9,6 +9,7 @@ import random
 import numpy as np
 
 import constants
+from economy import CityEconomy
 from class_hex import LAND_TYPES, YIELD_TYPES, HexMap, hex_distance, terrain_code
 from class_hex import hex_coords  # noqa: F401  Kept importable from game, where it used to live.
 
@@ -59,14 +60,15 @@ class WallSpec:
     """City walls: their outer defense (wall HP) and the ranged strike they give the city."""
     hp: float = 0
     ranged_strength: float = 0
+    cost: int = 0
 
 
 # Civ VI Ancient Walls give 100 outer defense and let the city shoot units
 # within two tiles. The strike matches the owner's strongest ranged unit, or 15
-# without one; the city here has no units, so it uses 15.
+# without one; the city here has no units, so it uses 15. They cost 80 production.
 WALL_SPECS = {
     'none': WallSpec(),
-    'ancient': WallSpec(hp=100, ranged_strength=15),
+    'ancient': WallSpec(hp=100, ranged_strength=15, cost=80),
 }
 WALL_TYPES = tuple(WALL_SPECS)
 
@@ -82,13 +84,21 @@ class BuildingSpec:
 
 
 # Base-game values from CivFanatics. Some wikis list a later cost of 50 for both.
-# Neither building affects combat, and the simulation has no economy yet.
+# Neither building affects combat; with the city economy on, their yields and
+# housing feed the city's growth, production and borders.
 BUILDING_SPECS = {
     'monument': BuildingSpec('BUILDING_MONUMENT', cost=60, yields=(('culture', 2),)),
     'granary': BuildingSpec('BUILDING_GRANARY', cost=65, yields=(('food', 1),), housing=2,
                             technology='TECH_POTTERY'),
 }
 BUILDING_TYPES = tuple(BUILDING_SPECS)
+
+# What the city can build with the economy on, and its default order.
+BUILD_ITEMS = BUILDING_TYPES + ('ancient_walls',)
+BUILD_COSTS = {**{name: spec.cost for name, spec in BUILDING_SPECS.items()},
+               'ancient_walls': WALL_SPECS['ancient'].cost}
+DEFAULT_BUILD_QUEUE = ('monument', 'granary', 'ancient_walls')
+MAX_CITY_POPULATION = 20
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,9 @@ class GameConfig:
     unit_strengths: tuple = ()
     unit_types: tuple = ()
     difficulty: str = 'normal'
+    economy: bool = False
+    city_population: int = 1
+    build_queue: tuple = ()
 
     def __post_init__(self):
         try:
@@ -168,6 +181,20 @@ class GameConfig:
             raise ValueError('unit_types must include at least one unit that can attack')
         if self.difficulty not in ('easy', 'normal', 'hard', 'curriculum'):
             raise ValueError('Unknown difficulty')
+        if not isinstance(self.economy, bool):
+            raise ValueError('economy must be true or false')
+        if (isinstance(self.city_population, bool) or not isinstance(self.city_population, int)
+                or not 1 <= self.city_population <= MAX_CITY_POPULATION):
+            raise ValueError(f'city_population must be an integer between 1 and {MAX_CITY_POPULATION}')
+        try:
+            object.__setattr__(self, 'build_queue', tuple(self.build_queue))
+        except TypeError as exc:
+            raise ValueError('build_queue must be a sequence of build items') from exc
+        if (any(not isinstance(name, str) or name not in BUILD_ITEMS for name in self.build_queue)
+                or len(set(self.build_queue)) != len(self.build_queue)):
+            raise ValueError(f'build_queue must name distinct items from {", ".join(BUILD_ITEMS)}')
+        if not self.economy and (self.city_population != 1 or self.build_queue):
+            raise ValueError('city_population and build_queue need the city economy')
         if self.city_position is not None:
             if len(self.city_position) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
                                                  for v in self.city_position):
@@ -248,11 +275,12 @@ class C_Unit(C_Sprite):
 class C_City(C_Sprite):
     def __init__(self, x, y, sprite=None, name_instance='City', hp=100,
                  hp_max=100, wall_hp=0, strength=28, strength_ranged=0,
-                 ranged_combat=False, heal=True, env=None, buildings=()):
+                 ranged_combat=False, heal=True, env=None, buildings=(), walls='none'):
         super().__init__(x, y, sprite, name_instance, hp, hp_max, strength, env)
         if any(name not in BUILDING_SPECS for name in buildings):
             raise ValueError(f'buildings must be among {", ".join(BUILDING_TYPES)}')
         self.buildings = tuple(buildings)
+        self.walls = walls
         self.wall_hp = float(wall_hp)
         self.wall_hp_max = float(wall_hp)
         self.strength_ranged = float(strength_ranged)
@@ -345,11 +373,13 @@ class Game:
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
                                    + (':terrain' if self.config.extended_terrain else '')
-                                   + (':rivers' if self.config.river_count else ''))
+                                   + (':rivers' if self.config.river_count else '')
+                                   + (':economy' if self.config.economy else ''))
         self._renderer = None
         self.quit = False
         self.units = []
         self.city = None
+        self.economy = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
         self.turn_number = 0
@@ -401,7 +431,9 @@ class Game:
         self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
                            wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
                            ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
-                           buildings=c.buildings)
+                           buildings=c.buildings, walls=c.walls)
+        self.economy = (CityEconomy(self, c.city_population, c.build_queue or DEFAULT_BUILD_QUEUE, BUILD_COSTS)
+                        if c.economy else None)
         self.turn_number = 0
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -531,6 +563,26 @@ class Game:
                     self.city.hp += healed
                     self.city.status = 'healed'
                     self.city._event('city_healed', amount=healed)
+        if self.economy is not None:
+            self.economy.turn()
+
+    def is_built(self, item):
+        """Whether the city already has a build item; any walls count as walls."""
+        if item == 'ancient_walls':
+            return self.city.wall_hp_max > 0
+        return item in self.city.buildings
+
+    def complete_build(self, item):
+        """Add a finished building to the city; walls arrive at full health with their ranged strike."""
+        city = self.city
+        if item == 'ancient_walls':
+            spec = WALL_SPECS['ancient']
+            city.walls = 'ancient'
+            city.wall_hp = city.wall_hp_max = float(spec.hp)
+            if not city.ranged_combat:
+                city.strength_ranged, city.ranged_combat = float(spec.ranged_strength), True
+        else:
+            city.buildings += (item,)
 
     def shoot(self, unit):
         if not unit.alive or not self.city.alive:
@@ -628,6 +680,8 @@ class Game:
         if c.river_count:
             values.extend(float(flag) for y in range(c.height) for x in range(c.width)
                           for flag in self.map.river_flags((x, y)))
+        if self.economy is not None:
+            values.extend(self.economy.observation(BUILD_ITEMS))
         return np.asarray(values, dtype=float)
 
     def _distances(self):

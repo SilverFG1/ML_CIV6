@@ -74,6 +74,8 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--wall-hp` | Set the city's initial wall health. |
 | `--walls none\|ancient` | Give the city Civ VI Ancient Walls: 100 wall health and a ranged strike. |
 | `--buildings monument granary` | Give the city a Monument (+2 culture) and/or a Granary (+1 food, +2 housing). |
+| `--economy` | Run the city's economy: it grows, builds, and claims tiles while you besiege it. |
+| `--city-population N`, `--build-queue ...` | With `--economy`, set the starting population (1–20, default 1) and what the city builds, in order (default: `monument granary ancient_walls`). |
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
 | `--land-types grassland plains desert tundra snow` | Fill the map with these Civ VI land types, in regions (default: grassland). |
 | `--hills-density`, `--water-density` | Turn this share of land into hills, or of all tiles into water. |
@@ -100,7 +102,7 @@ Ancient Walls (`--walls ancient`) follow Civ VI. They give the city 100 wall hea
 
 Rivers run along the edges between tiles, not across tiles. Each river starts at a random edge and winds across the map until it leaves the map or joins another river. Rivers never block movement. As in Civ VI, a city attacked in melee from across a river gets +5 combat strength for that attack ("river defense"). The attacker deals less damage and takes more in return. Ranged attacks are unaffected. In Civ VI, crossing a river uses all of a unit's remaining movement. Every unit here already moves one hex per turn, so a crossing instead costs two movement points, like entering a forest. That cost feeds the movement penalty and the heuristic's path costs. The heuristic also prefers to attack from a tile that is on the city's side of the river.
 
-The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. With any of `--land-types`, `--hills-density`, or `--water-density`, each tile instead reports three combat properties: impassable, extra movement cost, and defense bonus, and the observation schema includes `:terrain`. With rivers enabled, it also has three river flags per tile, for the tile's east, southeast, and southwest edges, and the observation schema ends in `:rivers`. Scenarios without these options keep the earlier observation format, so existing models still load. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
+The observation includes normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. With any of `--land-types`, `--hills-density`, or `--water-density`, each tile instead reports three combat properties: impassable, extra movement cost, and defense bonus, and the observation schema includes `:terrain`. With rivers enabled, it also has three river flags per tile, for the tile's east, southeast, and southwest edges, and the observation schema ends in `:rivers`. `--economy` adds city features and `:economy` (see [City economy](#city-economy)). Scenarios without these options keep the earlier observation format, so existing models still load. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions still grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. Larger scenarios therefore make this tabular learner substantially more expensive. Start small and use the reported baselines to judge whether training improves the learned policy.
 
 ### City buildings
 
@@ -111,7 +113,24 @@ The observation includes normalized absolute city/unit coordinates, row parity, 
 | Monument | +2 culture | 60 | — |
 | Granary | +1 food, +2 housing | 65 | Pottery |
 
-Some wikis list a later cost of 50 for both; the simulator records cost but has no production yet. The city exposes the totals as `city.building_yields` (e.g. `{'food': 1, 'culture': 2}`) and `city.building_housing`. The renderer draws an obelisk (Monument) and a small barn (Granary) on the city tile and lists the buildings and their effects in the status line. As in Civ VI, neither building affects combat, and the simulation has no economy yet, so they do not change rewards or the observation; a run with them plays out exactly like one without.
+Some wikis list a later cost of 50 for both; the simulator records cost but has no production yet. The city exposes the totals as `city.building_yields` (e.g. `{'food': 1, 'culture': 2}`) and `city.building_housing`. The renderer draws an obelisk (Monument) and a small barn (Granary) on the city tile and lists the buildings and their effects in the status line. As in Civ VI, neither building affects combat. Without `--economy` they change nothing else either; with it, their yields and housing feed the city's growth and borders.
+
+### City economy
+
+`--economy` runs a Civ VI-style economy for the city you are besieging, at the end of each of its turns:
+
+- **Yields.** The city collects yields from its centre tile (always at least 2 food and 1 production), one worked tile per citizen, and its buildings.
+- **Citizens** work the owned tiles with the most food and production, preferring food on ties. They swap production for food when the city would otherwise starve. They cannot work mountains, the centre, or **a tile one of your units stands on**, so a siege can starve the city or slow its building.
+- **Food.** Each citizen eats 2 food. Surplus fills the food store, and the city grows when it holds 15, 24, 33, 44, … food (15 + 8(n−1) + (n−1)^1.5). If the store would go negative, the city loses a citizen.
+- **Housing** is 2, or 3 next to water, or 5 next to a river; a Granary adds 2. Growth halves one citizen below housing, drops to a quarter at or above it, and stops five above it.
+- **Production** builds the `--build-queue` in order: Monument (60), Granary (65), Ancient Walls (80). Overflow carries over, and items the city already has are skipped. Finished walls arrive at full health and switch on the city's ranged strike.
+- **Culture** (2 per turn from a Monument) claims a new tile every 10, then 10 + (6t)^1.3 culture, where t is the number of tiles claimed so far. Each claim takes the best unowned tile next to the territory, up to 3 tiles from the centre. A new city owns its centre and the six tiles around it.
+
+The economy sets a clock on the siege. Left alone on the default grassland map, a size-1 city building walls first finishes them in a median 40 turns. Standing on three of its tiles doubled that to a median 80 in testing, because grassland has no production and the forests that do are easy to block. On plains with hills it needs about 27 turns. The rule-based baseline usually takes the city within about 6 turns, before anything is built, so the clock mostly pressures slower policies such as the learner. Rewards are unchanged. The observation gains the city's population, progress towards growth, production and the next tile, its housing, and which item it is building; the schema ends in `:economy`.
+
+The renderer outlines the city's territory in red, marks worked tiles with a white citizen token, and adds an economy line to the status panel, for example `Pop 3   Housing 5   Food 21/33 (+2)   Granary 0/65 (+2)   Culture 0/10 (+2)`.
+
+Simplifications: there are no districts, specialists, gold or loyalty; the city cannot buy tiles or repair walls; a city's own culture comes only from its buildings; and the city never builds units. The 2-food-1-production centre minimum and the rule that enemy units block worked tiles come from Civ VI play rather than a source found while writing this.
 
 ### Terrain and yields
 
@@ -130,7 +149,7 @@ The map uses Civ VI's base-game terrain rules, taken from the same catalog as th
 - **Hills** cost two movement points and give units +3 defense.
 - **Forest** adds 1 production, one movement point, and +3 defense. It grows on grassland, plains, and tundra, flat or hills, but not desert or snow. A forest on hills costs three movement points and gives +6 defense.
 - **Mountains** are impassable. **Water** is impassable too, because units cannot embark.
-- **Yields** are attached to every tile (`cell.yields`, e.g. `{'food': 2, 'production': 1}`) and shown as dots near the top of each tile: green food, orange production, yellow gold. Press **Y** to hide or show them. The simulation has no economy yet, so yields do not change combat, rewards, or the observation.
+- **Yields** are attached to every tile (`cell.yields`, e.g. `{'food': 2, 'production': 1}`) and shown as dots near the top of each tile: green food, orange production, yellow gold. Press **Y** to hide or show them. Yields matter only with `--economy`, where the city collects them; they never change combat or rewards.
 
 By default every map is grassland, forest, and mountains, exactly as before. `--land-types` splits the map into regions around randomly placed centres. `--hills-density` raises that share of flat land into hills; the city's tile stays flat. `--water-density` turns that share of tiles into water, which counts against the same 0.8 limit as mountains and forests. Water next to land becomes coast and water further out becomes ocean. Rivers never run alongside water.
 
@@ -152,6 +171,12 @@ For a siege across rivers:
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 2 --river-count 2 --forest-density 0.1 --model-path runs/rivers/model.json --metrics-dir runs/rivers --fresh
+```
+
+For a city that grows and builds while you besiege it:
+
+```powershell
+python run_game.py --episodes 200 --unit-count 3 --economy --city-population 2 --build-queue ancient_walls monument --land-types plains grassland --hills-density 0.2 --model-path runs/economy/model.json --metrics-dir runs/economy --fresh
 ```
 
 For a city with Ancient Walls:

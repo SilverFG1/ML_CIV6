@@ -126,6 +126,29 @@ class RendererTests(unittest.TestCase):
             with self.subTest(building=name):
                 self.assertEqual(tuple(renderer.surface.get_at((int(x), int(base - size * height))))[:3], color)
 
+    def test_draws_territory_worked_tiles_and_economy_panel(self):
+        from renderer import CITIZEN_COLOR, TERRITORY_COLOR
+        env = Game(render=True, config=GameConfig(unit_count=1, economy=True, city_population=2))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.units[0].x, env.units[0].y = 0, 0
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        worked = env.economy.worked_tiles()
+        self.assertEqual(len(worked), 2)
+        for position in worked:
+            center = renderer.citizen_marker(position)
+            self.assertEqual(tuple(renderer.surface.get_at((int(center[0]), int(center[1]))))[:3], CITIZEN_COLOR)
+        # The ring's outer edge is outlined; the edge shared with the centre is not.
+        x, y = env.city.position
+        polygon = renderer._polygon((x + 1, y))  # East neighbour: its east side faces outside.
+        cx = sum(px for px, _ in polygon) / 6
+        cy = sum(py for _, py in polygon) / 6
+        (x1, y1), (x2, y2) = ((cx + (px - cx) * .9, cy + (py - cy) * .9) for px, py in (polygon[1], polygon[2]))
+        self.assertEqual(tuple(renderer.surface.get_at((int((x1 + x2) / 2), int((y1 + y2) / 2))))[:3], TERRITORY_COLOR)
+        self.assertGreater(renderer.panel_height, 118)
+        self.assertIn('Pop 2', env.economy.status_text())
+
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))
         env.reset(seed=7)

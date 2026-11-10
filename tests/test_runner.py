@@ -357,6 +357,25 @@ class RunnerTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             run_game.parse_args(['--buildings', 'library'])
 
+    def test_economy_resumes_and_rejects_changes(self):
+        args = self.args('--economy', '--city-population', '2', '--build-queue', 'ancient_walls', 'monument')
+        agent = self.make_agent(args)
+        self.assertTrue(agent.observation_schema.endswith(':economy'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, args.config)
+        self.assertEqual(resume_args.config.build_queue, ('ancient_walls', 'monument'))
+        for flags in [('--city-population', '3'), ('--build-queue', 'monument')]:
+            with self.assertRaisesRegex(ValueError, 'fresh'):
+                self.make_agent(self.args(*flags))
+        with self.assertRaisesRegex(ValueError, 'need the city economy'):
+            self.make_agent(self.args('--city-population', '2', '--fresh'))
+        for flags in [('--build-queue', 'palace'), ('--city-population', '0')]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run_game.parse_args(list(flags))
+
     def test_checkpoint_without_river_setting_resumes_without_rivers(self):
         args = self.args()
         agent = self.make_agent(args)

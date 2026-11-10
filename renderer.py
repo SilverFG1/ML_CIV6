@@ -24,6 +24,7 @@ MOUNTAIN_COLOR, PEAK_COLOR = (99, 109, 121), (165, 175, 185)
 FOREST_COLOR = (42, 89, 56)
 YIELD_COLORS = {'food': (104, 200, 88), 'production': (214, 130, 56), 'gold': (240, 206, 72),
                 'science': (90, 160, 235), 'culture': (190, 110, 220), 'faith': (236, 236, 236)}
+TERRITORY_COLOR, CITIZEN_COLOR = (232, 72, 72), (250, 250, 250)
 MONUMENT_COLOR, GRANARY_COLOR, GRANARY_ROOF = (214, 208, 196), (206, 164, 92), (150, 104, 56)
 # Horizontal position of each building's icon on the city tile.
 BUILDING_SPOTS = {'monument': .24, 'granary': .76}
@@ -46,7 +47,9 @@ class Renderer:
                                int(720 / (env.config.height * .75 + .25))))
         self.margin = 24
         width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
-        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + 118
+        # Text panel under the map; the economy adds a line or two.
+        self.panel_height = 118 + (44 if env.config.economy else 0)
+        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + self.panel_height
         self.surface = pygame.display.set_mode((width, height))
         pygame.display.set_caption('ML_CIV6 — training and evaluation')
         self.font = pygame.font.SysFont('Segoe UI', 16)
@@ -96,9 +99,16 @@ class Renderer:
         for cell in self.env.map.grid.values():
             self._draw_tile(cell)
         self._draw_rivers()
+        if self.env.economy is not None:
+            self._draw_territory()
         if self.show_yields:
             for cell in self.env.map.grid.values():
                 self._draw_yields(cell)
+        if self.env.economy is not None:
+            for position in self.env.economy.worked_tiles():
+                center = self.citizen_marker(position)
+                p.draw.circle(self.surface, CITIZEN_COLOR, center, max(3, self.size // 14))
+                p.draw.circle(self.surface, TERRITORY_COLOR, center, max(3, self.size // 14), 2)
         for obj in self.env.objects:
             x, y = self._position(obj.position)
             if obj.alive:
@@ -120,24 +130,25 @@ class Renderer:
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
-        y = self.surface.get_height() - 109
-        status_lines = self._wrapped_text(self.status_text(), (self.margin, y))
-        y += 22 * (status_lines - 1)
+        y = self.surface.get_height() - self.panel_height + 9
+        y += 22 * self._wrapped_text(self.status_text(), (self.margin, y))
+        if self.env.economy is not None:
+            y += 22 * self._wrapped_text(self.env.economy.status_text(), (self.margin, y))
         if self.env.human:
             controls = ('Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   '
                         'Y: yields   R: restart   Esc: quit')
         else:
             controls = (f'Space: pause   Right: one turn   +/-: speed   Y: yields   Esc: quit   '
                         f'Delay {self.delay_ms or 0}ms')
-        control_lines = self._wrapped_text(controls, (self.margin, y + 27))
+        control_lines = self._wrapped_text(controls, (self.margin, y + 5))
         if self.paused:
-            self._text('PAUSED', (self.margin, y + 31 + 22 * control_lines), (255, 220, 100))
+            self._text('PAUSED', (self.margin, y + 9 + 22 * control_lines), (255, 220, 100))
         p.display.flip()
 
     def status_text(self):
         city = self.env.city
         walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
-                 if self.env.config.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
+                 if city.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
         text = (f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   {walls}   '
                 f'{self.env.last_info["outcome"].upper()}')
         if city.buildings:
@@ -147,6 +158,26 @@ class Renderer:
             names = ', '.join(name.title() for name in city.buildings)
             text += f'   {names} ({", ".join(effects)})'
         return text
+
+    def citizen_marker(self, position):
+        """Where a worked tile shows its citizen marker."""
+        x, y = self._position(position)
+        return x + self.size / 2, y + self.size * .84
+
+    def _draw_territory(self):
+        """Outline the city's territory just inside its edge tiles."""
+        territory = self.env.economy.territory
+        width = max(2, self.size // 22)
+        for position in territory:
+            polygon = self._polygon(position)
+            cx = sum(x for x, _ in polygon) / 6
+            cy = sum(y for _, y in polygon) / 6
+            inset = [(cx + (x - cx) * .9, cy + (y - cy) * .9) for x, y in polygon]
+            x, y = position
+            for direction, (first, second) in SIDE_CORNERS.items():
+                dx, dy = constants.movement_delta(direction, y)
+                if (x + dx, y + dy) not in territory:
+                    self.pygame.draw.line(self.surface, TERRITORY_COLOR, inset[first], inset[second], width)
 
     def building_spot(self, name):
         """Centre-bottom point of a building's icon on the city tile."""

@@ -632,5 +632,146 @@ class GameTests(unittest.TestCase):
         self.assertAlmostEqual(reward, 3.95)
 
 
+    # Ancient-era districts and buildings.
+    def test_builds_are_off_by_default(self):
+        env = self.make_env(city_population=2)
+        self.assertEqual((env.districts, env.buildings), ({}, []))
+        self.assertNotIn('built', env.observation_schema)
+        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 3)
+        report = env.city_report()
+        self.assertEqual((report['culture'], report['science'], report['faith']), (0, 0, 0))
+        self.assertNotIn('producing', report)
+
+    def test_build_config_validation(self):
+        for kwargs, message in [
+                ({'city_districts': ('campus',)}, 'population'),
+                ({'city_population': 1, 'city_buildings': ('library',)}, 'campus'),
+                ({'city_population': 1, 'city_build_queue': ('shrine', 'holy_site')}, 'holy_site'),
+                ({'city_population': 3, 'city_districts': ('campus', 'holy_site')}, 'at most 1 district'),
+                ({'city_population': 1, 'city_buildings': ('monument',), 'city_build_queue': ('monument',)}, 'once'),
+                ({'city_population': 1, 'city_buildings': ('water_mill',)}, 'monument'),
+                ({'city_population': 1, 'city_buildings': ['monument']}, 'monument')]:
+            with self.subTest(**kwargs), self.assertRaisesRegex(ValueError, message):
+                GameConfig(**kwargs)
+        config = GameConfig(city_population=4, city_districts=('campus', 'encampment'), city_buildings=('library',),
+                            city_build_queue=('barracks', 'holy_site', 'shrine'))
+        self.assertEqual(config.builds[-1], 'shrine')
+
+    def test_district_adjacency_and_yields(self):
+        env = self.make_env(city_population=4, city_build_queue=('campus', 'holy_site', 'library', 'shrine'))
+        self.place_far(env)
+        for pos in [(5, 2), (4, 2)]:
+            env.map.grid[pos].set_terrain('MOUNTAIN')
+        for pos in [(2, 3), (3, 2)]:
+            env.map.grid[pos].set_terrain('FOREST')
+        self.assertTrue(env.complete_build('campus'))
+        self.assertEqual(env.districts['campus'], (4, 3))  # between two mountains
+        self.assertNotIn((4, 3), env.territory())
+        self.assertTrue(env.complete_build('holy_site'))
+        self.assertEqual(env.districts['holy_site'], (3, 3))
+        output = env.city_output()
+        # Campus: 2 mountains + 1 for its two district neighbors (city center, holy site).
+        # Holy site: 1 mountain + 1 for two woods + 1 for two districts.
+        self.assertEqual((output['science'], output['faith']), (3, 3))
+        env.complete_build('library')
+        env.complete_build('shrine')
+        self.assertEqual(env.city_report()['science'], 5)
+        self.assertEqual(env.city_report()['faith'], 5)
+        self.assertEqual([e['item'] for e in env.events if e['type'] == 'city_built'],
+                         ['campus', 'holy_site', 'library', 'shrine'])
+
+    def test_district_avoids_occupied_tiles_and_replaces_farms(self):
+        env = self.make_env(city_population=1, city_build_queue=('campus',))
+        self.place(env, [(3, 3), (0, 0), (2, 0)])
+        env.farms.add((4, 3))
+        env.complete_build('campus')
+        self.assertNotEqual(env.districts['campus'], (3, 3))
+        site = env.districts['campus']
+        self.assertEqual(env.map.grid[site].district, 'campus')
+        env.farms.add(site)
+        self.assertNotIn(site, env.farm_sites())
+
+    def test_buildings_add_food_production_and_culture(self):
+        env = self.make_env(city_population=1, city_buildings=('monument', 'granary'))
+        self.place_far(env)
+        self.assertEqual(env.city_yields(), (5, 1))  # 2 center + 2 grassland + 1 granary
+        self.assertEqual(env.city_output()['culture'], 2)
+        self.assertEqual(env.food_surplus(), 3)
+        self.assertEqual(env.city.wall_hp, 0)
+        self.assertFalse(env.city.ranged_combat)
+
+    def test_queue_finishes_walls_carries_overflow_and_city_strikes(self):
+        env = self.make_env(city_population=1, city_build_queue=('ancient_walls', 'monument'))
+        self.place_far(env)
+        for pos in env.territory():
+            env.map.grid[pos].set_terrain('FOREST')
+        self.assertEqual(env.city_yields()[1], 2)
+        env.build_progress['ancient_walls'] = 79
+        _, reward, _ = env.step(self.wait(env))
+        self.assertAlmostEqual(reward, -1.05)
+        self.assertIn({'type': 'city_built', 'object': 'Ottertopia', 'item': 'ancient_walls'}, env.events)
+        self.assertEqual((env.city.wall_hp, env.city.wall_hp_max), (100, 100))
+        self.assertEqual((env.city.ranged_combat, env.city.strength_ranged), (True, 15))
+        report = env.city_report()
+        self.assertEqual((report['producing'], report['production_progress'], report['production_cost']),
+                         ('monument', 1, 60))
+        self.assertEqual(report['completed'], ['ancient_walls'])
+        env.units[0].x, env.units[0].y = 3, 4
+        with patch('game.attack', return_value=(7, 0)):
+            env.step(self.wait(env))
+        self.assertEqual(env.units[0].hp, 93)
+
+    def test_queue_skips_districts_over_the_population_limit(self):
+        env = self.make_env(city_population=1, city_districts=('campus',), city_build_queue=('holy_site', 'monument'))
+        self.assertEqual(env.current_build(), 'monument')
+        env.city.population = 4
+        self.assertEqual(env.current_build(), 'holy_site')
+        env.city.population = 1
+        env.build_progress['monument'] = 59
+        env.step(self.wait(env))
+        self.assertIn('monument', env.buildings)
+        self.assertIsNone(env.current_build())
+
+    def test_encampment_two_hexes_out_blocks_units_and_strikes(self):
+        env = self.make_env(city_population=1, unit_count=1, city_districts=('encampment',),
+                            city_buildings=('barracks',))
+        camp = env.districts['encampment']
+        self.assertEqual(hex_distance(camp, env.city.position), 2)
+        self.assertTrue(env.map.grid[camp].block_path)
+        self.assertNotEqual(env.units[0].position, camp)
+        self.assertEqual(env.city_yields()[1], 2)  # city center 1 + barracks 1
+        self.assertEqual((env.city.ranged_combat, env.city.strength_ranged), (False, 15))
+        observation = env.get_observation()
+        self.assertEqual(observation[7 + 8 + camp[1] * 8 + camp[0]], 1.0)
+        # Stand next to the encampment, out of the city's reach.
+        neighbor = next(cell.index for cell in env.map.grid[camp].get_neighbors(env.map.grid)
+                        if not cell.block_path and hex_distance(cell.index, env.city.position) == 3)
+        self.place(env, [neighbor])
+        unit = env.units[0]
+        into_camp = next(d for d in constants.DIRECTIONS[:-1]
+                         if (unit.x + constants.movement_delta(d, unit.y)[0],
+                             unit.y + constants.movement_delta(d, unit.y)[1]) == camp)
+        self.assertNotIn(env.encode_action([into_camp]), env.valid_actions())
+        with patch('game.attack', return_value=(9, 0)):
+            env.step(self.wait(env))
+        self.assertIn({'type': 'encampment_strike', 'object': 'Ottertopia', 'target': 'Otto'}, env.events)
+        self.assertEqual(unit.hp, 91)
+
+    def test_build_observation_and_schema(self):
+        env = self.make_env(city_population=1, city_buildings=('monument',), city_build_queue=('granary',))
+        self.assertTrue(env.observation_schema.endswith(':built=monument:queue=granary'))
+        base = self.make_env(city_population=1)
+        observation = env.get_observation()
+        self.assertEqual(len(observation), len(base.get_observation()) + 3)
+        np.testing.assert_allclose(observation[-3:], [1, 0, 0])
+        env.build_progress['granary'] = 33  # just over half of 65
+        np.testing.assert_allclose(env.get_observation()[-3:], [1, 0, .5])
+
+    def test_starting_campus_keeps_random_maps(self):
+        plain = self.make_env(city_population=1, forest_density=.2)
+        campus = self.make_env(city_population=1, forest_density=.2, city_districts=('campus',))
+        self.assertEqual([u.position for u in plain.units], [u.position for u in campus.units])
+
+
 if __name__ == '__main__':
     unittest.main()

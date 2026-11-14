@@ -101,5 +101,15 @@ class RendererTests(unittest.TestCase):
         self.assertTrue(env.render_frame())
 
 
+    def test_draws_districts_buildings_and_production(self):
+        env = Game(render=True, config=GameConfig(
+            unit_count=1, city_population=4, city_districts=('campus', 'encampment'),
+            city_buildings=('monument', 'library', 'ancient_walls'), city_build_queue=('granary', 'barracks')))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        self.assertTrue(env.render_frame())
+        self.assertGreater(env._renderer.panel, 118)  # room for the buildings and production line
+
+
 if __name__ == '__main__':
     unittest.main()

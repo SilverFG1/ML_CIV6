@@ -14,6 +14,9 @@ from learning_ai import QLearningAgent
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
+# Scenario fields stored as JSON lists that GameConfig needs as tuples.
+TUPLE_FIELDS = ("city_position", "unit_strengths", "unit_types", "city_districts", "city_buildings",
+                "city_build_queue")
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
                  "random_actions", "policy_actions", "q_table_size", "city_strength")
 
@@ -56,6 +59,13 @@ def parse_args(argv=None):
                         help="starting city population; enables worked tiles and growth (default: 0, off)")
     parser.add_argument("--city-builders", type=int, help="builders the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-settlers", type=int, help="settlers the city starts with, 0-2 (needs --city-population)")
+    parser.add_argument("--city-districts", choices=tuple(game.DISTRICTS), nargs="+",
+                        help="ancient-era districts the city starts with (needs --city-population)")
+    parser.add_argument("--city-buildings", choices=tuple(game.BUILDINGS), nargs="+",
+                        help="ancient-era buildings the city starts with")
+    parser.add_argument("--build-queue", dest="city_build_queue", nargs="+",
+                        choices=tuple(game.DISTRICTS) + tuple(game.BUILDINGS),
+                        help="districts and buildings the city produces in order")
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--no-city-healing", action="store_true")
     parser.add_argument("--unit-strengths", type=float, nargs="+")
@@ -91,10 +101,10 @@ def config_from_args(args, saved=None):
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
                  "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
-                 "city_population", "city_builders", "city_settlers"):
+                 "city_population", "city_builders", "city_settlers") + TUPLE_FIELDS[3:]:
         value = getattr(args, name)
         if value is not None:
-            explicit[name] = tuple(value) if name in ("city_position", "unit_strengths", "unit_types") else value
+            explicit[name] = tuple(value) if name in TUPLE_FIELDS else value
     if args.no_city_healing:
         explicit["city_heals"] = False
     if args.difficulty is not None and args.city_strength is None:
@@ -103,14 +113,15 @@ def config_from_args(args, saved=None):
         values["city_strength"] = DIFFICULTY_STRENGTHS[values["difficulty"]]
     for name, value in explicit.items():
         old = values.get(name)
-        if name in ("city_position", "unit_strengths", "unit_types") and old is not None:
+        if name in TUPLE_FIELDS and old is not None:
             old = tuple(old)
         if saved and old != value:
-            raise ValueError(f"--{name.replace('_', '-')} differs from the checkpoint; use --fresh for a new scenario")
+            flag = "build-queue" if name == "city_build_queue" else name.replace('_', '-')
+            raise ValueError(f"--{flag} differs from the checkpoint; use --fresh for a new scenario")
         values[name] = value
     values["city_position"] = None if values["city_position"] is None else tuple(values["city_position"])
-    values["unit_strengths"] = tuple(values["unit_strengths"])
-    values["unit_types"] = tuple(values["unit_types"])
+    for name in TUPLE_FIELDS[1:]:
+        values[name] = tuple(values[name])
     return game.GameConfig(**values)
 
 
@@ -240,6 +251,7 @@ class EpisodeResult:
     city_population: int | None = None  # final size, when city growth is enabled
     civilians_captured: int | None = None  # when the city has builders or settlers
     cities_founded: int | None = None
+    builds_completed: int | None = None  # when the city has a build queue
 
     @property
     def won(self):
@@ -288,11 +300,13 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
             break
     if train:
         agent.finish_episode()
-    population = (env.last_info.get("city") or {}).get("population")
+    city = env.last_info.get("city") or {}
+    population = city.get("population")
+    builds = len(city["completed"]) if "completed" in city else None
     civilians = env.last_info.get("civilians")
     captured, founded = (civilians["captured"], len(civilians["founded_cities"])) if civilians else (None, None)
     return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"],
-                         population, captured, founded)
+                         population, captured, founded, builds)
 
 
 def compare_policies(agent, args, *, count=None, seed=None, config=None, policies=None, render=False, verbose=True):
@@ -342,7 +356,8 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
             extras = {}
             for field, label in (("city_population", "average_city_population"),
                                  ("civilians_captured", "average_civilians_captured"),
-                                 ("cities_founded", "average_cities_founded")):
+                                 ("cities_founded", "average_cities_founded"),
+                                 ("builds_completed", "average_builds_completed")):
                 values = [row[field] for row in rows if row[field] is not None]
                 if values:
                     extras[label] = sum(values) / len(values)

@@ -87,6 +87,56 @@ CITY_FOUNDED_PENALTY = 5.0
 HUNT_RANGE = 3
 
 
+@dataclass(frozen=True)
+class DistrictSpec:
+    tech: str
+    cost: int = 54  # base cost; Civ VI raises it with tech and civic progress
+    yield_type: str | None = None  # what its adjacency bonus produces
+    mountain: int = 0  # adjacency per adjacent mountain
+    woods_pair: int = 0  # adjacency per two adjacent woods (forests)
+    district_pair: int = 0  # adjacency per two adjacent districts (the city center counts)
+    distance: int = 1  # hexes from the city center
+
+
+@dataclass(frozen=True)
+class BuildingSpec:
+    tech: str
+    cost: int
+    district: str = 'city_center'
+    yields: tuple = ()  # (yield type, amount) pairs
+    walls: float = 0  # outer defense added to the city's walls
+
+
+# Ancient-era districts and buildings (Gathering Storm). The Water Mill needs a
+# river, which these maps lack. The Government Plaza is omitted because its
+# buildings need Classical governments. The Encampment cannot be next to the
+# city center; this sim has no border growth, so it goes two hexes out.
+DISTRICTS = {
+    'campus': DistrictSpec('Writing', yield_type='science', mountain=1, district_pair=1),
+    'holy_site': DistrictSpec('Astrology', yield_type='faith', mountain=1, woods_pair=1, district_pair=1),
+    'encampment': DistrictSpec('Bronze Working', distance=2),
+}
+BUILDINGS = {
+    'monument': BuildingSpec('(none)', 60, yields=(('culture', 2),)),
+    'granary': BuildingSpec('Pottery', 65, yields=(('food', 1),)),
+    'ancient_walls': BuildingSpec('Masonry', 80, walls=100),
+    'library': BuildingSpec('Writing', 80, 'campus', yields=(('science', 2),)),
+    'shrine': BuildingSpec('Astrology', 65, 'holy_site', yields=(('faith', 2),)),
+    'barracks': BuildingSpec('Bronze Working', 80, 'encampment', yields=(('production', 1),)),
+}
+# Walls and encampments give the city a ranged strike; Civ VI uses the
+# strongest ranged unit's strength, or 15 without one. The city has no units.
+CITY_STRIKE_STRENGTH = 15
+STRIKE_RANGE = 2
+# The attacker loses this much reward whenever the city completes a build.
+BUILD_REWARD = 1.0
+
+
+def district_limit(population):
+    """Specialty districts a city of this size may have (Civ VI: one, plus one per 3 citizens)."""
+    return 1 + (population - 1) // 3
+
+
 def growth_threshold(population):
     """Food a city of this size needs to gain a citizen (Civ VI: 15 + 8n + n^1.5)."""
     n = population - 1
@@ -111,6 +161,9 @@ class GameConfig:
     city_population: int = 0
     city_builders: int = 0
     city_settlers: int = 0
+    city_districts: tuple = ()
+    city_buildings: tuple = ()
+    city_build_queue: tuple = ()
 
     @property
     def city_growth(self):
@@ -156,6 +209,7 @@ class GameConfig:
                 raise ValueError(f'{name} must be an integer between 0 and {MAX_CIVILIANS}')
         if (self.city_builders or self.city_settlers) and not self.city_growth:
             raise ValueError('builders and settlers need a city with population (city_population >= 1)')
+        self._validate_builds()
         if self.city_position is not None:
             if len(self.city_position) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
                                                  for v in self.city_position):
@@ -164,6 +218,36 @@ class GameConfig:
             if not (0 <= x < self.width and 0 <= y < self.height):
                 raise ValueError('city_position must lie inside the map')
 
+
+    def _validate_builds(self):
+        """Districts and buildings exist once each, and a building needs its district first."""
+        groups = (('city_districts', DISTRICTS), ('city_buildings', BUILDINGS),
+                  ('city_build_queue', {**DISTRICTS, **BUILDINGS}))
+        for name, table in groups:
+            value = getattr(self, name)
+            if not isinstance(value, tuple) or any(item not in table for item in value):
+                raise ValueError(f'{name} must name items from: {", ".join(table)}')
+        items = self.city_districts + self.city_buildings + self.city_build_queue
+        if not items:
+            return
+        if not self.city_growth:
+            raise ValueError('districts and buildings need a city with population (city_population >= 1)')
+        if len(set(items)) != len(items):
+            raise ValueError('each district and building can be built only once')
+        if len(self.city_districts) > district_limit(self.city_population):
+            limit = district_limit(self.city_population)
+            raise ValueError(f'a city of {self.city_population} can have at most {limit} '
+                             f'district{"s" if limit != 1 else ""}')
+        available = {'city_center', *self.city_districts}
+        for item in self.city_buildings + self.city_build_queue:
+            if item in BUILDINGS and BUILDINGS[item].district not in available:
+                raise ValueError(f'{item} needs a {BUILDINGS[item].district} built or queued before it')
+            available.add(item)
+
+    @property
+    def builds(self):
+        """Every district and building in the scenario, built or queued."""
+        return self.city_districts + self.city_buildings + self.city_build_queue
 
 class C_Sprite:
     """A simulation object; sprite is retained for older construction callers."""
@@ -329,13 +413,21 @@ class Game:
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
                                    + (':city_growth' if self.config.city_growth else '')
-                                   + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else ''))
+                                   + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else '')
+                                   + (':built=' + ','.join(self.config.city_districts + self.config.city_buildings)
+                                      if self.config.city_districts or self.config.city_buildings else '')
+                                   + (':queue=' + ','.join(self.config.city_build_queue)
+                                      if self.config.city_build_queue else ''))
         self._renderer = None
         self.quit = False
         self.units = []
         self.civilians = []
         self.farms = set()
         self.founded_cities = []
+        self.districts = {}
+        self.buildings = []
+        self.build_progress = {}
+        self.completed = []
         self.city = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -363,11 +455,26 @@ class Game:
             self.map.grid[city_pos].set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
             adjacent = self.map.grid[city_pos].get_neighbors(self.map.grid)
-            if len(component) >= c.unit_count + len(self.civilian_kinds) + 1 and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3):
+            needed = c.unit_count + len(self.civilian_kinds) + 1 + ('encampment' in c.city_districts)
+            if len(component) >= needed and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3):
                 break
         else:
             for cell in self.map.grid.values():
                 cell.set_terrain('GRASSLAND')
+            component = self.map.reachable(city_pos)
+        self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
+                           wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
+                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
+                           population=c.city_population)
+        self.units, self.civilians = [], []
+        self.farms = set()
+        self.founded_cities = []
+        self.districts, self.buildings, self.build_progress, self.completed = {}, [], {}, []
+        self._valid_cache_key = self._path_costs = None
+        # Starting districts and buildings exist before the squad arrives.
+        for item in c.city_districts + c.city_buildings:
+            self.complete_build(item, announce=False)
+        if 'encampment' in self.districts:
             component = self.map.reachable(city_pos)
         start_positions = self.rng.sample(sorted(component - {city_pos}), c.unit_count)
         specs = [UNIT_SPECS[kind] for kind in self.unit_types]
@@ -376,12 +483,6 @@ class Game:
         self.units = [C_Unit(*pos, name_instance=names[i], strength=strengths[i], env=self,
                              unit_type=self.unit_types[i], strength_ranged=specs[i].ranged_strength)
                       for i, pos in enumerate(start_positions)]
-        self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
-                           wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
-                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
-                           population=c.city_population)
-        self.farms = set()
-        self.founded_cities = []
         self.civilians = self._place_civilians(component) if self.civilian_kinds else []
         self.turn_number = 0
         self.events = []
@@ -532,6 +633,14 @@ class Game:
                 target = self.rng.choice(targets)
                 damage, _ = attack(self.city, target, ranged=True)
                 target.take_damage(damage)
+        encampment = self.districts.get('encampment')
+        if encampment is not None:
+            targets = [u for u in self.units if u.alive and hex_distance(u.position, encampment) <= STRIKE_RANGE]
+            if targets:
+                target = self.rng.choice(targets)
+                damage, _ = attack(self.city, target, ranged=True)
+                self.city._event('encampment_strike', target=target.name_instance)
+                target.take_damage(damage)
         if self.city.heal:
             besiegers = sum(u.alive and hex_distance(u.position, self.city.position) == 1 for u in self.units)
             if besiegers < min(3, self.config.unit_count):
@@ -545,6 +654,94 @@ class Game:
                 (self.builder_turn if civilian.kind == 'builder' else self.settler_turn)(civilian)
         if self.config.city_growth:
             self.grow_city()
+        if self.config.city_build_queue:
+            self.produce()
+
+    def is_built(self, item):
+        return item in self.districts or item in self.buildings
+
+    def adjacency(self, district, pos):
+        """A district's Civ VI adjacency bonus at pos; the city center counts as a district."""
+        spec = DISTRICTS[district]
+        neighbors = self.map.grid[pos].get_neighbors(self.map.grid)
+        mountains = sum(cell.terrain_type == 'MOUNTAIN' for cell in neighbors)
+        woods = sum(cell.terrain_type == 'FOREST' and cell.district is None for cell in neighbors)
+        districts = sum(cell.district is not None or cell.index == self.city.position for cell in neighbors)
+        return spec.mountain * mountains + spec.woods_pair * (woods // 2) + spec.district_pair * (districts // 2)
+
+    def district_site(self, district):
+        """The free tile with the best adjacency, then the lowest yields, or None.
+
+        Campuses and holy sites go next to the city center; encampments two hexes out.
+        """
+        occupied = ({u.position for u in self.units if u.alive}
+                    | {c.position for c in self.civilians if c.alive})
+        sites = [pos for pos, cell in self.map.grid.items()
+                 if hex_distance(pos, self.city.position) == DISTRICTS[district].distance
+                 and cell.terrain_type in TILE_YIELDS and cell.district is None and pos not in occupied]
+        if not sites:
+            return None
+        return max(sites, key=lambda pos: (self.adjacency(district, pos), -sum(self.tile_yield(pos)), -pos[1], -pos[0]))
+
+    def can_build(self, item):
+        if self.is_built(item):
+            return False
+        if item in DISTRICTS:
+            return (len(self.districts) < district_limit(self.city.population)
+                    and self.district_site(item) is not None)
+        district = BUILDINGS[item].district
+        return district == 'city_center' or district in self.districts
+
+    def complete_build(self, item, announce=True):
+        """Add a district or building to the city; return False if it cannot be built now."""
+        city = self.city
+        if item in DISTRICTS:
+            site = self.district_site(item)
+            if site is None:
+                return False
+            cell = self.map.grid[site]
+            cell.district, cell.fortified = item, item == 'encampment'
+            self.farms.discard(site)
+            self.districts[item] = site
+            self._valid_cache_key = self._path_costs = None
+        else:
+            district = BUILDINGS[item].district
+            if district != 'city_center' and district not in self.districts:
+                return False
+            self.buildings.append(item)
+            city.wall_hp += BUILDINGS[item].walls
+            city.wall_hp_max += BUILDINGS[item].walls
+        if item in ('ancient_walls', 'encampment') and city.strength_ranged == 0:
+            city.strength_ranged = CITY_STRIKE_STRENGTH
+        if item == 'ancient_walls':
+            city.ranged_combat = True
+        if announce:
+            self.completed.append(item)
+            city._event('city_built', item=item)
+        return True
+
+    def current_build(self):
+        """The first item in the queue that the city can work on now."""
+        return next((item for item in self.config.city_build_queue if self.can_build(item)), None)
+
+    @staticmethod
+    def build_cost(item):
+        return (DISTRICTS.get(item) or BUILDINGS[item]).cost
+
+    def produce(self):
+        """Put this turn's production into the queue; overflow goes to the next item."""
+        production = self.city_yields()[1]
+        while production > 0:
+            item = self.current_build()
+            if item is None:
+                return  # nothing can be built now, so the production is lost
+            needed = self.build_cost(item) - self.build_progress.get(item, 0)
+            if production < needed:
+                self.build_progress[item] = self.build_progress.get(item, 0) + production
+                return
+            self.build_progress[item] = self.build_cost(item)
+            production -= needed
+            self.complete_build(item)
 
     def _steps_to(self, goals, blocked):
         """Hex steps from every reachable tile to the nearest goal, avoiding blocked tiles."""
@@ -603,7 +800,7 @@ class Game:
     def territory(self):
         """Workable tiles the city owns: the six around its center, minus mountains."""
         return [cell.index for cell in self.map.grid[self.city.position].get_neighbors(self.map.grid)
-                if cell.terrain_type in TILE_YIELDS]
+                if cell.terrain_type in TILE_YIELDS and cell.district is None]
 
     def blocked_tiles(self):
         """Territory tiles that cannot be worked because a unit stands on them."""
@@ -634,7 +831,23 @@ class Game:
         for pos in self.worked_tiles():
             tile_food, tile_production = self.tile_yield(pos)
             food, production = food + tile_food, production + tile_production
+        for building in self.buildings:
+            yields = dict(BUILDINGS[building].yields)
+            food, production = food + yields.get('food', 0), production + yields.get('production', 0)
         return food, production
+
+    def city_output(self):
+        """All the city's yields per turn: food, production, culture, science and faith."""
+        food, production = self.city_yields()
+        output = {'food': food, 'production': production, 'culture': 0, 'science': 0, 'faith': 0}
+        for district, pos in self.districts.items():
+            if DISTRICTS[district].yield_type:
+                output[DISTRICTS[district].yield_type] += self.adjacency(district, pos)
+        for building in self.buildings:
+            for kind, amount in BUILDINGS[building].yields:
+                if kind not in ('food', 'production'):
+                    output[kind] += amount
+        return output
 
     def food_surplus(self):
         return self.city_yields()[0] - FOOD_PER_CITIZEN * self.city.population
@@ -652,7 +865,18 @@ class Game:
                 'turns_to_grow': math.ceil((threshold - city.food) / surplus) if surplus > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
                 'blocked_tiles': [list(pos) for pos in self.blocked_tiles()],
-                'farms': [list(pos) for pos in sorted(self.farms, key=lambda pos: (pos[1], pos[0]))]}
+                'farms': [list(pos) for pos in sorted(self.farms, key=lambda pos: (pos[1], pos[0]))],
+                **{kind: amount for kind, amount in self.city_output().items() if kind in ('culture', 'science', 'faith')},
+                'districts': {name: list(pos) for name, pos in self.districts.items()},
+                'buildings': list(self.buildings), **self.production_report()}
+
+    def production_report(self):
+        """What the city is producing, when it has a build queue."""
+        if not self.config.city_build_queue:
+            return {}
+        item = self.current_build()
+        return {'producing': item, 'production_progress': self.build_progress.get(item, 0) if item else 0,
+                'production_cost': self.build_cost(item) if item else None, 'completed': list(self.completed)}
 
     def civilian_report(self):
         """Each civilian's state and the cities settlers have founded, or None without civilians."""
@@ -726,6 +950,8 @@ class Game:
                 reward += CAPTURE_REWARDS[event['civilian']]
             elif kind == 'city_founded':
                 reward -= CITY_FOUNDED_PENALTY
+            elif kind == 'city_built':
+                reward -= BUILD_REWARD
         if self.last_info['outcome'] == 'win':
             reward += 10
         elif self.last_info['outcome'] == 'loss':
@@ -774,7 +1000,8 @@ class Game:
             values.extend([unit.x / (c.width - 1), unit.y / (c.height - 1),
                            unit.hp / unit.hp_max, float(unit.alive), unit.strength / 100,
                            float(unit.y % 2), unit.strength_ranged / 100, unit.attack_range / 2])
-        values.extend(TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
+        # An encampment blocks movement, so it reads like a mountain.
+        values.extend(1.0 if self.map.grid[(x, y)].fortified else TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
                       for y in range(c.height) for x in range(c.width))
         if c.city_growth:
             # Growth progress is coarse (quarters) to keep the tabular state space small.
@@ -784,6 +1011,11 @@ class Game:
         for civilian in self.civilians:
             values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
                            float(civilian.alive), civilian.charges / BUILDER_CHARGES])
+        values.extend(float(self.is_built(item)) for item in c.builds)
+        if c.city_build_queue:
+            item = self.current_build()
+            progress = self.build_progress.get(item, 0) / self.build_cost(item) if item else 0
+            values.append(math.floor(4 * progress) / 4)
         return np.asarray(values, dtype=float)
 
     def _distances(self):

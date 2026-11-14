@@ -5,6 +5,11 @@ import time
 import constants
 
 # Warriors share the plain unit sprite; other types get a short coloured label.
+DISTRICT_STYLES = {
+    'campus': ('CAMPUS', (95, 150, 230)),
+    'holy_site': ('HOLY SITE', (240, 225, 150)),
+    'encampment': ('ENCAMP', (225, 95, 80)),
+}
 UNIT_LABELS = {
     'spearman': ('SPEARMAN', (170, 215, 255)),
     'heavy_chariot': ('CHARIOT', (235, 160, 235)),
@@ -28,7 +33,9 @@ class Renderer:
                                int(720 / (env.config.height * .75 + .25))))
         self.margin = 24
         width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
-        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + 118
+        # A longer status line (buildings and production) wraps onto extra rows.
+        self.panel = 118 + (44 if env.config.builds else 0)
+        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + self.panel
         self.surface = pygame.display.set_mode((width, height))
         pygame.display.set_caption('ML_CIV6 — training and evaluation')
         self.font = pygame.font.SysFont('Segoe UI', 16)
@@ -96,6 +103,12 @@ class Renderer:
             p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 3)
             p.draw.rect(self.surface, constants.COLOR_PURPLE, (x + s * .35, y + s * .4, s * .3, s * .25))
             self._text('NEW CITY', (x + 2, y + s * .7), (235, 220, 255), small=True)
+        for district, pos in self.env.districts.items():
+            label, color = DISTRICT_STYLES[district]
+            x, y = self._position(pos)
+            p.draw.polygon(self.surface, color, self._polygon(pos), 4)
+            p.draw.rect(self.surface, color, (x + s * .38, y + s * .3, s * .24, s * .24), 0 if district == 'encampment' else 2)
+            self._text(label, (x + 4, y + s * .58), color, small=True)
         report = self.env.city_report()
         show_tiles = report is not None and self.env.city.alive
         if show_tiles:
@@ -140,18 +153,34 @@ class Renderer:
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
-        y = self.surface.get_height() - 109
+        y = self.surface.get_height() - self.panel + 9
         city = self.env.city
         outcome = self.env.last_info['outcome']
-        status = (f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
-                  f'Walls {city.wall_hp:.0f}   ')
+        status = [f'Turn {self.env.turn_number}', f'City {city.hp:.0f}/{city.hp_max:.0f}',
+                  f'Walls {city.wall_hp:.0f}']
         if report is not None:
-            status += (f'Pop {report["population"]}   Food {report["food"]}/{report["growth_threshold"]} '
-                       f'({report["food_surplus"]:+d})   ')
+            status += [f'Pop {report["population"]}',
+                       f'Food {report["food"]}/{report["growth_threshold"]} ({report["food_surplus"]:+d})']
         civilians = self.env.civilian_report()
         if civilians is not None:
-            status += f'Captured {civilians["captured"]}   Founded {len(civilians["founded_cities"])}   '
-        self._text(status + outcome.upper(), (self.margin, y))
+            status += [f'Captured {civilians["captured"]}', f'Founded {len(civilians["founded_cities"])}']
+        status.append(outcome.upper())
+        if self.env.buildings:
+            status.append('Built: ' + ', '.join(name.replace('_', ' ') for name in self.env.buildings))
+        if report is not None and report.get('producing'):
+            status.append(f'Producing {report["producing"].replace("_", " ")} '
+                          f'{report["production_progress"]}/{report["production_cost"]} '
+                          f'(+{report["production_yield"]})')
+        lines = ['']
+        for part in status:
+            proposed = (lines[-1] + '   ' + part).strip()
+            if lines[-1] and self.font.size(proposed)[0] > self.surface.get_width() - 2 * self.margin:
+                lines.append(part)
+            else:
+                lines[-1] = proposed
+        for index, line in enumerate(lines):
+            self._text(line, (self.margin, y + 22 * index))
+        y += 22 * (len(lines) - 1)
         if self.env.human:
             controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
         else:

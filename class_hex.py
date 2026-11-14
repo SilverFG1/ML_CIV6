@@ -11,6 +11,9 @@ TERRAIN_CODES = {'GRASSLAND': 0, 'FOREST': 1, 'MOUNTAIN': 2, 'EDGE': 2}
 class HexCell:
     index: tuple
     terrain_type: str = 'GRASSLAND'
+    district: str | None = None
+    # A defensible district (an encampment) blocks attacking units like a mountain.
+    fortified: bool = False
 
     def __post_init__(self):
         self.set_terrain(self.terrain_type)
@@ -27,7 +30,7 @@ class HexCell:
 
     @property
     def block_path(self):
-        return self.terrain_type in ('MOUNTAIN', 'EDGE')
+        return self.terrain_type in ('MOUNTAIN', 'EDGE') or self.fortified
 
     @property
     def defense_bonus(self):

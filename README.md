@@ -76,6 +76,8 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--no-city-healing` | Disable city healing. |
 | `--city-population N` | Start the city with N citizens (0–20) and simulate worked tiles and growth; 0 (the default) turns this off. |
 | `--city-builders N`, `--city-settlers N` | Give the city up to two builders and two settlers; requires `--city-population`. |
+| `--city-districts ...`, `--city-buildings ...` | Ancient-era districts and buildings the city starts with; requires `--city-population`. |
+| `--build-queue ...` | Districts and buildings the city produces, in order, during the game. |
 | `--curriculum-episodes N` | Progress from easier scenarios to the selected difficulty over N training episodes. |
 
 Each unit type has default strengths; `--unit-strengths` overrides the melee value only (for a battering ram, its defense).
@@ -149,6 +151,41 @@ python run_game.py --episodes 300 --unit-count 3 --city-population 2 --city-buil
 ```
 
 During playback, civilians are purple discs marked B or S (with a builder's remaining charges beside its name), farms show yellow furrows, founded cities are outlined in purple, and the status bar counts captured civilians and founded cities.
+
+## Districts and buildings (ancient era)
+
+A populated city can have the ancient-era districts and buildings from Civ VI's Gathering Storm ruleset. `--city-districts` and `--city-buildings` set what the city starts with, and `--build-queue` lists what it produces during the game.
+
+| District | Unlocked by | Cost | Placement | Adjacency bonus |
+| --- | --- | --- | --- | --- |
+| `campus` | Writing | 54 | Next to the city center | Science: +1 per adjacent mountain, +1 per 2 adjacent districts |
+| `holy_site` | Astrology | 54 | Next to the city center | Faith: +1 per adjacent mountain, +1 per 2 adjacent woods, +1 per 2 adjacent districts |
+| `encampment` | Bronze Working | 54 | Two hexes from the city center | None |
+
+| Building | District | Cost | Effect in this simulation |
+| --- | --- | --- | --- |
+| `monument` | City center | 60 | +2 culture |
+| `granary` | City center | 65 | +1 food |
+| `ancient_walls` | City center | 80 | +100 wall HP and a city ranged strike |
+| `library` | Campus | 80 | +2 science |
+| `shrine` | Holy Site | 65 | +2 faith |
+| `barracks` | Encampment | 80 | +1 production |
+
+- **Placement.** A district goes on the free tile with the best adjacency bonus, then the lowest yields. The city center counts as a district for adjacency. A district tile is no longer worked by citizens, and a district placed on a farm replaces it. A tile with a unit or civilian on it cannot take a district.
+- **District limit.** A city can have one district, plus one more for every three citizens beyond the first (1 at population 1–3, 2 at 4–6, and so on). A starting configuration that exceeds the limit is rejected.
+- **Production.** The city's production (1 from the city center, 1 from each worked forest, and 1 from barracks) goes to the first queued item it can build. An item waits while its district is missing, the district limit is reached, or no tile is free; partial progress is kept. Leftover production carries over to the next item, and production is lost when nothing in the queue can be built. Blockading forest tiles therefore slows construction.
+- **Combat.** Ancient Walls add 100 wall HP and give the city a ranged strike, as walls do in Civ VI. The encampment shoots a unit within 2 hexes of it each turn. Units cannot enter the encampment, which cannot be attacked. Both strikes use the city's ranged strength, or 15 (Civ VI's value for a civilization without ranged units) when the city has none. Battering rams help against these walls as they do against `--wall-hp`.
+- **Reward.** The attacker loses 1 each time the city completes a district or building.
+
+Culture, science and faith are tracked and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, housing, building maintenance, and pillaging. The Water Mill is left out because these maps have no rivers. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
+
+The observation adds a built flag for each listed district and building, plus the current item's production progress in quarters. An encampment appears as impassable in the terrain grid. The schema ends with `:built=...` and `:queue=...`, so changing them requires `--fresh`. Evaluation summaries report `average_builds_completed` when there is a queue.
+
+```powershell
+python run_game.py --episodes 300 --unit-count 3 --unit-types warrior spearman battering_ram --city-population 4 --forest-density 0.3 --city-districts campus --city-buildings monument library --build-queue ancient_walls encampment barracks --model-path runs/districts/model.json --metrics-dir runs/districts --fresh
+```
+
+During playback, districts are outlined in their own color (blue campus, gold holy site, red encampment), and the status bar lists completed buildings and the item in production with its progress.
 
 ## Metrics and playback
 

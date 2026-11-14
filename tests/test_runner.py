@@ -361,5 +361,28 @@ class RunnerTests(unittest.TestCase):
             self.make_agent(self.args('--fresh', '--city-builders', '1'))
 
 
+    def test_districts_and_buildings_resume_and_report_builds(self):
+        args = self.args('--city-population', '2', '--city-districts', 'campus', '--city-buildings', 'library',
+                         '--build-queue', 'monument', 'ancient_walls', '--max-steps', '40')
+        agent = self.make_agent(args)
+        self.assertTrue(agent.observation_schema.endswith(':built=campus,library:queue=monument,ancient_walls'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args('--max-steps', '40')
+        resumed = self.make_agent(resume_args)
+        self.assertEqual((resume_args.config.city_districts, resume_args.config.city_buildings,
+                          resume_args.config.city_build_queue),
+                         (('campus',), ('library',), ('monument', 'ancient_walls')))
+        with self.assertRaisesRegex(ValueError, '--build-queue'):
+            self.make_agent(self.args('--max-steps', '40', '--build-queue', 'ancient_walls'))
+        evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
+        for summary in evaluations.values():
+            self.assertTrue(0 <= summary['average_builds_completed'] <= 2)
+        with self.assertRaisesRegex(ValueError, 'campus'):
+            self.make_agent(self.args('--fresh', '--city-population', '1', '--city-buildings', 'library'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args('--build-queue', 'water_mill')
+
+
 if __name__ == "__main__":
     unittest.main()

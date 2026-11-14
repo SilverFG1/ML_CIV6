@@ -85,11 +85,34 @@ class Renderer:
                 p.draw.polygon(self.surface, (165, 175, 185),
                                [(x + s * .2, y + s * .7), (x + s * .5, y + s * .2),
                                 (x + s * .8, y + s * .7)])
+        s = self.size
+        for pos in self.env.farms:
+            # Furrows mark a farm.
+            x, y = self._position(pos)
+            for offset in (.62, .7, .78):
+                p.draw.line(self.surface, (214, 186, 92), (x + s * .3, y + s * offset), (x + s * .7, y + s * offset), 2)
+        for pos in self.env.founded_cities:
+            x, y = self._position(pos)
+            p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 3)
+            p.draw.rect(self.surface, constants.COLOR_PURPLE, (x + s * .35, y + s * .4, s * .3, s * .25))
+            self._text('NEW CITY', (x + 2, y + s * .7), (235, 220, 255), small=True)
         report = self.env.city_report()
         show_tiles = report is not None and self.env.city.alive
         if show_tiles:
             for pos in self.env.territory():
                 p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 2)
+        for civilian in self.env.civilians:
+            if not civilian.alive:
+                continue
+            x, y = self._position(civilian.position)
+            center = (int(x + s / 2), int(y + s * .45))
+            p.draw.circle(self.surface, constants.COLOR_PURPLE, center, max(6, int(s * .22)))
+            p.draw.circle(self.surface, (40, 30, 50), center, max(6, int(s * .22)), 2)
+            letter = 'B' if civilian.kind == 'builder' else 'S'
+            glyph = self.font.render(letter, True, (40, 30, 50))
+            self.surface.blit(glyph, glyph.get_rect(center=center))
+            charges = f' ({civilian.charges})' if civilian.kind == 'builder' else ''
+            self._text(civilian.name_instance + charges, (x + 2, y + s * .7), small=True)
         for obj in self.env.objects:
             x, y = self._position(obj.position)
             if obj.alive:
@@ -125,6 +148,9 @@ class Renderer:
         if report is not None:
             status += (f'Pop {report["population"]}   Food {report["food"]}/{report["growth_threshold"]} '
                        f'({report["food_surplus"]:+d})   ')
+        civilians = self.env.civilian_report()
+        if civilians is not None:
+            status += f'Captured {civilians["captured"]}   Founded {len(civilians["founded_cities"])}   '
         self._text(status + outcome.upper(), (self.margin, y))
         if self.env.human:
             controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'

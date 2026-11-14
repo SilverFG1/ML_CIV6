@@ -90,5 +90,16 @@ class RendererTests(unittest.TestCase):
         self.assertTrue(env.render_frame())
 
 
+    def test_draws_civilians_farms_and_founded_cities(self):
+        env = Game(render=True, config=GameConfig(unit_count=1, city_population=2, city_builders=1, city_settlers=1))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.farms.add(env.territory()[0])
+        env.founded_cities.append((0, 0))
+        self.assertTrue(env.render_frame())
+        env.civilians[0].leave('captured', 'civilian_captured')
+        self.assertTrue(env.render_frame())
+
+
 if __name__ == '__main__':
     unittest.main()

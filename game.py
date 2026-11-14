@@ -71,6 +71,22 @@ MAX_CITY_POPULATION = 20
 POPULATION_REWARD = 1.0
 
 
+# Civilians belong to a populated city. A builder has Civ VI's 3 build charges
+# and farms flat grassland in the city's territory (+1 food); Civ VI does not
+# allow farms on woods, so forests are left alone. A settler walks to the
+# nearest tile at least 4 hexes from every city (Civ VI's minimum spacing) and
+# founds a city there. An attacking unit that moves onto a civilian captures it.
+CIVILIAN_KINDS = ('builder', 'settler')
+BUILDER_CHARGES = 3
+FARM_FOOD = 1
+MIN_CITY_DISTANCE = 4
+MAX_CIVILIANS = 2  # of each kind
+CAPTURE_REWARDS = {'builder': 2.0, 'settler': 4.0}
+CITY_FOUNDED_PENALTY = 5.0
+# The heuristic hunts a civilian within this many hexes instead of besieging.
+HUNT_RANGE = 3
+
+
 def growth_threshold(population):
     """Food a city of this size needs to gain a citizen (Civ VI: 15 + 8n + n^1.5)."""
     n = population - 1
@@ -93,6 +109,8 @@ class GameConfig:
     unit_types: tuple = ()
     difficulty: str = 'normal'
     city_population: int = 0
+    city_builders: int = 0
+    city_settlers: int = 0
 
     @property
     def city_growth(self):
@@ -132,6 +150,12 @@ class GameConfig:
         if (isinstance(self.city_population, bool) or not isinstance(self.city_population, int)
                 or not 0 <= self.city_population <= MAX_CITY_POPULATION):
             raise ValueError(f'city_population must be an integer between 0 and {MAX_CITY_POPULATION}')
+        for name in ('city_builders', 'city_settlers'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CIVILIANS:
+                raise ValueError(f'{name} must be an integer between 0 and {MAX_CIVILIANS}')
+        if (self.city_builders or self.city_settlers) and not self.city_growth:
+            raise ValueError('builders and settlers need a city with population (city_population >= 1)')
         if self.city_position is not None:
             if len(self.city_position) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
                                                  for v in self.city_position):
@@ -253,6 +277,24 @@ class C_City(C_Sprite):
             self._event('city_captured')
 
 
+class C_Civilian(C_Sprite):
+    """The city's builder or settler. Civilians cannot fight; attackers capture them."""
+    def __init__(self, x, y, kind, name_instance, env=None):
+        if kind not in CIVILIAN_KINDS:
+            raise ValueError(f'Unknown civilian: {kind}')
+        super().__init__(x, y, name_instance=name_instance, strength=0, env=env)
+        self.kind = kind
+        self.charges = BUILDER_CHARGES if kind == 'builder' else 0
+        self.status = 'active'
+
+    def leave(self, status, event, **details):
+        """Remove the civilian from play as captured, settled or used up."""
+        if self.alive:
+            self.alive = False
+            self.status = status
+            self._event(event, civilian=self.kind, **details)
+
+
 def attack(aggressor, target, ranged=False, rng=None):
     """Compute combat damage using the environment's private RNG."""
     rng = rng or (aggressor.env.rng if aggressor.env is not None else random.Random())
@@ -282,12 +324,18 @@ class Game:
         self.actions = tuple(itertools.product(*self.unit_directions))
         self.action_count = len(self.actions)
         self._action_index = {a: i for i, a in enumerate(self.actions)}
+        self.civilian_kinds = (('builder',) * self.config.city_builders
+                               + ('settler',) * self.config.city_settlers)
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
-                                   + (':city_growth' if self.config.city_growth else ''))
+                                   + (':city_growth' if self.config.city_growth else '')
+                                   + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else ''))
         self._renderer = None
         self.quit = False
         self.units = []
+        self.civilians = []
+        self.farms = set()
+        self.founded_cities = []
         self.city = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -315,7 +363,7 @@ class Game:
             self.map.grid[city_pos].set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
             adjacent = self.map.grid[city_pos].get_neighbors(self.map.grid)
-            if len(component) >= c.unit_count + 1 and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3):
+            if len(component) >= c.unit_count + len(self.civilian_kinds) + 1 and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3):
                 break
         else:
             for cell in self.map.grid.values():
@@ -332,6 +380,9 @@ class Game:
                            wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
                            ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
                            population=c.city_population)
+        self.farms = set()
+        self.founded_cities = []
+        self.civilians = self._place_civilians(component) if self.civilian_kinds else []
         self.turn_number = 0
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -339,6 +390,25 @@ class Game:
         self._valid_cache_key = None
         self._path_costs = None
         return self.get_observation()
+
+    def _place_civilians(self, component):
+        """Start civilians on free territory tiles, then on the free tiles nearest the city."""
+        taken = {u.position for u in self.units} | {self.city.position}
+        territory = [pos for pos in self.territory() if pos in component and pos not in taken]
+        self.rng.shuffle(territory)
+        nearby = sorted((pos for pos in component if pos not in taken and pos not in territory),
+                        key=lambda pos: (hex_distance(pos, self.city.position), pos[1], pos[0]))
+        spots = territory + nearby
+        counts = {}
+        civilians = []
+        for kind, pos in zip(self.civilian_kinds, spots):
+            counts[kind] = counts.get(kind, 0) + 1
+            name = kind.capitalize() + ('' if counts[kind] == 1 else f' {counts[kind]}')
+            civilians.append(C_Civilian(*pos, kind, name, env=self))
+        return civilians
+
+    def civilian_at(self, position):
+        return next((c for c in self.civilians if c.alive and c.position == tuple(position)), None)
 
     def game_initialize(self, ep_number=0, seed=None):
         self.episode_number = ep_number
@@ -353,7 +423,8 @@ class Game:
         if self.city is None:
             raise RuntimeError('Call reset before using the environment')
         terrain = tuple(cell.terrain_type for cell in self.map.grid.values())
-        key = (tuple((u.position, u.alive) for u in self.units), self.city.position, terrain)
+        key = (tuple((u.position, u.alive) for u in self.units), self.city.position, terrain,
+               tuple((c.position, c.alive) for c in self.civilians))
         if key == self._valid_cache_key:
             return list(self._valid_cache)
         result = []
@@ -378,7 +449,7 @@ class Game:
                 cell = self.map.grid.get(destination)
                 if cell is None or cell.block_path or destination in remaining:
                     continue
-                if unit.support and destination == self.city.position:
+                if unit.support and (destination == self.city.position or self.civilian_at(destination)):
                     continue
                 final = unit.position if destination == self.city.position else destination
                 visit(index + 1, action + [direction], remaining | {final})
@@ -407,6 +478,15 @@ class Game:
         if cell is None or cell.block_path:
             unit.status = 'hit wall'
             unit._event('invalid_move')
+            return
+        civilian = self.civilian_at(destination)
+        if civilian is not None:
+            if unit.support:
+                unit._event('blocked_move')
+                return
+            civilian.leave('captured', 'civilian_captured', by=unit.name_instance)
+            unit.x, unit.y = destination
+            unit.status = 'captured'
             return
         target = self.occupant(destination, exclude=unit)
         if target is self.city and unit.support:
@@ -460,8 +540,65 @@ class Game:
                     self.city.hp += healed
                     self.city.status = 'healed'
                     self.city._event('city_healed', amount=healed)
+        for civilian in self.civilians:
+            if civilian.alive:
+                (self.builder_turn if civilian.kind == 'builder' else self.settler_turn)(civilian)
         if self.config.city_growth:
             self.grow_city()
+
+    def _steps_to(self, goals, blocked):
+        """Hex steps from every reachable tile to the nearest goal, avoiding blocked tiles."""
+        steps = {goal: 0 for goal in goals}
+        pending = list(steps)
+        for pos in pending:
+            for cell in self.map.grid[pos].get_neighbors(self.map.grid):
+                if not cell.block_path and cell.index not in blocked and cell.index not in steps:
+                    steps[cell.index] = steps[pos] + 1
+                    pending.append(cell.index)
+        return steps
+
+    def _civilian_step(self, civilian, goals):
+        """Move one hex toward the nearest reachable goal, around units and the city."""
+        blocked = ({u.position for u in self.units if u.alive} | {self.city.position}
+                   | {c.position for c in self.civilians if c.alive and c is not civilian})
+        steps = self._steps_to([goal for goal in goals if goal not in blocked], blocked)
+        here = steps.get(civilian.position)
+        options = [(steps[cell.index], cell.index[1], cell.index[0])
+                   for cell in self.map.grid[civilian.position].get_neighbors(self.map.grid)
+                   if cell.index in steps and cell.index not in blocked]
+        if here is not None and options and min(options)[0] < here:
+            _, y, x = min(options)
+            civilian.x, civilian.y = x, y
+
+    def farm_sites(self):
+        """Unfarmed grassland in the city's territory."""
+        return [pos for pos in self.territory()
+                if self.map.grid[pos].terrain_type == 'GRASSLAND' and pos not in self.farms]
+
+    def builder_turn(self, builder):
+        sites = self.farm_sites()
+        if builder.position not in sites:
+            self._civilian_step(builder, sites)
+            return
+        self.farms.add(builder.position)
+        builder.charges -= 1
+        builder._event('farm_built', position=list(builder.position), charges=builder.charges)
+        if builder.charges == 0:
+            builder.leave('used up', 'builder_used_up')
+
+    def settlement_sites(self):
+        """Tiles far enough from every city to found a new one."""
+        cities = [self.city.position] + self.founded_cities
+        return [pos for pos, cell in self.map.grid.items() if not cell.block_path
+                and all(hex_distance(pos, city) >= MIN_CITY_DISTANCE for city in cities)]
+
+    def settler_turn(self, settler):
+        sites = self.settlement_sites()
+        if settler.position not in sites:
+            self._civilian_step(settler, sites)
+            return
+        self.founded_cities.append(settler.position)
+        settler.leave('settled', 'city_founded', position=list(settler.position))
 
     def territory(self):
         """Workable tiles the city owns: the six around its center, minus mountains."""
@@ -483,14 +620,19 @@ class Game:
             return []
         blocked = set(self.blocked_tiles())
         free = [pos for pos in self.territory() if pos not in blocked]
-        free.sort(key=lambda pos: (tuple(-v for v in TILE_YIELDS[self.map.grid[pos].terrain_type]), pos[1], pos[0]))
+        free.sort(key=lambda pos: (tuple(-v for v in self.tile_yield(pos)), pos[1], pos[0]))
         return free[:self.city.population]
+
+    def tile_yield(self, pos):
+        """Return a territory tile's (food, production), including any farm."""
+        food, production = TILE_YIELDS[self.map.grid[pos].terrain_type]
+        return food + (FARM_FOOD if pos in self.farms else 0), production
 
     def city_yields(self):
         """Return (food, production) from the city center and worked tiles."""
         food, production = CITY_CENTER_YIELD
         for pos in self.worked_tiles():
-            tile_food, tile_production = TILE_YIELDS[self.map.grid[pos].terrain_type]
+            tile_food, tile_production = self.tile_yield(pos)
             food, production = food + tile_food, production + tile_production
         return food, production
 
@@ -509,7 +651,17 @@ class Game:
                 'food_yield': food, 'production_yield': production, 'food_surplus': surplus,
                 'turns_to_grow': math.ceil((threshold - city.food) / surplus) if surplus > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
-                'blocked_tiles': [list(pos) for pos in self.blocked_tiles()]}
+                'blocked_tiles': [list(pos) for pos in self.blocked_tiles()],
+                'farms': [list(pos) for pos in sorted(self.farms, key=lambda pos: (pos[1], pos[0]))]}
+
+    def civilian_report(self):
+        """Each civilian's state and the cities settlers have founded, or None without civilians."""
+        if not self.civilian_kinds:
+            return None
+        return {'civilians': [{'name': c.name_instance, 'kind': c.kind, 'position': list(c.position),
+                               'status': c.status, 'charges': c.charges} for c in self.civilians],
+                'captured': sum(c.status == 'captured' for c in self.civilians),
+                'founded_cities': [list(pos) for pos in self.founded_cities]}
 
     def grow_city(self):
         """Store this turn's surplus; grow at the threshold, or starve once food runs out."""
@@ -570,6 +722,10 @@ class Game:
                 reward -= POPULATION_REWARD
             elif kind == 'city_starved':
                 reward += POPULATION_REWARD
+            elif kind == 'civilian_captured':
+                reward += CAPTURE_REWARDS[event['civilian']]
+            elif kind == 'city_founded':
+                reward -= CITY_FOUNDED_PENALTY
         if self.last_info['outcome'] == 'win':
             reward += 10
         elif self.last_info['outcome'] == 'loss':
@@ -601,6 +757,8 @@ class Game:
                           'turn': self.turn_number}
         if self.config.city_growth:
             self.last_info['city'] = self.city_report()
+        if self.civilian_kinds:
+            self.last_info['civilians'] = self.civilian_report()
         reward = self.get_rewards()
         return self.get_observation(), reward, self._done
 
@@ -623,6 +781,9 @@ class Game:
             progress = min(1.0, city.food / growth_threshold(city.population))
             values.extend([city.population / MAX_CITY_POPULATION, math.floor(4 * progress) / 4,
                            self.food_surplus() / 10])
+        for civilian in self.civilians:
+            values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
+                           float(civilian.alive), civilian.charges / BUILDER_CHARGES])
         return np.asarray(values, dtype=float)
 
     def _distances(self):
@@ -645,14 +806,33 @@ class Game:
         self._path_costs = key, costs
         return costs
 
+    def _hunt_steps(self, unit):
+        """Steps to the nearest civilian within HUNT_RANGE, for a healthy unit that can capture."""
+        if not unit.alive or unit.support or unit.hp < .35 * unit.hp_max:
+            return None
+        nearby = [c for c in self.civilians if c.alive and hex_distance(c.position, unit.position) <= HUNT_RANGE]
+        if not nearby:
+            return None
+        target = min(nearby, key=lambda c: hex_distance(c.position, unit.position))
+        return self._steps_to([target.position], {self.city.position})
+
     def guided_action(self, rng=None):
         rng = rng or self.rng
         costs = self._distances()
+        hunts = [self._hunt_steps(unit) for unit in self.units]
         scores = []
         for action in self.valid_actions():
             score = 0
-            for unit, direction in zip(self.units, self.actions[action]):
+            for unit, direction, hunt in zip(self.units, self.actions[action], hunts):
                 if not unit.alive:
+                    continue
+                if hunt is not None:
+                    # Chase the civilian; moving onto it captures it.
+                    if direction == 'SHOOT':
+                        score += hunt.get(unit.position, 10000) + 1
+                    else:
+                        dx, dy = constants.movement_delta(direction, unit.y)
+                        score += hunt.get((unit.x + dx, unit.y + dy), 10000)
                     continue
                 if direction == 'SHOOT':
                     score += costs.get(unit.position, 10000) - 2
@@ -678,6 +858,10 @@ class Game:
                                     'alive': obj.alive} for obj in self.objects}
         if self.config.city_growth:
             state[self.city.name_instance].update(self.city_report())
+        for civilian in self.civilians:
+            state[civilian.name_instance] = {'position': [civilian.x, civilian.y], 'alive': civilian.alive,
+                                             'kind': civilian.kind, 'status': civilian.status,
+                                             'charges': civilian.charges}
         return state
 
     def render_frame(self, delay_ms=0):

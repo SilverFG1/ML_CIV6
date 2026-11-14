@@ -342,5 +342,24 @@ class RunnerTests(unittest.TestCase):
             self.make_agent(self.args('--fresh', '--city-population', '21'))
 
 
+    def test_builders_and_settlers_resume_and_report_captures(self):
+        args = self.args('--city-population', '2', '--city-builders', '1', '--city-settlers', '1')
+        agent = self.make_agent(args)
+        self.assertTrue(agent.observation_schema.endswith(':civilians=builder,settler'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        resumed = self.make_agent(resume_args)
+        self.assertEqual((resume_args.config.city_builders, resume_args.config.city_settlers), (1, 1))
+        with self.assertRaisesRegex(ValueError, 'city-settlers'):
+            self.make_agent(self.args('--city-settlers', '2'))
+        evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
+        for summary in evaluations.values():
+            self.assertTrue(0 <= summary['average_civilians_captured'] <= 2)
+            self.assertTrue(0 <= summary['average_cities_founded'] <= 1)
+        with self.assertRaisesRegex(ValueError, 'population'):
+            self.make_agent(self.args('--fresh', '--city-builders', '1'))
+
+
 if __name__ == "__main__":
     unittest.main()

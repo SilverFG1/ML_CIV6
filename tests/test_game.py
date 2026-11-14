@@ -510,5 +510,127 @@ class GameTests(unittest.TestCase):
                 GameConfig(city_population=value)
 
 
+    # Builders and settlers.
+    def put_civilian(self, env, kind, pos):
+        """Move the scenario's first civilian of this kind to pos."""
+        civilian = next(c for c in env.civilians if c.kind == kind)
+        civilian.x, civilian.y = pos
+        return civilian
+
+    def test_civilians_are_off_by_default_and_need_population(self):
+        env = self.make_env(city_population=2)
+        self.assertEqual(env.civilians, [])
+        self.assertIsNone(env.civilian_report())
+        self.assertNotIn('civilians', env.observation_schema)
+        for kwargs in ({'city_builders': 1}, {'city_settlers': 1}, {'city_population': 1, 'city_builders': 3},
+                       {'city_population': 1, 'city_settlers': -1}, {'city_population': 1, 'city_builders': True}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                GameConfig(**kwargs)
+
+    def test_civilian_free_scenarios_keep_their_random_maps(self):
+        plain = self.make_env(city_population=2, forest_density=.2)
+        with_civilians = self.make_env(city_population=2, forest_density=.2, city_builders=1)
+        self.assertEqual([u.position for u in plain.units], [u.position for u in with_civilians.units])
+
+    def test_civilians_start_on_free_territory(self):
+        env = self.make_env(city_population=2, city_builders=2, city_settlers=2)
+        self.assertEqual([c.name_instance for c in env.civilians], ['Builder', 'Builder 2', 'Settler', 'Settler 2'])
+        positions = [c.position for c in env.civilians]
+        self.assertEqual(len(set(positions)), 4)
+        self.assertFalse(set(positions) & ({u.position for u in env.units} | {env.city.position}))
+        self.assertTrue(all(hex_distance(pos, env.city.position) <= 2 for pos in positions))
+        self.assertEqual(env.observation_schema,
+                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:civilians=builder,builder,settler,settler')
+        self.assertEqual(len(env.get_observation()), len(self.make_env(city_population=2).get_observation()) + 16)
+
+    def test_builder_farms_grassland_until_its_charges_run_out(self):
+        env = self.make_env(city_population=3, city_builders=1)
+        self.place_far(env)
+        env.map.grid[(4, 3)].set_terrain('FOREST')
+        builder = self.put_civilian(env, 'builder', (3, 3))
+        self.assertEqual(env.food_surplus(), 2)
+        env.step(self.wait(env))
+        self.assertEqual(env.farms, {(3, 3)})
+        self.assertEqual(env.tile_yield((3, 3)), (3, 0))
+        self.assertEqual(env.city_report()['farms'], [[3, 3]])
+        self.assertEqual(env.food_surplus(), 3)
+        for _ in range(6):
+            env.step(self.wait(env))
+        self.assertEqual(len(env.farms), 3)
+        self.assertNotIn((4, 3), env.farms)  # woods are not farmed
+        self.assertEqual((builder.alive, builder.status, builder.charges), (False, 'used up', 0))
+        # Citizens now work the farms first.
+        self.assertTrue(set(env.worked_tiles()) <= env.farms)
+
+    def test_settler_walks_out_and_founds_a_city(self):
+        env = self.make_env(city_population=1, city_settlers=1)
+        self.place_far(env)
+        settler = self.put_civilian(env, 'settler', (5, 4))
+        rewards = []
+        while settler.alive:
+            rewards.append(env.step(self.wait(env))[1])
+        self.assertEqual(settler.status, 'settled')
+        self.assertEqual(env.founded_cities, [settler.position])
+        self.assertGreaterEqual(hex_distance(settler.position, env.city.position), 4)
+        self.assertEqual(len(rewards), 4)  # three moves, then founding
+        self.assertAlmostEqual(rewards[-1], -5.05)
+        self.assertEqual(env.last_info['civilians']['founded_cities'], [list(settler.position)])
+        # A second settler must keep its distance from the new city too.
+        self.assertTrue(all(hex_distance(pos, settler.position) >= 4 for pos in env.settlement_sites()))
+
+    def test_military_unit_captures_civilian_but_ram_cannot(self):
+        env = self.make_env(city_population=1, unit_count=2, unit_types=('warrior', 'battering_ram'),
+                            city_builders=1, city_settlers=1)
+        self.place(env, [(1, 1), (5, 2)])
+        builder = self.put_civilian(env, 'builder', (2, 1))
+        settler = self.put_civilian(env, 'settler', (6, 2))
+        legal = [env.actions[a] for a in env.valid_actions()]
+        self.assertIn(('E', 'SPACE'), legal)
+        self.assertNotIn(('SPACE', 'E'), legal)
+        _, reward, _ = env.step(env.encode_action(['E', 'SPACE']))
+        self.assertAlmostEqual(reward, 1.95)
+        self.assertEqual((builder.status, env.units[0].position), ('captured', (2, 1)))
+        self.assertIn({'type': 'civilian_captured', 'object': 'Builder', 'civilian': 'builder', 'by': 'Otto'},
+                      env.events)
+        settler.x, settler.y = 6, 2  # keep the settler next to the ram
+        env.units[1].move(1, 0)
+        self.assertTrue(settler.alive)
+        self.assertEqual(env.units[1].position, (5, 2))
+        self.assertEqual(env.events[-1]['type'], 'blocked_move')
+        self.assertEqual(env.civilian_report()['captured'], 1)
+
+    def test_capturing_a_settler_is_worth_more(self):
+        env = self.make_env(city_population=1, unit_count=1, city_settlers=1)
+        self.place(env, [(1, 1)])
+        self.put_civilian(env, 'settler', (2, 1))
+        _, reward, _ = env.step(env.encode_action(['E']))
+        self.assertAlmostEqual(reward, 3.95)
+
+    def test_civilians_walk_around_units(self):
+        env = self.make_env(city_population=1, city_builders=1)
+        self.place(env, [(4, 3), (0, 0), (2, 0)])
+        builder = self.put_civilian(env, 'builder', (5, 3))
+        env.map.grid[(5, 4)].set_terrain('MOUNTAIN')
+        for pos in [(3, 3), (3, 4), (3, 5), (4, 5)]:
+            env.farms.add(pos)
+        # The only farm site is occupied by a unit, so the builder waits.
+        env.step(self.wait(env))
+        self.assertEqual(builder.position, (5, 3))
+        env.units[0].x, env.units[0].y = 0, 2
+        env.step(self.wait(env))
+        self.assertEqual(builder.position, (4, 3))
+
+    def test_heuristic_hunts_nearby_civilians(self):
+        env = self.make_env(city_population=1, unit_count=1, city_settlers=1)
+        self.place(env, [(1, 1)])
+        settler = self.put_civilian(env, 'settler', (3, 1))
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))], ('E',))
+        env.step(env.encode_action(['E']))
+        self.assertEqual(settler.position, (3, 0))  # stepped onto a settling site
+        _, reward, _ = env.step(env.guided_action(random.Random(1)))
+        self.assertEqual(settler.status, 'captured')  # caught before it could found a city
+        self.assertAlmostEqual(reward, 3.95)
+
+
 if __name__ == '__main__':
     unittest.main()

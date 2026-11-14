@@ -75,6 +75,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
 | `--no-city-healing` | Disable city healing. |
 | `--city-population N` | Start the city with N citizens (0–20) and simulate worked tiles and growth; 0 (the default) turns this off. |
+| `--city-builders N`, `--city-settlers N` | Give the city up to two builders and two settlers; requires `--city-population`. |
 | `--curriculum-episodes N` | Progress from easier scenarios to the selected difficulty over N training episodes. |
 
 Each unit type has default strengths; `--unit-strengths` overrides the melee value only (for a battering ram, its defense).
@@ -129,6 +130,25 @@ python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-pat
 ```
 
 During playback, the city's territory is outlined, gold dots mark worked tiles, red dots mark tiles a unit is blocking, and the status bar shows population, stored food against the growth threshold, and the food surplus.
+
+## Builders and settlers
+
+`--city-builders N` and `--city-settlers N` (up to two each) give a populated city civilians that start on free tiles in its territory. Civilians move one hex per turn after the squad moves, walking around units, other civilians, and the city itself.
+
+- **Builders** have Civ VI's three build charges. A builder farms the unfarmed grassland tiles in the city's territory, using one charge per farm, and is used up when the charges run out. A farm adds 1 food, so a farmed tile yields 3 food, and citizens work farms first. Civ VI does not allow farms on woods, so forests are not farmed.
+- **Settlers** walk to the nearest tile at least 4 hexes from every city (Civ VI's minimum spacing) and found a city there on the following turn. The new city is recorded and drawn but is not otherwise simulated.
+- **Capture.** A unit that moves onto a civilian captures it and takes its tile. Battering rams cannot capture civilians, just as they cannot capture the city.
+- **Reward.** Capturing a builder is worth +2 and capturing a settler +4. A city founded by a settler costs the attacker 5.
+
+The squad therefore has to look for the city's civilians as well as besiege it: a settler that gets away founds a new city, and a builder left alone speeds up the city's growth. The heuristic hunts any civilian within 3 hexes of a healthy unit that can capture, and besieges otherwise. Units still move one hex per turn, so the Civ VI civilians' two movement points and the population cost of training a settler are not modeled.
+
+The observation adds each civilian's position, whether it is still in play, and a builder's remaining charges. The schema ends with `:civilians=...`, so models need `--fresh` when civilians are added. Evaluation summaries also report `average_civilians_captured` and `average_cities_founded`.
+
+```powershell
+python run_game.py --episodes 300 --unit-count 3 --city-population 2 --city-builders 1 --city-settlers 1 --model-path runs/civilians/model.json --metrics-dir runs/civilians --fresh
+```
+
+During playback, civilians are purple discs marked B or S (with a builder's remaining charges beside its name), farms show yellow furrows, founded cities are outlined in purple, and the status bar counts captured civilians and founded cities.
 
 ## Metrics and playback
 

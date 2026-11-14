@@ -52,6 +52,8 @@ def parse_args(argv=None):
                        ("ranged-strength", float), ("mountain-density", float), ("forest-density", float)):
         parser.add_argument("--" + flag, type=kind)
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
+    parser.add_argument("--city-population", type=int,
+                        help="starting city population; enables worked tiles and growth (default: 0, off)")
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--no-city-healing", action="store_true")
     parser.add_argument("--unit-strengths", type=float, nargs="+")
@@ -86,7 +88,8 @@ def config_from_args(args, saved=None):
     values.update(saved)
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
-                 "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty"):
+                 "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
+                 "city_population"):
         value = getattr(args, name)
         if value is not None:
             explicit[name] = tuple(value) if name in ("city_position", "unit_strengths", "unit_types") else value
@@ -232,6 +235,7 @@ class EpisodeResult:
     guidance_actions: int = 0
     random_actions: int = 0
     policy_actions: int = 0
+    city_population: int | None = None  # final size, when city growth is enabled
 
     @property
     def won(self):
@@ -280,7 +284,9 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
             break
     if train:
         agent.finish_episode()
-    return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"])
+    population = (env.last_info.get("city") or {}).get("population")
+    return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"],
+                         population)
 
 
 def compare_policies(agent, args, *, count=None, seed=None, config=None, policies=None, render=False, verbose=True):
@@ -327,10 +333,15 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 "average_steps": sum(row["steps"] for row in rows) / completed if completed else 0.0,
                 "episodes_detail": rows,
             }
+            populations = [row["city_population"] for row in rows if row["city_population"] is not None]
+            if populations:
+                summaries[policy]["average_city_population"] = sum(populations) / len(populations)
             if verbose:
                 summary = summaries[policy]
                 print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}, "
-                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}")
+                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}"
+                      + (f", average city population {summary['average_city_population']:.2f}"
+                         if populations else ""))
             if summaries[policy]["quits"]:
                 break
     finally:

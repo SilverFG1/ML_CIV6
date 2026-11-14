@@ -79,5 +79,16 @@ class RendererTests(unittest.TestCase):
         self.assertIn('ranged_attack', [e['type'] for e in self.env.events])
 
 
+    def test_draws_city_growth_with_worked_and_blocked_tiles(self):
+        env = Game(render=True, config=GameConfig(unit_count=2, city_population=3))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.units[0].x, env.units[0].y = 5, 4
+        self.assertEqual(env.city_report()['blocked_tiles'], [[5, 4]])
+        self.assertTrue(env.render_frame())
+        env.city.death()
+        self.assertTrue(env.render_frame())
+
+
 if __name__ == '__main__':
     unittest.main()

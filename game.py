@@ -57,6 +57,25 @@ UNIT_TYPES = tuple(UNIT_SPECS)
 MELEE_WALL_DAMAGE = 0.5
 RAM_SUPPORTED_CLASSES = ('melee', 'anti_cavalry')
 
+# City economy, enabled when the city starts with population. Yields follow
+# Civ VI: each citizen eats 2 food, the city center makes at least 2 food and
+# 1 production, grassland makes 2 food, and woods add 1 production. Mountains
+# cannot be worked. A newly founded city owns the six tiles around its center,
+# and a tile with an enemy unit on it cannot be worked.
+FOOD_PER_CITIZEN = 2
+CITY_CENTER_YIELD = (2, 1)  # (food, production)
+TILE_YIELDS = {'GRASSLAND': (2, 0), 'FOREST': (2, 1)}
+MAX_CITY_POPULATION = 20
+# The attacker loses this much reward when the city grows and gains it when
+# the city starves.
+POPULATION_REWARD = 1.0
+
+
+def growth_threshold(population):
+    """Food a city of this size needs to gain a citizen (Civ VI: 15 + 8n + n^1.5)."""
+    n = population - 1
+    return math.floor(15 + 8 * n + n ** 1.5)
+
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -73,6 +92,12 @@ class GameConfig:
     unit_strengths: tuple = ()
     unit_types: tuple = ()
     difficulty: str = 'normal'
+    city_population: int = 0
+
+    @property
+    def city_growth(self):
+        """Population, worked tiles and growth are simulated only for a populated city."""
+        return self.city_population > 0
 
     def __post_init__(self):
         for name in ('width', 'height'):
@@ -104,6 +129,9 @@ class GameConfig:
             raise ValueError('unit_types must include at least one unit that can attack')
         if self.difficulty not in ('easy', 'normal', 'hard', 'curriculum'):
             raise ValueError('Unknown difficulty')
+        if (isinstance(self.city_population, bool) or not isinstance(self.city_population, int)
+                or not 0 <= self.city_population <= MAX_CITY_POPULATION):
+            raise ValueError(f'city_population must be an integer between 0 and {MAX_CITY_POPULATION}')
         if self.city_position is not None:
             if len(self.city_position) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
                                                  for v in self.city_position):
@@ -179,13 +207,15 @@ class C_Unit(C_Sprite):
 class C_City(C_Sprite):
     def __init__(self, x, y, sprite=None, name_instance='City', hp=100,
                  hp_max=100, wall_hp=0, strength=28, strength_ranged=0,
-                 ranged_combat=False, heal=True, env=None):
+                 ranged_combat=False, heal=True, env=None, population=0):
         super().__init__(x, y, sprite, name_instance, hp, hp_max, strength, env)
         self.wall_hp = float(wall_hp)
         self.wall_hp_max = float(wall_hp)
         self.strength_ranged = float(strength_ranged)
         self.ranged_combat = ranged_combat
         self.heal = heal
+        self.population = int(population)
+        self.food = 0
 
     def take_turn(self):
         if self.env is not None and self.alive:
@@ -253,7 +283,8 @@ class Game:
         self.action_count = len(self.actions)
         self._action_index = {a: i for i, a in enumerate(self.actions)}
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
-                                   + ','.join(self.unit_types))
+                                   + ','.join(self.unit_types)
+                                   + (':city_growth' if self.config.city_growth else ''))
         self._renderer = None
         self.quit = False
         self.units = []
@@ -299,7 +330,8 @@ class Game:
                       for i, pos in enumerate(start_positions)]
         self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
                            wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
-                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self)
+                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
+                           population=c.city_population)
         self.turn_number = 0
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -428,6 +460,71 @@ class Game:
                     self.city.hp += healed
                     self.city.status = 'healed'
                     self.city._event('city_healed', amount=healed)
+        if self.config.city_growth:
+            self.grow_city()
+
+    def territory(self):
+        """Workable tiles the city owns: the six around its center, minus mountains."""
+        return [cell.index for cell in self.map.grid[self.city.position].get_neighbors(self.map.grid)
+                if cell.terrain_type in TILE_YIELDS]
+
+    def blocked_tiles(self):
+        """Territory tiles that cannot be worked because a unit stands on them."""
+        occupied = {u.position for u in self.units if u.alive}
+        return [pos for pos in self.territory() if pos in occupied]
+
+    def worked_tiles(self):
+        """Citizens work the free tiles with the most food, then production.
+
+        Citizens are reassigned whenever units move, so this is derived from the
+        current positions. Citizens with no free tile still eat.
+        """
+        if not self.config.city_growth:
+            return []
+        blocked = set(self.blocked_tiles())
+        free = [pos for pos in self.territory() if pos not in blocked]
+        free.sort(key=lambda pos: (tuple(-v for v in TILE_YIELDS[self.map.grid[pos].terrain_type]), pos[1], pos[0]))
+        return free[:self.city.population]
+
+    def city_yields(self):
+        """Return (food, production) from the city center and worked tiles."""
+        food, production = CITY_CENTER_YIELD
+        for pos in self.worked_tiles():
+            tile_food, tile_production = TILE_YIELDS[self.map.grid[pos].terrain_type]
+            food, production = food + tile_food, production + tile_production
+        return food, production
+
+    def food_surplus(self):
+        return self.city_yields()[0] - FOOD_PER_CITIZEN * self.city.population
+
+    def city_report(self):
+        """Population, stored food and tile use, or None when growth is off."""
+        if not self.config.city_growth:
+            return None
+        city = self.city
+        food, production = self.city_yields()
+        surplus = food - FOOD_PER_CITIZEN * city.population
+        threshold = growth_threshold(city.population)
+        return {'population': city.population, 'food': city.food, 'growth_threshold': threshold,
+                'food_yield': food, 'production_yield': production, 'food_surplus': surplus,
+                'turns_to_grow': math.ceil((threshold - city.food) / surplus) if surplus > 0 else None,
+                'worked_tiles': [list(pos) for pos in self.worked_tiles()],
+                'blocked_tiles': [list(pos) for pos in self.blocked_tiles()]}
+
+    def grow_city(self):
+        """Store this turn's surplus; grow at the threshold, or starve once food runs out."""
+        city = self.city
+        city.food += self.food_surplus()
+        threshold = growth_threshold(city.population)
+        if city.food >= threshold:
+            city.food -= threshold
+            city.population += 1
+            city._event('city_grew', population=city.population)
+        elif city.food < 0:
+            city.food = 0
+            if city.population > 1:
+                city.population -= 1
+                city._event('city_starved', population=city.population)
 
     def shoot(self, unit):
         if not unit.alive or not self.city.alive:
@@ -469,6 +566,10 @@ class Game:
                 reward -= .2
             elif kind == 'moved':
                 reward += .05 * event['progress'] - .01 * (event['cost'] - 1)
+            elif kind == 'city_grew':
+                reward -= POPULATION_REWARD
+            elif kind == 'city_starved':
+                reward += POPULATION_REWARD
         if self.last_info['outcome'] == 'win':
             reward += 10
         elif self.last_info['outcome'] == 'loss':
@@ -498,6 +599,8 @@ class Game:
         self._done = outcome != 'ongoing'
         self.last_info = {'outcome': outcome, 'events': [event.copy() for event in self.events],
                           'turn': self.turn_number}
+        if self.config.city_growth:
+            self.last_info['city'] = self.city_report()
         reward = self.get_rewards()
         return self.get_observation(), reward, self._done
 
@@ -515,6 +618,11 @@ class Game:
                            float(unit.y % 2), unit.strength_ranged / 100, unit.attack_range / 2])
         values.extend(TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
                       for y in range(c.height) for x in range(c.width))
+        if c.city_growth:
+            # Growth progress is coarse (quarters) to keep the tabular state space small.
+            progress = min(1.0, city.food / growth_threshold(city.population))
+            values.extend([city.population / MAX_CITY_POPULATION, math.floor(4 * progress) / 4,
+                           self.food_surplus() / 10])
         return np.asarray(values, dtype=float)
 
     def _distances(self):
@@ -566,8 +674,11 @@ class Game:
         return rng.choice([action for score, action in scores if score == best])
 
     def get_current_state(self):
-        return {obj.name_instance: {'health': obj.hp, 'position': [obj.x, obj.y],
-                                   'alive': obj.alive} for obj in self.objects}
+        state = {obj.name_instance: {'health': obj.hp, 'position': [obj.x, obj.y],
+                                    'alive': obj.alive} for obj in self.objects}
+        if self.config.city_growth:
+            state[self.city.name_instance].update(self.city_report())
+        return state
 
     def render_frame(self, delay_ms=0):
         if not self.render:

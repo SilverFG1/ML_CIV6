@@ -74,6 +74,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--wall-hp` | Set the city's initial wall health. |
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
 | `--no-city-healing` | Disable city healing. |
+| `--city-population N` | Start the city with N citizens (0–20) and simulate worked tiles and growth; 0 (the default) turns this off. |
 | `--curriculum-episodes N` | Progress from easier scenarios to the selected difficulty over N training episodes. |
 
 Each unit type has default strengths; `--unit-strengths` overrides the melee value only (for a battering ram, its defense).
@@ -104,6 +105,30 @@ For a walled siege with a battering ram:
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman battering_ram --wall-hp 50 --model-path runs/siege/model.json --metrics-dir runs/siege --fresh
 ```
+
+## City population and growth
+
+`--city-population N` gives the defending city N citizens. Each turn the city collects food, grows, or starves, using Civ VI yields:
+
+| Source | Food | Production |
+| --- | --- | --- |
+| City center (always worked) | 2 | 1 |
+| Grassland | 2 | 0 |
+| Forest (grassland woods) | 2 | 1 |
+| Mountain | cannot be worked | |
+
+- **Worked tiles.** The city owns the six tiles around its center, like a newly founded Civ VI city. Each citizen works one free tile, choosing the most food, then the most production. A tile with a unit on it cannot be worked, and citizens are reassigned whenever units move. A citizen with no free tile still eats.
+- **Growth.** Each citizen eats 2 food. The surplus is stored, and the city gains a citizen when the store reaches the Civ VI threshold of 15 + 8n + n^1.5 food, where n is the population minus one (15, 24, 33, 44, …). Leftover food carries over.
+- **Starvation.** If the city's food store would drop below zero, it empties and the city loses a citizen (never going below one).
+- **Reward.** The attacker loses 1 reward each time the city grows and gains 1 each time it starves. Units standing next to the city therefore blockade it as well as besiege it.
+
+Housing, amenities, and territory expansion are not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), and food surplus, and the observation schema ends with `:city_growth`, so turning growth on for an existing model requires `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
+
+```powershell
+python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-path runs/growth/model.json --metrics-dir runs/growth --fresh
+```
+
+During playback, the city's territory is outlined, gold dots mark worked tiles, red dots mark tiles a unit is blocking, and the status bar shows population, stored food against the growth threshold, and the food surplus.
 
 ## Metrics and playback
 

@@ -319,5 +319,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(run_game.episode_config(single, 0).city_strength, 38)
 
 
+    def test_city_population_trains_resumes_and_reports_final_size(self):
+        args = self.args('--city-population', '2')
+        agent = self.make_agent(args)
+        self.assertTrue(agent.observation_schema.endswith(':city_growth'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        resumed = self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.city_population, 2)
+        with self.assertRaisesRegex(ValueError, 'city-population'):
+            self.make_agent(self.args('--city-population', '3'))
+        evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
+        for summary in evaluations.values():
+            self.assertGreaterEqual(summary['average_city_population'], 1)
+            self.assertTrue(all(row['city_population'] >= 1 for row in summary['episodes_detail']))
+        plain_args = self.args('--fresh')
+        plain = self.make_agent(plain_args)
+        summary = run_game.compare_policies(plain, plain_args, policies=['heuristic'], verbose=False)['heuristic']
+        self.assertNotIn('average_city_population', summary)
+        with self.assertRaisesRegex(ValueError, 'city_population'):
+            self.make_agent(self.args('--fresh', '--city-population', '21'))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -85,6 +85,11 @@ class Renderer:
                 p.draw.polygon(self.surface, (165, 175, 185),
                                [(x + s * .2, y + s * .7), (x + s * .5, y + s * .2),
                                 (x + s * .8, y + s * .7)])
+        report = self.env.city_report()
+        show_tiles = report is not None and self.env.city.alive
+        if show_tiles:
+            for pos in self.env.territory():
+                p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 2)
         for obj in self.env.objects:
             x, y = self._position(obj.position)
             if obj.alive:
@@ -100,14 +105,27 @@ class Renderer:
                 p.draw.line(self.surface, constants.COLOR_RED, (x + 2 * s / 3, y + s / 3),
                             (x + s / 3, y + 2 * s / 3), 3)
             self._text(f'{obj.name_instance} {obj.hp:.0f}', (x + 2, y + self.size * .7), small=True)
+        if show_tiles:
+            # Drawn over units: gold marks a worked tile, red a tile a unit is blocking.
+            for positions, color in ((report['worked_tiles'], (240, 200, 80)),
+                                     (report['blocked_tiles'], constants.COLOR_RED)):
+                for pos in positions:
+                    x, y = self._position(pos)
+                    center = (int(x + self.size * .82), int(y + self.size * .3))
+                    p.draw.circle(self.surface, color, center, max(3, self.size // 14))
+                    p.draw.circle(self.surface, (30, 30, 30), center, max(3, self.size // 14), 1)
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
         y = self.surface.get_height() - 109
         city = self.env.city
         outcome = self.env.last_info['outcome']
-        self._text(f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
-                   f'Walls {city.wall_hp:.0f}   {outcome.upper()}', (self.margin, y))
+        status = (f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   '
+                  f'Walls {city.wall_hp:.0f}   ')
+        if report is not None:
+            status += (f'Pop {report["population"]}   Food {report["food"]}/{report["growth_threshold"]} '
+                       f'({report["food_surplus"]:+d})   ')
+        self._text(status + outcome.upper(), (self.margin, y))
         if self.env.human:
             controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
         else:

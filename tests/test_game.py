@@ -10,7 +10,7 @@ import numpy as np
 
 import constants
 from class_hex import HexMap
-from game import C_Unit, Game, GameConfig, attack, hex_distance
+from game import C_Unit, Game, GameConfig, attack, growth_threshold, hex_distance
 
 
 class GameTests(unittest.TestCase):
@@ -406,6 +406,108 @@ class GameTests(unittest.TestCase):
         env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_heals=False)
         self.place(env, [(0, 0), (5, 4)])
         self.assertEqual(env.actions[env.guided_action(random.Random(1))][1], 'SPACE')
+
+
+    # City population, worked tiles and growth.
+    def place_far(self, env):
+        self.place(env, [(0, 0), (2, 0), (0, 2), (2, 2)])
+
+    def test_city_growth_is_off_by_default(self):
+        env = self.make_env()
+        self.assertEqual(env.city.population, 0)
+        self.assertIsNone(env.city_report())
+        self.assertEqual(env.worked_tiles(), [])
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior')
+        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64)
+        for _ in range(20):
+            env.step(self.wait(env))
+        self.assertEqual(env.city.population, 0)
+        self.assertNotIn('city', env.last_info)
+        self.assertEqual(set(env.get_current_state()['Ottertopia']), {'health', 'position', 'alive'})
+
+    def test_growth_threshold_follows_civ6(self):
+        self.assertEqual([growth_threshold(p) for p in range(1, 7)], [15, 24, 33, 44, 55, 66])
+
+    def test_unblocked_city_grows_and_penalizes_the_attacker(self):
+        env = self.make_env(city_population=1)
+        self.place_far(env)
+        report = env.city_report()
+        self.assertEqual((report['food_yield'], report['production_yield'], report['food_surplus'],
+                          report['turns_to_grow'], report['blocked_tiles']), (4, 1, 2, 8, []))
+        rewards = [env.step(self.wait(env))[1] for _ in range(8)]
+        for reward in rewards[:-1]:
+            self.assertAlmostEqual(reward, -0.05)
+        self.assertAlmostEqual(rewards[-1], -1.05)
+        self.assertIn({'type': 'city_grew', 'object': 'Ottertopia', 'population': 2}, env.events)
+        self.assertEqual((env.city.population, env.city.food), (2, 1))  # 16 stored, 15 spent
+        self.assertEqual(env.last_info['city']['population'], 2)
+        self.assertEqual(len(env.worked_tiles()), 2)
+        state = env.get_current_state()['Ottertopia']
+        self.assertEqual((state['population'], state['growth_threshold']), (2, 24))
+
+    def test_citizens_prefer_woods_skip_mountains_and_avoid_occupied_tiles(self):
+        env = self.make_env(city_population=3)
+        grid = env.map.grid
+        grid[(4, 3)].set_terrain('MOUNTAIN')
+        grid[(3, 5)].set_terrain('FOREST')
+        grid[(5, 4)].set_terrain('FOREST')
+        self.place(env, [(5, 4), (0, 0), (2, 0)])
+        self.assertEqual(sorted(env.territory()), [(3, 3), (3, 4), (3, 5), (4, 5), (5, 4)])
+        self.assertEqual(env.blocked_tiles(), [(5, 4)])
+        self.assertEqual(env.worked_tiles(), [(3, 5), (3, 3), (3, 4)])
+        self.assertEqual(env.city_yields(), (8, 2))
+        env.units[0].death_unit()
+        self.assertEqual(env.blocked_tiles(), [])
+        self.assertEqual(env.worked_tiles()[:2], [(5, 4), (3, 5)])
+
+    def test_blockade_starves_city_to_a_sustainable_size(self):
+        env = self.make_env(city_population=7)
+        self.place(env, [(3, 4), (5, 4), (4, 3)])
+        self.assertEqual(env.city_report()['food_surplus'], -6)
+        self.assertIsNone(env.city_report()['turns_to_grow'])
+        _, reward, _ = env.step(self.wait(env))
+        self.assertAlmostEqual(reward, 0.95)
+        self.assertIn({'type': 'city_starved', 'object': 'Ottertopia', 'population': 6}, env.events)
+        for _ in range(10):
+            env.step(self.wait(env))
+        # Three free tiles feed four citizens exactly: 2 + 3 * 2 food for 4 * 2 eaten.
+        self.assertEqual((env.city.population, env.city.food, env.food_surplus()), (4, 0, 0))
+
+    def test_starving_city_keeps_one_citizen(self):
+        env = self.make_env(city_population=2)
+        self.place_far(env)
+        for pos in env.territory():
+            env.map.grid[pos].set_terrain('MOUNTAIN')
+        env.step(self.wait(env))
+        self.assertEqual(env.city.population, 1)
+        for _ in range(5):
+            _, reward, _ = env.step(self.wait(env))
+            self.assertAlmostEqual(reward, -0.05)
+        self.assertEqual((env.city.population, env.city.food), (1, 0))
+
+    def test_captured_city_stops_growing(self):
+        env = self.make_env(city_population=1)
+        self.place(env, [(3, 4), (0, 0), (2, 0)])
+        env.city.hp, env.city.food = 1, 14
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(env.encode_action(['E', 'SPACE', 'SPACE']))
+        self.assertEqual(env.last_info['outcome'], 'win')
+        self.assertEqual((env.city.population, env.city.food), (1, 14))
+
+    def test_growth_observation_and_schema(self):
+        env = self.make_env(city_population=2)
+        base = self.make_env()
+        self.assertEqual(env.observation_schema, base.observation_schema + ':city_growth')
+        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 3)
+        self.place_far(env)
+        np.testing.assert_allclose(env.get_observation()[-3:], [2 / 20, 0, 0.2])
+        env.city.food = 13  # just over half of 24, reported in quarters
+        self.assertEqual(env.get_observation()[-2], 0.5)
+
+    def test_invalid_city_population_rejected(self):
+        for value in (-1, 21, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                GameConfig(city_population=value)
 
 
 if __name__ == '__main__':

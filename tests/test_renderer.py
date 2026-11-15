@@ -111,5 +111,24 @@ class RendererTests(unittest.TestCase):
         self.assertGreater(env._renderer.panel, 118)  # room for the buildings and production line
 
 
+    def test_status_bar_uses_icons_for_city_systems(self):
+        env = Game(render=True, config=GameConfig(
+            unit_count=1, city_population=4, city_war_weariness=500, city_governor='pingala',
+            city_pantheon='fertility_rites', city_faith=3, city_districts=('campus',), city_buildings=('library',),
+            city_build_queue=('granary',), city_builders=1))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        self.assertTrue(env.render_frame())
+        used = {icon for icon, _, _ in env._renderer._status_chips()}
+        self.assertLessEqual({'turn', 'city_hp', 'walls', 'population', 'food', 'housing', 'mood_displeased',
+                              'loyalty', 'war_weariness', 'science', 'faith', 'governor', 'production',
+                              'captured', 'settlement', 'building_library'}, used)
+        plain = Game(render=True, config=GameConfig(unit_count=1))
+        plain.reset(seed=7)
+        self.addCleanup(plain.close)
+        self.assertTrue(plain.render_frame())
+        self.assertGreater(env._renderer.panel, plain._renderer.panel)
+
+
 if __name__ == '__main__':
     unittest.main()

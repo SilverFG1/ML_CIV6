@@ -1212,9 +1212,8 @@ class Game:
                 'loyalty': self.loyalty, 'loyalty_per_turn': self.loyalty_per_turn(),
                 'loyalty_sources': self.loyalty_sources(),
                 **(self.governor_report() if self.config.city_governor else {}),
-                **({'faith': self.faith, 'faith_per_turn': self.city_output()['faith'],
-                    'pantheon': self.config.city_pantheon, 'pantheon_founded': self.pantheon_founded}
-                   if self.config.city_pantheon else {}),
+                **({'faith_stored': self.faith, 'pantheon': self.config.city_pantheon,
+                    'pantheon_founded': self.pantheon_founded} if self.config.city_pantheon else {}),
                 'growth_surplus': stored,
                 'turns_to_grow': math.ceil((threshold - city.food) / stored) if stored > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],

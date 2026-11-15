@@ -3,20 +3,19 @@
 import time
 
 import constants
+from icons import IconSet
 
-# Warriors share the plain unit sprite; other types get a short coloured label.
+# District tiles are outlined in their badge color and labeled under the icon.
 DISTRICT_STYLES = {
-    'campus': ('CAMPUS', (95, 150, 230)),
-    'holy_site': ('HOLY SITE', (240, 225, 150)),
-    'encampment': ('ENCAMP', (225, 95, 80)),
+    'campus': ('CAMPUS', (96, 158, 232)),
+    'holy_site': ('HOLY SITE', (228, 168, 58)),
+    'encampment': ('ENCAMP', (214, 66, 66)),
 }
-UNIT_LABELS = {
-    'spearman': ('SPEARMAN', (170, 215, 255)),
-    'heavy_chariot': ('CHARIOT', (235, 160, 235)),
-    'slinger': ('SLINGER', (255, 190, 130)),
-    'archer': ('ARCHER', (255, 235, 140)),
-    'battering_ram': ('RAM', (200, 200, 200)),
-}
+OUTCOME_COLORS = {'win': (140, 220, 120), 'loss': (240, 110, 100), 'free_city': (200, 170, 235),
+                  'timeout': (235, 235, 235), 'ongoing': (190, 196, 204)}
+STATUS_LINE = 24  # height of one status-bar row
+STATUS_ICON = 18
+STATUS_GAP = 16
 
 
 class Renderer:
@@ -32,19 +31,19 @@ class Renderer:
         self.size = max(20, min(96, int(1180 / (env.config.width + .5)),
                                int(720 / (env.config.height * .75 + .25))))
         self.margin = 24
-        width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
-        # A longer status line (buildings and production) wraps onto extra rows.
-        self.panel = 118 + (44 if env.config.builds else 0)
-        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + self.panel
-        self.surface = pygame.display.set_mode((width, height))
-        pygame.display.set_caption('ML_CIV6 — training and evaluation')
-        self.font = pygame.font.SysFont('Segoe UI', 16)
-        self.small_font = pygame.font.SysFont('Segoe UI', max(11, min(16, self.size // 5)))
-        self.clock = pygame.time.Clock()
         self.paused = False
         self.delay_ms = None
         self._open = True
         self.selected_unit = 0
+        self.font = pygame.font.SysFont('Segoe UI', 16)
+        self.small_font = pygame.font.SysFont('Segoe UI', max(11, min(16, self.size // 5)))
+        self.icons = IconSet(pygame)
+        width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
+        self.panel = self._panel_height(width - 2 * self.margin)
+        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + self.panel
+        self.surface = pygame.display.set_mode((width, height))
+        pygame.display.set_caption('ML_CIV6 — training and evaluation')
+        self.clock = pygame.time.Clock()
         self.images = {}
         for name, path in [('unit', 'data/Otter_Warrior.png'), ('city', 'data/Ottertopia.png')]:
             loaded = pygame.image.load(constants.resource_path(path)).convert_alpha()
@@ -65,14 +64,92 @@ class Renderer:
         font = self.small_font if small else self.font
         self.surface.blit(font.render(text, True, color), pos)
 
-    def _wrapped_text(self, text, pos):
+    def _icon(self, name, pos, size):
+        self.surface.blit(self.icons.get(name, size), (int(pos[0]), int(pos[1])))
+
+    def _controls(self):
+        if self.env.human:
+            return 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
+        return f'Space: pause   Right: one turn   +/-: speed   Esc: quit   Delay {self.delay_ms or 0}ms'
+
+    def _wrap(self, text, width):
+        """Split text into lines no wider than width."""
         lines = ['']
         for word in text.split():
             proposed = (lines[-1] + ' ' + word).strip()
-            if lines[-1] and self.font.size(proposed)[0] > self.surface.get_width() - 2 * self.margin:
+            if lines[-1] and self.font.size(proposed)[0] > width:
                 lines.append(word)
             else:
                 lines[-1] = proposed
+        return lines
+
+    def _status_chips(self):
+        """Status-bar entries as (icon name or None, text, color)."""
+        env, city = self.env, self.env.city
+        report = env.city_report()
+        light = (235, 235, 235)
+        outcome = env.last_info['outcome']
+        chips = [('turn', f'Turn {env.turn_number}', light),
+                 (None, outcome.upper(), OUTCOME_COLORS.get(outcome, light)),
+                 ('city_hp', f'City {city.hp:.0f}/{city.hp_max:.0f}', light),
+                 ('walls', f'Walls {city.wall_hp:.0f}', light)]
+        if report is not None:
+            chips += [('population', f'Pop {report["population"]}', light),
+                      ('food', f'{report["food"]:g}/{report["growth_threshold"]} ({report["growth_surplus"]:+g})', light),
+                      ('housing', f'Housing {report["housing"]:g}', light),
+                      (f'mood_{report["mood"]}',
+                       f'Amenities {report["amenities"]}/{report["amenities_needed"]} {report["mood"]}', light),
+                      ('loyalty', f'Loyalty {report["loyalty"]:g} ({report["loyalty_per_turn"]:+g})', light)]
+            if report['war_weariness']:
+                chips.append(('war_weariness', f'War weariness {report["war_weariness"]}', light))
+            for kind in ('culture', 'science'):
+                if report[kind]:
+                    chips.append((kind, f'{kind.capitalize()} +{report[kind]:g}', light))
+            if 'pantheon' in report:
+                belief = report['pantheon'].replace('_', ' ')
+                chips.append(('pantheon', belief.capitalize(), light) if report['pantheon_founded'] else
+                             ('faith', f'{report["faith_stored"]:g}/25 (+{report["faith"]:g}) toward {belief}', light))
+            elif report['faith']:
+                chips.append(('faith', f'Faith +{report["faith"]:g}', light))
+            if 'governor' in report:
+                text = report['governor'].capitalize()
+                if report['governor_promotion']:
+                    text += f' ({report["governor_promotion"].replace("_", " ")})'
+                if not report['governor_established']:
+                    turns = report['turns_to_establish']
+                    text += f', establishing: {turns} turn{"" if turns == 1 else "s"}'
+                chips.append(('governor', text, light))
+            if report.get('producing'):
+                chips.append(('production', f'Producing {report["producing"].replace("_", " ")} '
+                                            f'{report["production_progress"]:g}/{report["production_cost"]} '
+                                            f'(+{report["production_yield"]:g})', light))
+        civilians = env.civilian_report()
+        if civilians is not None:
+            chips += [('captured', f'Captured {civilians["captured"]}', light),
+                      ('settlement', f'Founded {len(civilians["founded_cities"])}', light)]
+        chips += [(f'building_{name}', name.replace('_', ' ').capitalize(), light) for name in env.buildings]
+        return chips
+
+    def _layout(self, chips, width):
+        """Place chips left to right, wrapping at width; returns [(row, x, chip)] and the row count."""
+        placed, row, x = [], 0, 0
+        for chip in chips:
+            icon, text, _ = chip
+            chip_width = self.font.size(text)[0] + (STATUS_ICON + 4 if icon else 0)
+            if x and x + chip_width > width:
+                row, x = row + 1, 0
+            placed.append((row, x, chip))
+            x += chip_width + STATUS_GAP
+        return placed, row + 1
+
+    def _panel_height(self, width):
+        """Room for today's status bar plus a spare row, as values and buildings grow."""
+        _, rows = self._layout(self._status_chips(), width)
+        rows += 1 + bool(self.env.config.builds)
+        return 10 + STATUS_LINE * rows + 6 + 22 * len(self._wrap(self._controls(), width)) + 22 + 8
+
+    def _wrapped_text(self, text, pos):
+        lines = self._wrap(text, self.surface.get_width() - 2 * self.margin)
         for index, line in enumerate(lines):
             self._text(line, (pos[0], pos[1] + 22 * index))
         return len(lines)
@@ -94,21 +171,19 @@ class Renderer:
                                 (x + s * .8, y + s * .7)])
         s = self.size
         for pos in self.env.farms:
-            # Furrows mark a farm.
             x, y = self._position(pos)
-            for offset in (.62, .7, .78):
-                p.draw.line(self.surface, (214, 186, 92), (x + s * .3, y + s * offset), (x + s * .7, y + s * offset), 2)
+            self._icon('farm', (x + s * .31, y + s * .42), s * .38)
         for pos in self.env.founded_cities:
             x, y = self._position(pos)
             p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 3)
-            p.draw.rect(self.surface, constants.COLOR_PURPLE, (x + s * .35, y + s * .4, s * .3, s * .25))
-            self._text('NEW CITY', (x + 2, y + s * .7), (235, 220, 255), small=True)
+            self._icon('settlement', (x + s * .27, y + s * .14), s * .46)
+            self._text('NEW CITY', (x + 2, y + s * .66), (235, 220, 255), small=True)
         for district, pos in self.env.districts.items():
             label, color = DISTRICT_STYLES[district]
             x, y = self._position(pos)
             p.draw.polygon(self.surface, color, self._polygon(pos), 4)
-            p.draw.rect(self.surface, color, (x + s * .38, y + s * .3, s * .24, s * .24), 0 if district == 'encampment' else 2)
-            self._text(label, (x + 4, y + s * .58), color, small=True)
+            self._icon(f'district_{district}', (x + s * .29, y + s * .1), s * .42)
+            self._text(label, (x + 4, y + s * .56), color, small=True)
         report = self.env.city_report()
         show_tiles = report is not None and self.env.city.alive
         if show_tiles:
@@ -118,12 +193,7 @@ class Renderer:
             if not civilian.alive:
                 continue
             x, y = self._position(civilian.position)
-            center = (int(x + s / 2), int(y + s * .45))
-            p.draw.circle(self.surface, constants.COLOR_PURPLE, center, max(6, int(s * .22)))
-            p.draw.circle(self.surface, (40, 30, 50), center, max(6, int(s * .22)), 2)
-            letter = 'B' if civilian.kind == 'builder' else 'S'
-            glyph = self.font.render(letter, True, (40, 30, 50))
-            self.surface.blit(glyph, glyph.get_rect(center=center))
+            self._icon(f'civilian_{civilian.kind}', (x + s * .26, y + s * .16), s * .48)
             charges = f' ({civilian.charges})' if civilian.kind == 'builder' else ''
             self._text(civilian.name_instance + charges, (x + 2, y + s * .7), small=True)
         for obj in self.env.objects:
@@ -131,9 +201,11 @@ class Renderer:
             if obj.alive:
                 image = self.images['city' if obj is self.env.city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
-                label = UNIT_LABELS.get(getattr(obj, 'unit_type', None))
-                if label is not None:
-                    self._text(label[0], (x + 2, y + 2), label[1], small=True)
+                if obj is self.env.city:
+                    if obj.wall_hp > 0:
+                        self._icon('walls', (x + s * .64, y + s * .1), s * .3)
+                else:
+                    self._icon(f'unit_{obj.unit_type}', (x + s * .04, y + s * .18), s * .3)
             else:
                 s = self.size
                 p.draw.line(self.surface, constants.COLOR_RED, (x + s / 3, y + s / 3),
@@ -153,54 +225,18 @@ class Renderer:
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
-        y = self.surface.get_height() - self.panel + 9
-        city = self.env.city
-        outcome = self.env.last_info['outcome']
-        status = [f'Turn {self.env.turn_number}', f'City {city.hp:.0f}/{city.hp_max:.0f}',
-                  f'Walls {city.wall_hp:.0f}']
-        if report is not None:
-            status += [f'Pop {report["population"]} (housing {report["housing"]:g})',
-                       f'Amenities {report["amenities"]}/{report["amenities_needed"]} {report["mood"]}',
-                       *([f'War weariness {report["war_weariness"]}'] if report['war_weariness'] else []),
-                       f'Loyalty {report["loyalty"]:g} ({report["loyalty_per_turn"]:+g})',
-                       *([f'Governor {report["governor"].capitalize()}'
-                          + (f' ({report["governor_promotion"].replace("_", " ")})' if report['governor_promotion'] else '')
-                          + ('' if report['governor_established']
-                             else f', establishing: {report["turns_to_establish"]} turn'
-                                  + ('' if report['turns_to_establish'] == 1 else 's'))]
-                         if 'governor' in report else []),
-                       *([f'Pantheon: {report["pantheon"].replace("_", " ")}' if report['pantheon_founded']
-                          else f'Faith {report["faith"]:g}/25 (+{report["faith_per_turn"]:g}) '
-                               f'for {report["pantheon"].replace("_", " ")}']
-                         if 'pantheon' in report else []),
-                       f'Food {report["food"]:g}/{report["growth_threshold"]} ({report["growth_surplus"]:+g})']
-        civilians = self.env.civilian_report()
-        if civilians is not None:
-            status += [f'Captured {civilians["captured"]}', f'Founded {len(civilians["founded_cities"])}']
-        status.append(outcome.upper())
-        if self.env.buildings:
-            status.append('Built: ' + ', '.join(name.replace('_', ' ') for name in self.env.buildings))
-        if report is not None and report.get('producing'):
-            status.append(f'Producing {report["producing"].replace("_", " ")} '
-                          f'{report["production_progress"]:g}/{report["production_cost"]} '
-                          f'(+{report["production_yield"]:g})')
-        lines = ['']
-        for part in status:
-            proposed = (lines[-1] + '   ' + part).strip()
-            if lines[-1] and self.font.size(proposed)[0] > self.surface.get_width() - 2 * self.margin:
-                lines.append(part)
-            else:
-                lines[-1] = proposed
-        for index, line in enumerate(lines):
-            self._text(line, (self.margin, y + 22 * index))
-        y += 22 * (len(lines) - 1)
-        if self.env.human:
-            controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
-        else:
-            controls = f'Space: pause   Right: one turn   +/-: speed   Esc: quit   Delay {self.delay_ms or 0}ms'
-        control_lines = self._wrapped_text(controls, (self.margin, y + 27))
+        top = self.surface.get_height() - self.panel + 10
+        placed, rows = self._layout(self._status_chips(), self.surface.get_width() - 2 * self.margin)
+        for row, x, (icon, text, color) in placed:
+            x, y = self.margin + x, top + row * STATUS_LINE
+            if icon:
+                self._icon(icon, (x, y + 1), STATUS_ICON)
+                x += STATUS_ICON + 4
+            self._text(text, (x, y), color)
+        y = top + rows * STATUS_LINE + 6
+        control_lines = self._wrapped_text(self._controls(), (self.margin, y))
         if self.paused:
-            self._text('PAUSED', (self.margin, y + 31 + 22 * control_lines), (255, 220, 100))
+            self._text('PAUSED', (self.margin, y + 22 * control_lines), (255, 220, 100))
         p.display.flip()
 
     def _events(self):

@@ -191,7 +191,7 @@ The observation adds each civilian's position, whether it is still in play, and 
 python run_game.py --episodes 300 --unit-count 3 --city-population 2 --city-builders 1 --city-settlers 1 --model-path runs/civilians/model.json --metrics-dir runs/civilians --fresh
 ```
 
-During playback, civilians are purple discs marked B or S (with a builder's remaining charges beside its name), farms show yellow furrows, founded cities are outlined in purple, and the status bar counts captured civilians and founded cities.
+During playback, builders and settlers appear as purple badges with a pickaxe or a covered wagon (with a builder's remaining charges beside its name), farms show a small wheat field, founded cities are outlined in purple with a tent, and the status bar counts captured civilians and founded cities.
 
 ## Districts and buildings (ancient era)
 
@@ -226,7 +226,7 @@ The observation adds a built flag for each listed district and building, plus th
 python run_game.py --episodes 300 --unit-count 3 --unit-types warrior spearman battering_ram --city-population 4 --forest-density 0.3 --city-districts campus --city-buildings monument library --build-queue ancient_walls encampment barracks --model-path runs/districts/model.json --metrics-dir runs/districts --fresh
 ```
 
-During playback, districts are outlined in their own color (blue campus, gold holy site, red encampment), and the status bar lists completed buildings and the item in production with its progress.
+During playback, each district is outlined in its own color with a badge: an open book for the campus, a star for the holy site, and a shield for the encampment. A city with walls shows a wall badge. The status bar shows an icon and name for each completed building, and the item in production with its progress.
 
 ## Religion (pantheons)
 
@@ -243,7 +243,7 @@ Without a holy site, shrine or starting faith, the pantheon is never founded. A 
 python run_game.py --episodes 300 --unit-count 3 --city-population 3 --city-luxuries 1 --city-districts holy_site --city-buildings shrine --pantheon fertility_rites --model-path runs/pantheon/model.json --metrics-dir runs/pantheon --fresh
 ```
 
-During playback, the status bar shows the stored faith toward the pantheon, then the founded belief.
+During playback, the status bar shows the stored faith toward the pantheon (a flame), then the founded belief (a sun).
 
 ## Metrics and playback
 
@@ -262,6 +262,8 @@ python run_game.py --episodes 0 --eval-episodes 3 --eval-policies learned --mode
 ```
 
 During playback, **Space** pauses/resumes, **Right Arrow** advances one turn while paused, **+ / -** change playback speed, and **Esc** exits. `--render-training` also displays training turns.
+
+The display draws its own icons in code (`icons.py`), using no image files besides the otter sprites. Each unit carries a badge for its type: a sword for the warrior, a spear, a chariot wheel, a slinger's whirling stone, a drawn bow, and a ram. Each status-bar entry has an icon: an hourglass for the turn, a heart for the city's health, a wall, a citizen, wheat for food, a house for housing, and a face that changes with the city's mood. The bar also has a banner for loyalty, a broken sword for war weariness, a scroll for culture, a flask for science, a flame for faith, a seal for the governor, a sun for the pantheon, and a hammer for production. The status bar wraps to fit the window, which is sized for the systems the scenario uses.
 
 Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer or slinger, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
 

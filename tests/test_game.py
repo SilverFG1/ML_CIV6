@@ -1131,8 +1131,9 @@ class GameTests(unittest.TestCase):
         env.step(self.wait(env))
         self.assertEqual(env.faith, 7)  # faith keeps accumulating, with nothing left to spend it on
         report = env.city_report()
-        self.assertEqual((report['pantheon'], report['pantheon_founded'], report['faith_per_turn']),
-                         ('city_patron_goddess', True, 4))
+        # 'faith' is always the faith made per turn; 'faith_stored' is the pantheon's store.
+        self.assertEqual((report['pantheon'], report['pantheon_founded'], report['faith'], report['faith_stored']),
+                         ('city_patron_goddess', True, 4, 7))
 
     def test_starting_faith_and_no_faith(self):
         env = self.make_env(city_population=1, city_pantheon='fertility_rites', city_faith=30)

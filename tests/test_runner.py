@@ -346,6 +346,16 @@ class RunnerTests(unittest.TestCase):
             self.make_agent(self.args('--city-governor', 'victor'))
         with self.assertRaisesRegex(ValueError, '--governor-promotion differs'):
             self.make_agent(self.args('--governor-promotion', 'defense_logistics'))
+        with self.assertRaisesRegex(ValueError, '--pantheon differs'):
+            self.make_agent(self.args('--pantheon', 'fertility_rites'))
+        devout = self.args('--fresh', '--no-save', '--city-population', '3', '--pantheon', 'fertility_rites',
+                           '--city-faith', '30')
+        self.make_agent(devout)
+        self.assertEqual((devout.config.city_pantheon, devout.config.city_faith), ('fertility_rites', 30))
+        summary = run_game.compare_policies(self.make_agent(devout), devout, policies=['heuristic'],
+                                            verbose=False)['heuristic']
+        self.assertEqual(summary['episodes'], 2)
+        self.assertTrue(all(row['outcome'] in ('win', 'loss', 'timeout') for row in summary['episodes_detail']))
         governed = self.args('--fresh', '--no-save', '--city-population', '3', '--city-governor', 'victor',
                              '--governor-promotion', 'defense_logistics')
         self.make_agent(governed)

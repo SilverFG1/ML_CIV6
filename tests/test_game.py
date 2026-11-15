@@ -1095,5 +1095,100 @@ class GameTests(unittest.TestCase):
                 GameConfig(**kwargs)
 
 
+    # Religion: faith and pantheons.
+    def holy_city(self, **kwargs):
+        """A city whose holy site (mountain +1, two woods +1) and shrine (+2) make 4 faith a turn."""
+        env = self.make_env(city_population=3, city_luxuries=1, city_build_queue=('holy_site', 'shrine'), **kwargs)
+        self.place_far(env)
+        for pos in [(5, 2), (4, 2)]:
+            env.map.grid[pos].set_terrain('MOUNTAIN')
+        for pos in [(2, 3), (3, 2)]:
+            env.map.grid[pos].set_terrain('FOREST')
+        env.complete_build('holy_site')
+        env.complete_build('shrine')
+        env.events.clear()
+        return env
+
+    def test_no_religion_by_default(self):
+        env = self.make_env(city_population=2)
+        env.step(self.wait(env))
+        self.assertEqual((env.faith, env.pantheon_founded), (0, False))
+        self.assertNotIn('pantheon', env.city_report())
+        self.assertNotIn('pantheon', env.observation_schema)
+
+    def test_faith_founds_the_pantheon_at_25(self):
+        env = self.holy_city(city_pantheon='city_patron_goddess')
+        self.assertEqual(env.city_output()['faith'], 4)
+        for _ in range(6):
+            env.step(self.wait(env))
+        self.assertEqual((env.faith, env.pantheon_founded), (24, False))
+        rewards = [env.step(self.wait(env))[1]]
+        self.assertTrue(env.pantheon_founded)
+        self.assertIn({'type': 'pantheon_founded', 'object': 'Ottertopia', 'belief': 'city_patron_goddess'},
+                      env.events)
+        self.assertAlmostEqual(rewards[-1], -1.05)
+        self.assertEqual(env.faith, 3)  # 28 stored, 25 spent
+        env.step(self.wait(env))
+        self.assertEqual(env.faith, 7)  # faith keeps accumulating, with nothing left to spend it on
+        report = env.city_report()
+        self.assertEqual((report['pantheon'], report['pantheon_founded'], report['faith_per_turn']),
+                         ('city_patron_goddess', True, 4))
+
+    def test_starting_faith_and_no_faith(self):
+        env = self.make_env(city_population=1, city_pantheon='fertility_rites', city_faith=30)
+        self.place_far(env)
+        env.step(self.wait(env))
+        self.assertTrue(env.pantheon_founded)
+        self.assertEqual(env.faith, 5)
+        barren = self.make_env(city_population=1, city_pantheon='fertility_rites')
+        for _ in range(20):
+            barren.step(self.wait(barren))
+        self.assertFalse(barren.pantheon_founded)
+
+    def test_fertility_rites_grows_the_city_and_trains_a_builder(self):
+        env = self.make_env(city_population=1, city_pantheon='fertility_rites', city_faith=24)
+        self.place_far(env)
+        builder = env.civilians[-1]
+        self.assertEqual((builder.alive, builder.status), (False, 'not yet trained'))
+        self.assertIsNone(env.civilian_at(builder.position))
+        self.assertEqual(env.growth_surplus(), 2)
+        env.faith = 25
+        env.step(self.wait(env))
+        self.assertTrue(builder.alive)
+        self.assertEqual(hex_distance(builder.position, env.city.position), 1)
+        self.assertIn('builder_trained', [e['type'] for e in env.events])
+        self.assertAlmostEqual(env.growth_surplus(), 2.2)
+        self.assertEqual(len(env.get_observation()),
+                         len(self.make_env(city_population=1).get_observation()) + 4 + 1)
+
+    def test_city_patron_goddess_speeds_the_first_district(self):
+        for governor, rate in [('', 1.25), ('liang', 1.45)]:
+            with self.subTest(governor=governor):
+                env = self.make_env(city_population=4, city_luxuries=1, city_pantheon='city_patron_goddess',
+                                    city_governor=governor,
+                                    city_governor_promotion='zoning_commissioner' if governor else '',
+                                    city_build_queue=('campus', 'holy_site'))
+                self.place_far(env)
+                env.governor_turns, env.pantheon_founded = 5, True
+                env.step(self.wait(env))
+                self.assertAlmostEqual(env.build_progress['campus'], rate)
+                env.complete_build('campus')
+                env.step(self.wait(env))
+                # The city now has a specialty district, so only Liang's bonus remains.
+                self.assertAlmostEqual(env.build_progress['holy_site'], rate - 0.25)
+
+    def test_pantheon_observation_and_settings(self):
+        env = self.make_env(city_population=1, city_pantheon='city_patron_goddess', city_faith=13)
+        self.assertTrue(env.observation_schema.endswith(':pantheon=city_patron_goddess:faith=13'))
+        self.assertEqual(env.get_observation()[-1], 0.5)  # 13 of 25 faith, in quarters
+        env.faith, env.pantheon_founded = 0, True
+        self.assertEqual(env.get_observation()[-1], 1.0)
+        for kwargs in ({'city_pantheon': 'fertility_rites'}, {'city_faith': 5},
+                       {'city_population': 1, 'city_pantheon': 'god_of_war'},
+                       {'city_population': 1, 'city_faith': 501}, {'city_population': 1, 'city_faith': -1}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                GameConfig(**kwargs)
+
+
 if __name__ == '__main__':
     unittest.main()

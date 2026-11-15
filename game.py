@@ -152,6 +152,20 @@ SURPLUS_LOGISTICS_FOOD = .20  # Magnus: +20% food
 ZONING_COMMISSIONER_BONUS = .20  # Liang: +20% production toward districts
 
 
+# Religion in the ancient era is the pantheon. The civilization stores the
+# city's faith, and once it has 25 it founds a pantheon with one belief. Only
+# the beliefs that can matter here are offered: Fertility Rites (+10% growth,
+# and a free builder in the capital when founded, as in Gathering Storm) and City
+# Patron Goddess (+25% production toward districts while the city has no
+# specialty district). Great Prophets, founded religions and religious pressure
+# belong to later eras.
+PANTHEON_COST = 25
+PANTHEONS = ('fertility_rites', 'city_patron_goddess')
+FERTILITY_RITES_GROWTH = .10
+CITY_PATRON_GODDESS_BONUS = .25
+MAX_STARTING_FAITH = 500
+
+
 def citizen_pressure(population, distance, capital=False):
     """Loyalty a turn from a city's citizens at this distance."""
     if distance > LOYALTY_RANGE:
@@ -284,6 +298,8 @@ class GameConfig:
     enemy_city: tuple = ()  # (population, distance) of a city of the attacker's civilization
     city_governor: str = ''
     city_governor_promotion: str = ''
+    city_pantheon: str = ''
+    city_faith: int = 0
     city_builders: int = 0
     city_settlers: int = 0
     city_districts: tuple = ()
@@ -359,6 +375,13 @@ class GameConfig:
         if self.city_governor_promotion and self.city_governor_promotion not in offered:
             raise ValueError('city_governor_promotion must be one of: '
                              + (', '.join(offered) if offered else 'none for this governor'))
+        if self.city_pantheon not in ('', *PANTHEONS):
+            raise ValueError(f'city_pantheon must be one of: {", ".join(PANTHEONS)}')
+        if (isinstance(self.city_faith, bool) or not isinstance(self.city_faith, int)
+                or not 0 <= self.city_faith <= MAX_STARTING_FAITH):
+            raise ValueError(f'city_faith must be an integer between 0 and {MAX_STARTING_FAITH}')
+        if (self.city_pantheon or self.city_faith) and not self.city_growth:
+            raise ValueError('religion needs a city with population (city_population >= 1)')
         for name in ('city_builders', 'city_settlers'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CIVILIANS:
@@ -575,6 +598,8 @@ class Game:
                                       + (f':governor={self.config.city_governor}' if self.config.city_governor else '')
                                       + (f'+{self.config.city_governor_promotion}'
                                          if self.config.city_governor_promotion else '')
+                                      + (f':pantheon={self.config.city_pantheon}' if self.config.city_pantheon else '')
+                                      + (f':faith={self.config.city_faith}' if self.config.city_faith else '')
                                       if self.config.city_growth else '')
                                    + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else '')
                                    + (':built=' + ','.join(self.config.city_districts + self.config.city_buildings)
@@ -595,6 +620,8 @@ class Game:
         self.loyalty = 100
         self.independent = False
         self.governor_turns = 0
+        self.faith = 0
+        self.pantheon_founded = False
         self.city = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -640,6 +667,7 @@ class Game:
         self.war_weariness = c.city_war_weariness
         self.loyalty, self.independent = c.city_loyalty, False
         self.governor_turns = 0
+        self.faith, self.pantheon_founded = c.city_faith, False
         self._valid_cache_key = self._path_costs = None
         # Starting districts and buildings exist before the squad arrives.
         for item in c.city_districts + c.city_buildings:
@@ -654,6 +682,11 @@ class Game:
                              unit_type=self.unit_types[i], strength_ranged=specs[i].ranged_strength)
                       for i, pos in enumerate(start_positions)]
         self.civilians = self._place_civilians(component) if self.civilian_kinds else []
+        if c.city_pantheon == 'fertility_rites':
+            # Fertility Rites' builder waits, out of play, until the pantheon is founded.
+            builder = C_Civilian(*city_pos, 'builder', 'Pantheon builder', env=self)
+            builder.alive, builder.status = False, 'not yet trained'
+            self.civilians.append(builder)
         self.turn_number = 0
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -835,7 +868,33 @@ class Game:
             self.produce()
         if self.config.city_growth:
             self.update_loyalty()
+        if self.config.city_pantheon:
+            self.gather_faith()
 
+    def gather_faith(self):
+        """Store the city's faith, and found the pantheon once there is enough."""
+        self.faith = round(self.faith + self.city_output()['faith'], 2)
+        if not self.pantheon_founded and self.faith >= PANTHEON_COST:
+            self.faith = round(self.faith - PANTHEON_COST, 2)
+            self.pantheon_founded = True
+            self.city._event('pantheon_founded', belief=self.config.city_pantheon)
+            if self.config.city_pantheon == 'fertility_rites':
+                self._train_pantheon_builder()
+
+    def pantheon_has(self, belief):
+        return self.pantheon_founded and self.config.city_pantheon == belief
+
+    def _train_pantheon_builder(self):
+        """Fertility Rites' free builder appears on a free tile next to the city, or the nearest one."""
+        builder = next(c for c in self.civilians if c.status == 'not yet trained')
+        taken = ({u.position for u in self.units if u.alive} | {self.city.position}
+                 | {c.position for c in self.civilians if c.alive})
+        spots = sorted((pos for pos, cell in self.map.grid.items() if not cell.block_path and pos not in taken),
+                       key=lambda pos: (hex_distance(pos, self.city.position), pos[1], pos[0]))
+        if spots:
+            builder.x, builder.y = spots[0]
+            builder.alive, builder.status = True, 'active'
+            builder._event('builder_trained')
     def loyalty_sources(self):
         """This turn's loyalty change from each source."""
         city = self.city
@@ -965,8 +1024,11 @@ class Game:
             item = self.current_build()
             if item is None:
                 return  # nothing can be built now, so the production is lost
-            # Liang's Zoning Commissioner speeds up districts.
-            rate = 1 + ZONING_COMMISSIONER_BONUS if item in DISTRICTS and self.governor_has('zoning_commissioner') else 1
+            # Liang's Zoning Commissioner and City Patron Goddess speed up districts.
+            rate = 1
+            if item in DISTRICTS:
+                rate += ZONING_COMMISSIONER_BONUS if self.governor_has('zoning_commissioner') else 0
+                rate += CITY_PATRON_GODDESS_BONUS if self.pantheon_has('city_patron_goddess') and not self.districts else 0
             needed = self.build_cost(item) - self.build_progress.get(item, 0)
             if production * rate < needed:
                 self.build_progress[item] = round(self.build_progress.get(item, 0) + production * rate, 4)
@@ -1124,6 +1186,8 @@ class Game:
         surplus = self.food_surplus()
         if surplus > 0:
             change = self.mood()[1] + loyalty_effects(self.loyalty)[0]
+            if self.pantheon_has('fertility_rites'):
+                change += FERTILITY_RITES_GROWTH
             rate = max(0, 1 + change) * housing_growth_rate(self.city.population, self.housing())
             if rate != 1:
                 surplus = round(surplus * rate, 4)
@@ -1148,6 +1212,9 @@ class Game:
                 'loyalty': self.loyalty, 'loyalty_per_turn': self.loyalty_per_turn(),
                 'loyalty_sources': self.loyalty_sources(),
                 **(self.governor_report() if self.config.city_governor else {}),
+                **({'faith': self.faith, 'faith_per_turn': self.city_output()['faith'],
+                    'pantheon': self.config.city_pantheon, 'pantheon_founded': self.pantheon_founded}
+                   if self.config.city_pantheon else {}),
                 'growth_surplus': stored,
                 'turns_to_grow': math.ceil((threshold - city.food) / stored) if stored > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
@@ -1167,7 +1234,7 @@ class Game:
 
     def civilian_report(self):
         """Each civilian's state and the cities settlers have founded, or None without civilians."""
-        if not self.civilian_kinds:
+        if not self.civilian_kinds and self.config.city_pantheon != 'fertility_rites':
             return None
         return {'civilians': [{'name': c.name_instance, 'kind': c.kind, 'position': list(c.position),
                                'status': c.status, 'charges': c.charges} for c in self.civilians],
@@ -1244,6 +1311,8 @@ class Game:
                 reward -= BUILD_REWARD
             elif kind == 'city_declared_independence':
                 reward += INDEPENDENCE_REWARD
+            elif kind == 'pantheon_founded':
+                reward -= BUILD_REWARD
         if self.last_info['outcome'] == 'win':
             reward += 10
         elif self.last_info['outcome'] == 'loss':
@@ -1275,7 +1344,7 @@ class Game:
                           'turn': self.turn_number}
         if self.config.city_growth:
             self.last_info['city'] = self.city_report()
-        if self.civilian_kinds:
+        if self.civilian_report() is not None:
             self.last_info['civilians'] = self.civilian_report()
         reward = self.get_rewards()
         return self.get_observation(), reward, self._done
@@ -1304,6 +1373,9 @@ class Game:
                            math.floor(self.loyalty / 10) / 10])
             if c.city_governor:
                 values.append(float(self.governor_established()))
+            if c.city_pantheon:
+                progress = 1.0 if self.pantheon_founded else math.floor(4 * min(1.0, self.faith / PANTHEON_COST)) / 4
+                values.append(progress)
         for civilian in self.civilians:
             values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
                            float(civilian.alive), civilian.charges / BUILDER_CHARGES])

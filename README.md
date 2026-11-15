@@ -81,6 +81,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--city-loyalty N` | Set the city's starting loyalty (1–100; default: 100). |
 | `--enemy-city POPULATION DISTANCE` | Add a city of the attacker's civilization 4–9 hexes away, whose citizens pressure the city's loyalty. |
 | `--city-governor NAME`, `--governor-promotion NAME` | Appoint one governor to the city at the start, with up to one promotion; requires `--city-population`. |
+| `--pantheon BELIEF`, `--city-faith N` | Choose the pantheon belief the civilization founds once it stores 25 faith, and its starting faith (0–500). |
 | `--city-builders N`, `--city-settlers N` | Give the city up to two builders and two settlers; requires `--city-population`. |
 | `--city-districts ...`, `--city-buildings ...` | Ancient-era districts and buildings the city starts with; requires `--city-population`. |
 | `--build-queue ...` | Districts and buildings the city produces, in order, during the game. |
@@ -165,7 +166,7 @@ python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman b
 - **Starvation.** If the city's food store would drop below zero, it empties and the city loses a citizen (never going below one).
 - **Reward.** The attacker loses 1 reward each time the city grows and gains 1 each time it starves. Units standing next to the city therefore blockade it as well as besiege it.
 
-Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), war weariness in whole amenities (points ÷ 400), loyalty in tenths, and whether a governor is established. The observation schema ends with `:city_growth:water=...:luxuries=N:weariness=N:loyalty=N`, plus `:enemy=POPULATION@DISTANCE` with an enemy city and `:governor=NAME+PROMOTION` with a governor, so turning growth on or changing any of these requires `--fresh`; growth models trained before housing, amenities, war weariness and loyalty were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
+Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), war weariness in whole amenities (points ÷ 400), loyalty in tenths, whether a governor is established, and progress toward the pantheon in quarters. The observation schema ends with `:city_growth:water=...:luxuries=N:weariness=N:loyalty=N`, plus `:enemy=POPULATION@DISTANCE` with an enemy city, `:governor=NAME+PROMOTION` with a governor, and `:pantheon=BELIEF:faith=N` with a pantheon, so turning growth on or changing any of these requires `--fresh`; growth models trained before housing, amenities, war weariness and loyalty were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-path runs/growth/model.json --metrics-dir runs/growth --fresh
@@ -217,7 +218,7 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 - **Combat.** Ancient Walls add 100 wall HP and give the city a ranged strike, as walls do in Civ VI. The encampment shoots a unit within 2 hexes of it each turn. Units cannot enter the encampment, which cannot be attacked. Both strikes use the city's ranged strength, or 15 (Civ VI's value for a civilization without ranged units) when the city has none. Battering rams help against these walls as they do against `--wall-hp`.
 - **Reward.** The attacker loses 1 each time the city completes a district or building.
 
-Culture, science and faith are scaled by the city's mood and loyalty and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
+Culture, science and faith are scaled by the city's mood and loyalty and shown. Faith can found a pantheon (see below); nothing spends culture or science. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
 
 The observation adds a built flag for each listed district and building, plus the current item's production progress in quarters. An encampment appears as impassable in the terrain grid. The schema ends with `:built=...` and `:queue=...`, so changing them requires `--fresh`. Evaluation summaries report `average_builds_completed` when there is a queue.
 
@@ -226,6 +227,23 @@ python run_game.py --episodes 300 --unit-count 3 --unit-types warrior spearman b
 ```
 
 During playback, districts are outlined in their own color (blue campus, gold holy site, red encampment), and the status bar lists completed buildings and the item in production with its progress.
+
+## Religion (pantheons)
+
+In the ancient era, a civilization's religion is its pantheon. With `--pantheon BELIEF`, the city's faith each turn (from a holy site's adjacency bonus and a shrine, scaled by its mood and loyalty) is stored, starting from `--city-faith`. Once 25 faith has been stored, the civilization founds the pantheon. Founding costs the attacker 1 reward, like a completed building, and leftover faith keeps accumulating with nothing to spend it on. Two beliefs are offered, because Civ VI's other pantheon beliefs depend on resources, wonders, appeal, rivers, harvests or border growth that this simulation does not have:
+
+| Belief | Effect |
+| --- | --- |
+| `fertility_rites` | +10% growth. In Gathering Storm it also brings a free builder, which appears next to the city when the pantheon is founded and can be captured like any other builder. |
+| `city_patron_goddess` | +25% production toward a district while the city has no specialty district. It adds to Liang's Zoning Commissioner. |
+
+Without a holy site, shrine or starting faith, the pantheon is never founded. A holy site next to a mountain and two woods, plus a shrine, makes 4 faith a turn and founds it in 7 turns. Great Prophets, founding a religion, its beliefs, missionaries and religious pressure arrive in the Classical era and are not modeled. The 25-faith cost is the base game's; whether Gathering Storm changed it is unconfirmed.
+
+```powershell
+python run_game.py --episodes 300 --unit-count 3 --city-population 3 --city-luxuries 1 --city-districts holy_site --city-buildings shrine --pantheon fertility_rites --model-path runs/pantheon/model.json --metrics-dir runs/pantheon --fresh
+```
+
+During playback, the status bar shows the stored faith toward the pantheon, then the founded belief.
 
 ## Metrics and playback
 

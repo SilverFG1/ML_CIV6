@@ -169,6 +169,10 @@ class Renderer:
                              else f', establishing: {report["turns_to_establish"]} turn'
                                   + ('' if report['turns_to_establish'] == 1 else 's'))]
                          if 'governor' in report else []),
+                       *([f'Pantheon: {report["pantheon"].replace("_", " ")}' if report['pantheon_founded']
+                          else f'Faith {report["faith"]:g}/25 (+{report["faith_per_turn"]:g}) '
+                               f'for {report["pantheon"].replace("_", " ")}']
+                         if 'pantheon' in report else []),
                        f'Food {report["food"]:g}/{report["growth_threshold"]} ({report["growth_surplus"]:+g})']
         civilians = self.env.civilian_report()
         if civilians is not None:

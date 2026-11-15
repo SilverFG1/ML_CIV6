@@ -129,6 +129,15 @@ class RendererTests(unittest.TestCase):
         self.assertTrue(plain.render_frame())
         self.assertGreater(env._renderer.panel, plain._renderer.panel)
 
+    def test_border_growth_shows_in_the_status_bar(self):
+        env = Game(render=True, config=GameConfig(unit_count=1, city_population=1, city_buildings=('monument',)))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.claim_tile()
+        self.assertTrue(env.render_frame())
+        chips = {icon: text for icon, text, _ in env._renderer._status_chips()}
+        self.assertEqual(chips['borders'], 'Borders 0/20 (+2)')
+
 
 if __name__ == '__main__':
     unittest.main()

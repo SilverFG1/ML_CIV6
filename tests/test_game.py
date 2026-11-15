@@ -11,7 +11,7 @@ import numpy as np
 import constants
 from class_hex import HexMap
 from game import (C_Unit, Game, GameConfig, amenities_needed, amenity_mood, attack, citizen_pressure,
-                  growth_threshold, hex_distance, housing_growth_rate, loyalty_effects)
+                  growth_threshold, hex_distance, housing_growth_rate, loyalty_effects, tile_cost)
 
 
 class GameTests(unittest.TestCase):
@@ -499,14 +499,14 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=2)
         base = self.make_env()
         self.assertEqual(env.observation_schema,
-                         base.observation_schema + ':city_growth:water=fresh:luxuries=0:weariness=0:loyalty=100')
-        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 6)
+                         base.observation_schema + ':city_growth:borders:water=fresh:luxuries=0:weariness=0:loyalty=100')
+        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 8)
         self.place_far(env)
         # Population, growth progress, food surplus, housing room (5 housing - 2 citizens),
-        # war weariness in whole amenities, and loyalty in tenths.
-        np.testing.assert_allclose(env.get_observation()[-6:], [2 / 20, 0, 0.2, 0.3, 0, 1])
+        # war weariness in whole amenities, loyalty in tenths, tiles claimed, and border progress.
+        np.testing.assert_allclose(env.get_observation()[-8:], [2 / 20, 0, 0.2, 0.3, 0, 1, 0, 0])
         env.city.food = 13  # just over half of 24, reported in quarters
-        self.assertEqual(env.get_observation()[-5], 0.5)
+        self.assertEqual(env.get_observation()[-7], 0.5)
 
     def test_invalid_city_population_rejected(self):
         for value in (-1, 21, True, 1.5):
@@ -544,7 +544,7 @@ class GameTests(unittest.TestCase):
         self.assertFalse(set(positions) & ({u.position for u in env.units} | {env.city.position}))
         self.assertTrue(all(hex_distance(pos, env.city.position) <= 2 for pos in positions))
         self.assertEqual(env.observation_schema,
-                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:water=fresh:luxuries=0:weariness=0:'
+                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:borders:water=fresh:luxuries=0:weariness=0:'
                          'loyalty=100:civilians=builder,builder,settler,settler')
         self.assertEqual(len(env.get_observation()), len(self.make_env(city_population=2).get_observation()) + 16)
 
@@ -642,7 +642,7 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=2)
         self.assertEqual((env.districts, env.buildings), ({}, []))
         self.assertNotIn('built', env.observation_schema)
-        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 6)
+        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 8)
         report = env.city_report()
         self.assertEqual((report['culture'], report['science'], report['faith']), (0, 0, 0))
         self.assertNotIn('producing', report)
@@ -928,7 +928,7 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=3, city_luxuries=1, city_war_weariness=1000)
         self.place_far(env)
         self.assertEqual(env.city_report()['mood'], 'displeased')
-        self.assertEqual(env.get_observation()[-2], 0.2)  # two amenities' worth of weariness
+        self.assertEqual(env.get_observation()[-4], 0.2)  # two amenities' worth of weariness
         env.war_weariness = 399
         self.assertEqual(env.city_report()['mood'], 'content')
 
@@ -972,7 +972,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual(env.loyalty_sources(), {'citizen_pressure': 0, 'amenities': -3, 'buildings': 1})
         env.step(self.wait(env))
         self.assertEqual(env.loyalty, 78)
-        self.assertEqual(env.get_observation()[-2], 0.7)  # loyalty, before the monument's built flag
+        self.assertEqual(env.get_observation()[-4], 0.7)  # loyalty, before two border values and the monument's flag
         env.founded_cities.append((0, 0))  # six hexes away: one citizen adds 0.4
         self.assertAlmostEqual(env.loyalty_sources()['citizen_pressure'], 0.4)
 
@@ -1189,6 +1189,100 @@ class GameTests(unittest.TestCase):
                        {'city_population': 1, 'city_faith': 501}, {'city_population': 1, 'city_faith': -1}):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
+
+
+    # Border growth.
+    def test_tile_costs_follow_civ6(self):
+        self.assertEqual([tile_cost(n) for n in range(5)], [10, 20, 35, 52, 72])
+
+    def test_city_is_founded_owning_its_six_neighbors(self):
+        env = self.make_env(city_population=2)
+        env.map.grid[(5, 4)].set_terrain('MOUNTAIN')
+        self.assertEqual(sorted(env.owned_tiles), [(3, 3), (3, 4), (3, 5), (4, 3), (4, 5), (5, 4)])
+        self.assertNotIn((5, 4), env.territory())  # owned, but mountains cannot be worked
+        self.assertEqual(env.tiles_claimed, 0)
+        self.assertEqual(hex_distance(env.next_tile(), env.city.position), 2)
+        env.step(self.wait(env))
+        self.assertEqual(len(env.owned_tiles), 6)  # no culture, no border growth
+
+    def test_culture_claims_tiles_which_citizens_can_work(self):
+        env = self.make_env(city_population=1, city_buildings=('monument',))
+        self.place_far(env)
+        self.assertEqual(env.border_growth(), 2)
+        for _ in range(4):
+            env.step(self.wait(env))
+        self.assertEqual(env.tiles_claimed, 0)
+        env.step(self.wait(env))
+        claimed = env.owned_tiles[-1]
+        self.assertIn({'type': 'tile_claimed', 'object': 'Ottertopia', 'position': list(claimed)}, env.events)
+        self.assertEqual((env.tiles_claimed, env.border_culture), (1, 0))
+        self.assertEqual(hex_distance(claimed, env.city.position), 2)
+        self.assertIn(claimed, env.territory())
+        report = env.city_report()
+        self.assertEqual((report['tiles_claimed'], report['border_cost'], len(report['owned_tiles'])), (1, 20, 7))
+
+    def test_borders_grow_ring_by_ring_preferring_workable_land(self):
+        env = self.make_env(city_population=1)
+        env.map.grid[(4, 2)].set_terrain('MOUNTAIN')
+        rings = [hex_distance(env.claim_tile(), env.city.position) for _ in range(30)]
+        self.assertEqual(rings, sorted(rings))
+        self.assertEqual(rings.count(2), 12)
+        ring_two = env.owned_tiles[6:18]
+        self.assertEqual(ring_two[-1], (4, 2))  # the mountain comes last in its ring
+        # Tiles beyond 3 hexes are owned but not worked.
+        while env.claim_tile():
+            pass
+        self.assertTrue(all(hex_distance(pos, env.city.position) <= 5 for pos in env.owned_tiles))
+        self.assertTrue(any(hex_distance(pos, env.city.position) > 3 for pos in env.owned_tiles))
+        self.assertTrue(all(hex_distance(pos, env.city.position) <= 3 for pos in env.territory()))
+        within_reach = [pos for pos in env.map.grid if pos != env.city.position
+                        and hex_distance(pos, env.city.position) <= 5]
+        self.assertEqual(sorted(env.owned_tiles), sorted(within_reach))
+        self.assertNotIn((0, 0), env.owned_tiles)  # 6 hexes away, beyond the 5-hex limit
+
+    def test_encampment_waits_for_borders_to_reach_two_hexes(self):
+        env = self.make_env(city_population=1, city_build_queue=('encampment',))
+        self.assertFalse(env.can_build('encampment'))
+        claimed = env.claim_tile()
+        self.assertTrue(env.can_build('encampment'))
+        env.complete_build('encampment')
+        self.assertEqual(env.districts['encampment'], claimed)
+        starting = self.make_env(city_population=1, city_districts=('encampment',))
+        camp = starting.districts['encampment']
+        self.assertIn(camp, starting.owned_tiles)
+        self.assertEqual((starting.tiles_claimed, hex_distance(camp, starting.city.position)), (1, 2))
+
+    def test_districts_can_use_claimed_tiles(self):
+        env = self.make_env(city_population=1, city_build_queue=('campus',))
+        for pos in [(5, 1), (6, 2), (4, 1)]:  # around (5, 2), two hexes out
+            env.map.grid[pos].set_terrain('MOUNTAIN')
+        while (5, 2) not in env.owned_tiles:
+            env.claim_tile()
+        env.complete_build('campus')
+        self.assertEqual(env.districts['campus'], (5, 2))
+        self.assertEqual(env.adjacency('campus', (5, 2)), 3)
+
+    def test_religious_settlements_speeds_borders_and_brings_a_settler(self):
+        env = self.make_env(city_population=1, city_pantheon='religious_settlements', city_faith=25,
+                            city_buildings=('monument',))
+        self.place_far(env)
+        settler = env.civilians[-1]
+        self.assertEqual((settler.kind, settler.alive), ('settler', False))
+        self.assertEqual(env.border_growth(), 2)
+        env.step(self.wait(env))
+        self.assertTrue(env.pantheon_founded)
+        self.assertTrue(settler.alive)
+        self.assertIn('settler_trained', [e['type'] for e in env.events])
+        self.assertAlmostEqual(env.border_growth(), 2.3)
+
+    def test_border_observation(self):
+        env = self.make_env(city_population=1, city_buildings=('monument',))
+        self.place_far(env)
+        for _ in range(8):
+            env.step(self.wait(env))
+        # One tile claimed (8 turns of 2 culture, minus 10), 6 of the next 20.
+        self.assertEqual((env.tiles_claimed, env.border_culture), (1, 6))
+        np.testing.assert_allclose(env.get_observation()[-3:-1], [0.1, 0.25])
 
 
 if __name__ == '__main__':

@@ -127,7 +127,7 @@ python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman b
 | Forest (grassland woods) | 2 | 1 |
 | Mountain | cannot be worked | |
 
-- **Worked tiles.** The city owns the six tiles around its center, like a newly founded Civ VI city. Each citizen works one free tile, choosing the most food, then the most production. A tile with a unit on it cannot be worked, and citizens are reassigned whenever units move. A citizen with no free tile still eats.
+- **Worked tiles.** The city works the land it owns within 3 hexes of its center (see Borders below). Each citizen works one free tile, choosing the most food, then the most production. A tile with a unit on it cannot be worked, and citizens are reassigned whenever units move. A citizen with no free tile still eats.
 - **Growth.** Each citizen eats 2 food. The surplus is stored, and the city gains a citizen when the store reaches the Civ VI threshold of 15 + 8n + n^1.5 food, where n is the population minus one (15, 24, 33, 44, …). Leftover food carries over.
 - **Housing.** A city starts with 5 housing on fresh water (a river, lake or oasis), 3 on the coast, and 2 without water; `--city-water` chooses which. The water source is not drawn on the map. Each farm adds 0.5 housing, a granary 2, and barracks 1. As in Civ VI, a city one citizen below its housing stores only half its surplus food. At or above its housing, it stores a quarter, and five or more citizens over, it stops growing. Housing never reduces a food shortfall.
 - **Amenities.** A city needs no amenities for its first two citizens, one for the third, and one more for every two citizens after that (1 at population 3–4, 2 at 5–6, and so on). Since August 2020, Gathering Storm gives this free amenity only to capitals; the city is its civilization's capital, so it keeps it. Each luxury resource from `--city-luxuries` provides one; there are no other ancient-era sources here, since the Arena and entertainment buildings arrive in the Classical era. The balance sets the city's mood:
@@ -160,19 +160,20 @@ python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman b
   | `magnus` | Groundbreaker | None: there are no harvests | `surplus_logistics`: +20% food. `provision`: no effect here (no settlers are trained). |
   | `liang` | Guildmaster | None: no builders are trained during the game | `zoning_commissioner`: +20% production toward districts. `reinforced_materials`: no effect here (no disasters). |
   | `pingala` | Librarian | +15% science and culture | `connoisseur`: +1 culture per citizen. `researcher`: +1 science per citizen. |
-  | `reyna`, `amani`, `moksha` | Land Acquisition, Messenger, Bishop | None (trade, city-states, religion) | None offered |
+  | `reyna`, `amani`, `moksha` | Land Acquisition, Messenger, Bishop | None: Land Acquisition claims tiles faster by an undocumented amount, and the rest need trade, city-states or religion | None offered |
 
   An established governor's 8 loyalty outweighs a large enemy city. With a size-12 enemy city 4 hexes away, a size-3 capital that declared independence in 16 of 20 games against a squad that held back did not do so once with a governor. The 5- and 3-turn establishment times, Magnus's +20% food, and Liang's +20% district production come from community sources rather than the game files. Governor promotions beyond the ancient era's one, and moving governors between cities, are not modeled.
+- **Borders.** A city is founded owning the six tiles around its center. Each turn its culture (from a monument or Pingala, and 15% more with a Religious Settlements pantheon) is stored toward its next tile, which costs Civ VI's 10 + (6 × tiles claimed so far)^1.3 culture: 10, 20, 35, 52, 72, and so on. Borders grow ring by ring: every free tile within 2 hexes is claimed before any at 3, out to 5 hexes. Within a ring, workable land with the most food, then production, comes first. Only tiles within 3 hexes can be worked or hold districts. A city with a monument claims its first tile on turn 5, and four tiles in 60 turns. A city without culture never grows its borders. Claiming a tile gives no reward of its own; the city gains through what the tile adds. Buying tiles with gold is not modeled.
 - **Starvation.** If the city's food store would drop below zero, it empties and the city loses a citizen (never going below one).
 - **Reward.** The attacker loses 1 reward each time the city grows and gains 1 each time it starves. Units standing next to the city therefore blockade it as well as besiege it.
 
-Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), war weariness in whole amenities (points ÷ 400), loyalty in tenths, whether a governor is established, and progress toward the pantheon in quarters. The observation schema ends with `:city_growth:water=...:luxuries=N:weariness=N:loyalty=N`, plus `:enemy=POPULATION@DISTANCE` with an enemy city, `:governor=NAME+PROMOTION` with a governor, and `:pantheon=BELIEF:faith=N` with a pantheon, so turning growth on or changing any of these requires `--fresh`; growth models trained before housing, amenities, war weariness and loyalty were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
+When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), war weariness in whole amenities (points ÷ 400), loyalty in tenths, tiles claimed (in tenths, up to 10), border progress in quarters, whether a governor is established, and progress toward the pantheon in quarters. The observation schema ends with `:city_growth:borders:water=...:luxuries=N:weariness=N:loyalty=N`, plus `:enemy=POPULATION@DISTANCE` with an enemy city, `:governor=NAME+PROMOTION` with a governor, and `:pantheon=BELIEF:faith=N` with a pantheon, so turning growth on or changing any of these requires `--fresh`; growth models trained before housing, amenities, war weariness, loyalty and border growth were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-path runs/growth/model.json --metrics-dir runs/growth --fresh
 ```
 
-During playback, the city's territory is outlined, gold dots mark worked tiles, red dots mark tiles a unit is blocking, and the status bar shows population, stored food against the growth threshold, and the food surplus.
+During playback, the city's borders are outlined, gold dots mark worked tiles, red dots mark tiles a unit is blocking, and the status bar shows population, stored food against the growth threshold, and the food surplus.
 
 ## Builders and settlers
 
@@ -199,9 +200,9 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 
 | District | Unlocked by | Cost | Placement | Adjacency bonus |
 | --- | --- | --- | --- | --- |
-| `campus` | Writing | 54 | Next to the city center | Science: +1 per adjacent mountain, +1 per 2 adjacent districts |
-| `holy_site` | Astrology | 54 | Next to the city center | Faith: +1 per adjacent mountain, +1 per 2 adjacent woods, +1 per 2 adjacent districts |
-| `encampment` | Bronze Working | 54 | Two hexes from the city center | None |
+| `campus` | Writing | 54 | An owned tile within 3 hexes of the city center | Science: +1 per adjacent mountain, +1 per 2 adjacent districts |
+| `holy_site` | Astrology | 54 | An owned tile within 3 hexes of the city center | Faith: +1 per adjacent mountain, +1 per 2 adjacent woods, +1 per 2 adjacent districts |
+| `encampment` | Bronze Working | 54 | An owned tile 2–3 hexes from the city center, not next to it | None |
 
 | Building | District | Cost | Effect in this simulation |
 | --- | --- | --- | --- |
@@ -218,7 +219,7 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 - **Combat.** Ancient Walls add 100 wall HP and give the city a ranged strike, as walls do in Civ VI. The encampment shoots a unit within 2 hexes of it each turn. Units cannot enter the encampment, which cannot be attacked. Both strikes use the city's ranged strength, or 15 (Civ VI's value for a civilization without ranged units) when the city has none. Battering rams help against these walls as they do against `--wall-hp`.
 - **Reward.** The attacker loses 1 each time the city completes a district or building.
 
-Culture, science and faith are scaled by the city's mood and loyalty and shown. Faith can found a pantheon (see below); nothing spends culture or science. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
+Culture, science and faith are scaled by the city's mood and loyalty and shown. Faith can found a pantheon (see below); nothing spends culture or science. Several things are not modeled: rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. A queued encampment waits until the city's borders reach two hexes out. A starting encampment claims the tile it needs, as if borders had grown earlier. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
 
 The observation adds a built flag for each listed district and building, plus the current item's production progress in quarters. An encampment appears as impassable in the terrain grid. The schema ends with `:built=...` and `:queue=...`, so changing them requires `--fresh`. Evaluation summaries report `average_builds_completed` when there is a queue.
 
@@ -230,12 +231,13 @@ During playback, each district is outlined in its own color with a badge: an ope
 
 ## Religion (pantheons)
 
-In the ancient era, a civilization's religion is its pantheon. With `--pantheon BELIEF`, the city's faith each turn (from a holy site's adjacency bonus and a shrine, scaled by its mood and loyalty) is stored, starting from `--city-faith`. Once 25 faith has been stored, the civilization founds the pantheon. Founding costs the attacker 1 reward, like a completed building, and leftover faith keeps accumulating with nothing to spend it on. Two beliefs are offered, because Civ VI's other pantheon beliefs depend on resources, wonders, appeal, rivers, harvests or border growth that this simulation does not have:
+In the ancient era, a civilization's religion is its pantheon. With `--pantheon BELIEF`, the city's faith each turn (from a holy site's adjacency bonus and a shrine, scaled by its mood and loyalty) is stored, starting from `--city-faith`. Once 25 faith has been stored, the civilization founds the pantheon. Founding costs the attacker 1 reward, like a completed building, and leftover faith keeps accumulating with nothing to spend it on. Three beliefs are offered, because Civ VI's other pantheon beliefs depend on resources, wonders, appeal, rivers or harvests that this simulation does not have:
 
 | Belief | Effect |
 | --- | --- |
 | `fertility_rites` | +10% growth. In Gathering Storm it also brings a free builder, which appears next to the city when the pantheon is founded and can be captured like any other builder. |
 | `city_patron_goddess` | +25% production toward a district while the city has no specialty district. It adds to Liang's Zoning Commissioner. |
+| `religious_settlements` | Borders grow 15% faster. In Gathering Storm it also brings a free settler, which appears next to the city when the pantheon is founded and then sets off to found a city. |
 
 Without a holy site, shrine or starting faith, the pantheon is never founded. A holy site next to a mountain and two woods, plus a shrine, makes 4 faith a turn and founds it in 7 turns. Great Prophets, founding a religion, its beliefs, missionaries and religious pressure arrive in the Classical era and are not modeled. The 25-faith cost is the base game's; whether Gathering Storm changed it is unconfirmed.
 
@@ -263,7 +265,7 @@ python run_game.py --episodes 0 --eval-episodes 3 --eval-policies learned --mode
 
 During playback, **Space** pauses/resumes, **Right Arrow** advances one turn while paused, **+ / -** change playback speed, and **Esc** exits. `--render-training` also displays training turns.
 
-The display draws its own icons in code (`icons.py`), using no image files besides the otter sprites. Each unit carries a badge for its type: a sword for the warrior, a spear, a chariot wheel, a slinger's whirling stone, a drawn bow, and a ram. Each status-bar entry has an icon: an hourglass for the turn, a heart for the city's health, a wall, a citizen, wheat for food, a house for housing, and a face that changes with the city's mood. The bar also has a banner for loyalty, a broken sword for war weariness, a scroll for culture, a flask for science, a flame for faith, a seal for the governor, a sun for the pantheon, and a hammer for production. The status bar wraps to fit the window, which is sized for the systems the scenario uses.
+The display draws its own icons in code (`icons.py`), using no image files besides the otter sprites. Each unit carries a badge for its type: a sword for the warrior, a spear, a chariot wheel, a slinger's whirling stone, a drawn bow, and a ram. Each status-bar entry has an icon: an hourglass for the turn, a heart for the city's health, a wall, a citizen, wheat for food, a house for housing, and a face that changes with the city's mood. The bar also has a claimed tile for border growth, a banner for loyalty, a broken sword for war weariness, a scroll for culture, a flask for science, a flame for faith, a seal for the governor, a sun for the pantheon, and a hammer for production. The status bar wraps to fit the window, which is sized for the systems the scenario uses.
 
 Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer or slinger, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
 

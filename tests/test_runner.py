@@ -322,7 +322,8 @@ class RunnerTests(unittest.TestCase):
     def test_city_population_trains_resumes_and_reports_final_size(self):
         args = self.args('--city-population', '2', '--city-water', 'coast')
         agent = self.make_agent(args)
-        self.assertTrue(agent.observation_schema.endswith(':city_growth:water=coast:luxuries=0:weariness=0:loyalty=100'))
+        self.assertTrue(agent.observation_schema.endswith(
+            ':city_growth:borders:water=coast:luxuries=0:weariness=0:loyalty=100'))
         run_game.train_agent(agent, args)
         agent.save(args.model_path)
         resume_args = self.args()

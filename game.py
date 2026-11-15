@@ -155,14 +155,17 @@ ZONING_COMMISSIONER_BONUS = .20  # Liang: +20% production toward districts
 # Religion in the ancient era is the pantheon. The civilization stores the
 # city's faith, and once it has 25 it founds a pantheon with one belief. Only
 # the beliefs that can matter here are offered: Fertility Rites (+10% growth,
-# and a free builder in the capital when founded, as in Gathering Storm) and City
+# and a free builder in the capital when founded, as in Gathering Storm), City
 # Patron Goddess (+25% production toward districts while the city has no
-# specialty district). Great Prophets, founded religions and religious pressure
-# belong to later eras.
+# specialty district) and Religious Settlements (borders grow 15% faster, and a
+# free settler in the capital when founded, as in Gathering Storm). Great
+# Prophets, founded religions and religious pressure belong to later eras.
 PANTHEON_COST = 25
-PANTHEONS = ('fertility_rites', 'city_patron_goddess')
+PANTHEONS = ('fertility_rites', 'city_patron_goddess', 'religious_settlements')
+PANTHEON_CIVILIANS = {'fertility_rites': 'builder', 'religious_settlements': 'settler'}
 FERTILITY_RITES_GROWTH = .10
 CITY_PATRON_GODDESS_BONUS = .25
+RELIGIOUS_SETTLEMENTS_BORDERS = .15
 MAX_STARTING_FAITH = 500
 
 
@@ -225,7 +228,7 @@ class DistrictSpec:
     mountain: int = 0  # adjacency per adjacent mountain
     woods_pair: int = 0  # adjacency per two adjacent woods (forests)
     district_pair: int = 0  # adjacency per two adjacent districts (the city center counts)
-    distance: int = 1  # hexes from the city center
+    min_distance: int = 1  # closest it may be to the city center
 
 
 @dataclass(frozen=True)
@@ -241,12 +244,12 @@ class BuildingSpec:
 
 # Ancient-era districts and buildings (Gathering Storm). The Water Mill needs a
 # river on the map, which this sim does not model. The Government Plaza is omitted because its
-# buildings need Classical governments. The Encampment cannot be next to the
-# city center; this sim has no border growth, so it goes two hexes out.
+# buildings need Classical governments. Districts go on tiles the city owns
+# within 3 hexes of its center; the Encampment cannot be next to the center.
 DISTRICTS = {
     'campus': DistrictSpec('Writing', yield_type='science', mountain=1, district_pair=1),
     'holy_site': DistrictSpec('Astrology', yield_type='faith', mountain=1, woods_pair=1, district_pair=1),
-    'encampment': DistrictSpec('Bronze Working', distance=2),
+    'encampment': DistrictSpec('Bronze Working', min_distance=2),
 }
 BUILDINGS = {
     'monument': BuildingSpec('(none)', 60, yields=(('culture', 2),), loyalty=1),
@@ -267,6 +270,22 @@ BUILD_REWARD = 1.0
 def district_limit(population):
     """Specialty districts a city of this size may have (Civ VI: one, plus one per 3 citizens)."""
     return 1 + (population - 1) // 3
+
+
+# Borders (Civ VI global parameters). A city is founded owning the six tiles
+# around it. Its culture then claims one tile at a time, the next costing
+# 10 + (6 x tiles claimed so far)^1.3 culture: 10, 20, 35, 52, 72 and so on.
+# Claims go ring by ring out to 5 hexes, but only tiles within 3 can be worked.
+CULTURE_COST_FIRST_TILE = 10
+CULTURE_COST_MULTIPLIER = 6
+CULTURE_COST_EXPONENT = 1.3
+BORDER_RADIUS = 5
+WORK_RADIUS = 3
+
+
+def tile_cost(tiles_claimed):
+    """Culture needed for the city's next tile."""
+    return math.floor(CULTURE_COST_FIRST_TILE + (CULTURE_COST_MULTIPLIER * tiles_claimed) ** CULTURE_COST_EXPONENT)
 
 
 def growth_threshold(population):
@@ -591,7 +610,7 @@ class Game:
                                + ('settler',) * self.config.city_settlers)
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
-                                   + (f':city_growth:water={self.config.city_water}:luxuries={self.config.city_luxuries}'
+                                   + (f':city_growth:borders:water={self.config.city_water}:luxuries={self.config.city_luxuries}'
                                       f':weariness={self.config.city_war_weariness}'
                                       f':loyalty={self.config.city_loyalty}'
                                       + (':enemy={}@{}'.format(*self.config.enemy_city) if self.config.enemy_city else '')
@@ -622,6 +641,8 @@ class Game:
         self.governor_turns = 0
         self.faith = 0
         self.pantheon_founded = False
+        self.owned_tiles, self._owned = [], set()
+        self.tiles_claimed, self.border_culture = 0, 0
         self.city = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -668,9 +689,16 @@ class Game:
         self.loyalty, self.independent = c.city_loyalty, False
         self.governor_turns = 0
         self.faith, self.pantheon_founded = c.city_faith, False
+        # A newly founded city owns the six tiles around it.
+        self.owned_tiles = [cell.index for cell in self.map.grid[city_pos].get_neighbors(self.map.grid)]
+        self._owned = set(self.owned_tiles)
+        self.tiles_claimed, self.border_culture = 0, 0
         self._valid_cache_key = self._path_costs = None
-        # Starting districts and buildings exist before the squad arrives.
+        # Starting districts and buildings exist before the squad arrives. A
+        # starting district that needs more land claims it, as if borders grew earlier.
         for item in c.city_districts + c.city_buildings:
+            while item in DISTRICTS and self.district_site(item) is None and self.claim_tile():
+                pass
             self.complete_build(item, announce=False)
         if 'encampment' in self.districts:
             component = self.map.reachable(city_pos)
@@ -682,11 +710,12 @@ class Game:
                              unit_type=self.unit_types[i], strength_ranged=specs[i].ranged_strength)
                       for i, pos in enumerate(start_positions)]
         self.civilians = self._place_civilians(component) if self.civilian_kinds else []
-        if c.city_pantheon == 'fertility_rites':
-            # Fertility Rites' builder waits, out of play, until the pantheon is founded.
-            builder = C_Civilian(*city_pos, 'builder', 'Pantheon builder', env=self)
-            builder.alive, builder.status = False, 'not yet trained'
-            self.civilians.append(builder)
+        if c.city_pantheon in PANTHEON_CIVILIANS:
+            # The pantheon's free civilian waits, out of play, until the pantheon is founded.
+            kind = PANTHEON_CIVILIANS[c.city_pantheon]
+            civilian = C_Civilian(*city_pos, kind, f'Pantheon {kind}', env=self)
+            civilian.alive, civilian.status = False, 'not yet trained'
+            self.civilians.append(civilian)
         self.turn_number = 0
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -867,6 +896,7 @@ class Game:
         if self.config.city_build_queue:
             self.produce()
         if self.config.city_growth:
+            self.grow_borders()
             self.update_loyalty()
         if self.config.city_pantheon:
             self.gather_faith()
@@ -878,23 +908,23 @@ class Game:
             self.faith = round(self.faith - PANTHEON_COST, 2)
             self.pantheon_founded = True
             self.city._event('pantheon_founded', belief=self.config.city_pantheon)
-            if self.config.city_pantheon == 'fertility_rites':
-                self._train_pantheon_builder()
+            if self.config.city_pantheon in PANTHEON_CIVILIANS:
+                self._train_pantheon_civilian()
 
     def pantheon_has(self, belief):
         return self.pantheon_founded and self.config.city_pantheon == belief
 
-    def _train_pantheon_builder(self):
-        """Fertility Rites' free builder appears on a free tile next to the city, or the nearest one."""
-        builder = next(c for c in self.civilians if c.status == 'not yet trained')
+    def _train_pantheon_civilian(self):
+        """The pantheon's free civilian appears on a free tile next to the city, or the nearest one."""
+        civilian = next(c for c in self.civilians if c.status == 'not yet trained')
         taken = ({u.position for u in self.units if u.alive} | {self.city.position}
                  | {c.position for c in self.civilians if c.alive})
         spots = sorted((pos for pos, cell in self.map.grid.items() if not cell.block_path and pos not in taken),
                        key=lambda pos: (hex_distance(pos, self.city.position), pos[1], pos[0]))
         if spots:
-            builder.x, builder.y = spots[0]
-            builder.alive, builder.status = True, 'active'
-            builder._event('builder_trained')
+            civilian.x, civilian.y = spots[0]
+            civilian.alive, civilian.status = True, 'active'
+            civilian._event(f'{civilian.kind}_trained')
     def loyalty_sources(self):
         """This turn's loyalty change from each source."""
         city = self.city
@@ -959,15 +989,16 @@ class Game:
         return spec.mountain * mountains + spec.woods_pair * (woods // 2) + spec.district_pair * (districts // 2)
 
     def district_site(self, district):
-        """The free tile with the best adjacency, then the lowest yields, or None.
+        """The free owned tile with the best adjacency, then the lowest yields, or None.
 
-        Campuses and holy sites go next to the city center; encampments two hexes out.
+        Districts go within 3 hexes of the city center; an encampment cannot be next to it.
         """
         occupied = ({u.position for u in self.units if u.alive}
                     | {c.position for c in self.civilians if c.alive})
-        sites = [pos for pos, cell in self.map.grid.items()
-                 if hex_distance(pos, self.city.position) == DISTRICTS[district].distance
-                 and cell.terrain_type in TILE_YIELDS and cell.district is None and pos not in occupied]
+        sites = [pos for pos in self.owned_tiles
+                 if DISTRICTS[district].min_distance <= hex_distance(pos, self.city.position) <= WORK_RADIUS
+                 and self.map.grid[pos].terrain_type in TILE_YIELDS and self.map.grid[pos].district is None
+                 and pos not in occupied]
         if not sites:
             return None
         return max(sites, key=lambda pos: (self.adjacency(district, pos), -sum(self.tile_yield(pos)), -pos[1], -pos[0]))
@@ -1092,9 +1123,56 @@ class Game:
         settler.leave('settled', 'city_founded', position=list(settler.position))
 
     def territory(self):
-        """Workable tiles the city owns: the six around its center, minus mountains."""
-        return [cell.index for cell in self.map.grid[self.city.position].get_neighbors(self.map.grid)
-                if cell.terrain_type in TILE_YIELDS and cell.district is None]
+        """Tiles the city can work: owned, within 3 hexes, and neither mountains nor districts."""
+        return [pos for pos in self.owned_tiles
+                if hex_distance(pos, self.city.position) <= WORK_RADIUS
+                and self.map.grid[pos].terrain_type in TILE_YIELDS and self.map.grid[pos].district is None]
+
+    def next_tile(self):
+        """The tile the city's borders take next, or None.
+
+        Civ VI claims ring by ring; within a ring this takes workable land first,
+        then the most food and production.
+        """
+        center = self.city.position
+        candidates = [pos for pos in self.map.grid if pos != center and pos not in self._owned
+                      and hex_distance(pos, center) <= BORDER_RADIUS
+                      and any(cell.index in self._owned or cell.index == center
+                              for cell in self.map.grid[pos].get_neighbors(self.map.grid))]
+        if not candidates:
+            return None
+
+        def preference(pos):
+            terrain = self.map.grid[pos].terrain_type
+            yields = TILE_YIELDS.get(terrain, (0, 0))
+            return (hex_distance(pos, center), terrain not in TILE_YIELDS, -yields[0], -yields[1], pos[1], pos[0])
+        return min(candidates, key=preference)
+
+    def claim_tile(self):
+        """Add the next tile to the city's territory; return it, or None if none is left."""
+        pos = self.next_tile()
+        if pos is not None:
+            self.owned_tiles.append(pos)
+            self._owned.add(pos)
+            self.tiles_claimed += 1
+        return pos
+
+    def border_growth(self):
+        """Culture a turn that goes toward new tiles."""
+        culture = self.city_output()['culture']
+        if self.pantheon_has('religious_settlements'):
+            culture *= 1 + RELIGIOUS_SETTLEMENTS_BORDERS
+        return round(culture, 2)
+
+    def grow_borders(self):
+        """Store this turn's culture and claim a tile when there is enough."""
+        self.border_culture = round(self.border_culture + self.border_growth(), 2)
+        cost = tile_cost(self.tiles_claimed)
+        if self.border_culture >= cost:
+            pos = self.claim_tile()
+            if pos is not None:
+                self.border_culture = round(self.border_culture - cost, 2)
+                self.city._event('tile_claimed', position=list(pos))
 
     def blocked_tiles(self):
         """Territory tiles that cannot be worked because a unit stands on them."""
@@ -1211,6 +1289,9 @@ class Game:
                 'amenities_lost_to_war': self.amenities_lost_to_war(),
                 'loyalty': self.loyalty, 'loyalty_per_turn': self.loyalty_per_turn(),
                 'loyalty_sources': self.loyalty_sources(),
+                'owned_tiles': [list(pos) for pos in self.owned_tiles], 'tiles_claimed': self.tiles_claimed,
+                'border_culture': self.border_culture, 'border_cost': tile_cost(self.tiles_claimed),
+                'border_growth': self.border_growth(),
                 **(self.governor_report() if self.config.city_governor else {}),
                 **({'faith_stored': self.faith, 'pantheon': self.config.city_pantheon,
                     'pantheon_founded': self.pantheon_founded} if self.config.city_pantheon else {}),
@@ -1233,7 +1314,7 @@ class Game:
 
     def civilian_report(self):
         """Each civilian's state and the cities settlers have founded, or None without civilians."""
-        if not self.civilian_kinds and self.config.city_pantheon != 'fertility_rites':
+        if not self.civilian_kinds and self.config.city_pantheon not in PANTHEON_CIVILIANS:
             return None
         return {'civilians': [{'name': c.name_instance, 'kind': c.kind, 'position': list(c.position),
                                'status': c.status, 'charges': c.charges} for c in self.civilians],
@@ -1369,7 +1450,8 @@ class Game:
             values.extend([city.population / MAX_CITY_POPULATION, math.floor(4 * progress) / 4,
                            self.food_surplus() / 10, (self.housing() - city.population) / 10,
                            min(1.0, self.war_weariness // WAR_WEARINESS_PER_AMENITY / 10),
-                           math.floor(self.loyalty / 10) / 10])
+                           math.floor(self.loyalty / 10) / 10, min(1.0, self.tiles_claimed / 10),
+                           math.floor(4 * min(1.0, self.border_culture / tile_cost(self.tiles_claimed))) / 4])
             if c.city_governor:
                 values.append(float(self.governor_established()))
             if c.city_pantheon:

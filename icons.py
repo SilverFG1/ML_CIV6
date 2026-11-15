@@ -327,6 +327,16 @@ def settlement(pen):
     pen.polygon([(.4, .88), (.5, .56), (.6, .88)], WOOD_DARK, outline=False)
 
 
+def borders(pen):
+    """A tile inside a purple border, with a flag claiming it."""
+    hexagon = [(.46 + .36 * math.cos(math.pi / 6 + k * math.pi / 3), .56 + .36 * math.sin(math.pi / 6 + k * math.pi / 3))
+               for k in range(6)]
+    pen.polygon(hexagon, (150, 192, 112), width=.04)
+    pen.stroke(hexagon + [hexagon[0]], PURPLE, .05)
+    pen.line([(.66, .52), (.66, .1)], WOOD_DARK, .035)
+    pen.polygon([(.67, .11), (.92, .18), (.67, .27)], PURPLE, width=.03)
+
+
 def farm(pen):
     pen.rect((.06, .62, .88, .3), SOIL, radius=.06)
     for y in (.71, .82):
@@ -477,7 +487,7 @@ ICONS = {
     'food': food, 'production': production, 'culture': culture, 'science': science, 'faith': faith,
     'housing': housing, 'loyalty': loyalty, 'war_weariness': war_weariness, 'governor': governor,
     'pantheon': pantheon, 'population': population, 'turn': turn, 'city_hp': city_hp, 'walls': walls,
-    'captured': captured, 'settlement': settlement, 'farm': farm,
+    'captured': captured, 'settlement': settlement, 'farm': farm, 'borders': borders,
     **{f'mood_{name}': partial(mood, name=name) for name in MOOD_FACES},
     **{f'building_{name}': draw for name, draw in (
         ('monument', monument), ('granary', granary), ('ancient_walls', walls), ('library', library),

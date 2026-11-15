@@ -102,6 +102,9 @@ class Renderer:
                       ('loyalty', f'Loyalty {report["loyalty"]:g} ({report["loyalty_per_turn"]:+g})', light)]
             if report['war_weariness']:
                 chips.append(('war_weariness', f'War weariness {report["war_weariness"]}', light))
+            if report['border_growth'] or report['tiles_claimed']:
+                chips.append(('borders', f'Borders {report["border_culture"]:g}/{report["border_cost"]} '
+                                         f'(+{report["border_growth"]:g})', light))
             for kind in ('culture', 'science'):
                 if report[kind]:
                     chips.append((kind, f'{kind.capitalize()} +{report[kind]:g}', light))
@@ -178,17 +181,18 @@ class Renderer:
             p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 3)
             self._icon('settlement', (x + s * .27, y + s * .14), s * .46)
             self._text('NEW CITY', (x + 2, y + s * .66), (235, 220, 255), small=True)
+        report = self.env.city_report()
+        show_tiles = report is not None and self.env.city.alive
+        if show_tiles:
+            # The city's borders: every tile it owns, worked or not.
+            for pos in self.env.owned_tiles:
+                p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 2)
         for district, pos in self.env.districts.items():
             label, color = DISTRICT_STYLES[district]
             x, y = self._position(pos)
             p.draw.polygon(self.surface, color, self._polygon(pos), 4)
             self._icon(f'district_{district}', (x + s * .29, y + s * .1), s * .42)
             self._text(label, (x + 4, y + s * .56), color, small=True)
-        report = self.env.city_report()
-        show_tiles = report is not None and self.env.city.alive
-        if show_tiles:
-            for pos in self.env.territory():
-                p.draw.polygon(self.surface, constants.COLOR_PURPLE, self._polygon(pos), 2)
         for civilian in self.env.civilians:
             if not civilian.alive:
                 continue

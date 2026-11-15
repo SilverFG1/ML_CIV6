@@ -61,6 +61,8 @@ def parse_args(argv=None):
                         help="the city's water supply, which sets its starting housing (default: fresh)")
     parser.add_argument("--city-luxuries", type=int,
                         help="luxury resources the city has, each giving one amenity, 0-8 (default: 0)")
+    parser.add_argument("--city-war-weariness", type=int,
+                        help="war weariness the city's civilization starts with, 0-10000 points (default: 0)")
     parser.add_argument("--city-builders", type=int, help="builders the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-settlers", type=int, help="settlers the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-districts", choices=tuple(game.DISTRICTS), nargs="+",
@@ -105,7 +107,8 @@ def config_from_args(args, saved=None):
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
                  "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
-                 "city_population", "city_water", "city_luxuries", "city_builders", "city_settlers",
+                 "city_population", "city_water", "city_luxuries", "city_war_weariness", "city_builders",
+                 "city_settlers",
                  *TUPLE_FIELDS[3:]):
         value = getattr(args, name)
         if value is not None:

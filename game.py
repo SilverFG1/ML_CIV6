@@ -89,9 +89,21 @@ AMENITY_MOODS = (  # (lowest balance, mood, growth change, non-food yield change
     (None, 'revolt', -1.0, -.20),
 )
 MAX_LUXURIES = 8
+# War weariness (Gathering Storm global parameters). Each combat costs both
+# sides 16 points in the ancient era. The defender fights on its own land, so
+# the doubling for foreign land does not apply, and it has no units to lose, so
+# neither does the tripling for a killed unit. While at war, weariness fades by
+# 50 points a turn. Every 400 points cost the city one amenity, but never more
+# amenities than the city needs.
+WAR_WEARINESS_PER_COMBAT = 16
+WAR_WEARINESS_DECAY = 50
+WAR_WEARINESS_PER_AMENITY = 400
+MAX_WAR_WEARINESS = 10000  # largest starting value a scenario accepts
 
 
 def amenities_needed(population):
+    """Amenities a capital needs. Gathering Storm gives capitals one free amenity, so
+    their first two citizens need none; other cities would need one more."""
     return max(0, (population - 1) // 2)
 
 
@@ -208,6 +220,7 @@ class GameConfig:
     city_population: int = 0
     city_water: str = 'fresh'
     city_luxuries: int = 0
+    city_war_weariness: int = 0
     city_builders: int = 0
     city_settlers: int = 0
     city_districts: tuple = ()
@@ -259,6 +272,11 @@ class GameConfig:
             raise ValueError(f'city_luxuries must be an integer between 0 and {MAX_LUXURIES}')
         if self.city_luxuries and not self.city_growth:
             raise ValueError('luxuries need a city with population (city_population >= 1)')
+        if (isinstance(self.city_war_weariness, bool) or not isinstance(self.city_war_weariness, int)
+                or not 0 <= self.city_war_weariness <= MAX_WAR_WEARINESS):
+            raise ValueError(f'city_war_weariness must be an integer between 0 and {MAX_WAR_WEARINESS}')
+        if self.city_war_weariness and not self.city_growth:
+            raise ValueError('war weariness needs a city with population (city_population >= 1)')
         for name in ('city_builders', 'city_settlers'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CIVILIANS:
@@ -469,6 +487,7 @@ class Game:
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
                                    + (f':city_growth:water={self.config.city_water}:luxuries={self.config.city_luxuries}'
+                                      f':weariness={self.config.city_war_weariness}'
                                       if self.config.city_growth else '')
                                    + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else '')
                                    + (':built=' + ','.join(self.config.city_districts + self.config.city_buildings)
@@ -485,6 +504,7 @@ class Game:
         self.buildings = []
         self.build_progress = {}
         self.completed = []
+        self.war_weariness = 0
         self.city = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -527,6 +547,7 @@ class Game:
         self.farms = set()
         self.founded_cities = []
         self.districts, self.buildings, self.build_progress, self.completed = {}, [], {}, []
+        self.war_weariness = c.city_war_weariness
         self._valid_cache_key = self._path_costs = None
         # Starting districts and buildings exist before the squad arrives.
         for item in c.city_districts + c.city_buildings:
@@ -651,6 +672,7 @@ class Game:
             unit._event('invalid_move')
         elif target is self.city:
             damage_out, damage_taken = attack(unit, self.city)
+            self.combat_fought()
             unit._event('attacked')
             unit.take_damage(damage_taken)
             self.city.take_damage(damage_out, aggressor_alive=unit.alive,
@@ -689,6 +711,7 @@ class Game:
             if targets:
                 target = self.rng.choice(targets)
                 damage, _ = attack(self.city, target, ranged=True)
+                self.combat_fought()
                 target.take_damage(damage)
         encampment = self.districts.get('encampment')
         if encampment is not None:
@@ -696,6 +719,7 @@ class Game:
             if targets:
                 target = self.rng.choice(targets)
                 damage, _ = attack(self.city, target, ranged=True)
+                self.combat_fought()
                 self.city._event('encampment_strike', target=target.name_instance)
                 target.take_damage(damage)
         if self.city.heal:
@@ -710,9 +734,19 @@ class Game:
             if civilian.alive:
                 (self.builder_turn if civilian.kind == 'builder' else self.settler_turn)(civilian)
         if self.config.city_growth:
+            self.war_weariness = max(0, self.war_weariness - WAR_WEARINESS_DECAY)
             self.grow_city()
         if self.config.city_build_queue:
             self.produce()
+
+    def combat_fought(self):
+        """Each combat around the city adds to its civilization's war weariness."""
+        if self.config.city_growth:
+            self.war_weariness += WAR_WEARINESS_PER_COMBAT
+
+    def amenities_lost_to_war(self):
+        needed = amenities_needed(self.city.population)
+        return min(self.war_weariness // WAR_WEARINESS_PER_AMENITY, needed)
 
     def is_built(self, item):
         return item in self.districts or item in self.buildings
@@ -895,7 +929,8 @@ class Game:
 
     def amenities(self):
         """Return (amenities available, amenities needed)."""
-        return self.config.city_luxuries, amenities_needed(self.city.population)
+        return (self.config.city_luxuries - self.amenities_lost_to_war(),
+                amenities_needed(self.city.population))
 
     def mood(self):
         """The city's mood and its growth and non-food yield changes; content without growth."""
@@ -958,7 +993,8 @@ class Game:
                 'food_yield': food, 'production_yield': production, 'food_surplus': surplus,
                 'housing': housing, 'growth_rate': housing_growth_rate(city.population, housing),
                 'amenities': self.amenities()[0], 'amenities_needed': self.amenities()[1],
-                'mood': self.mood()[0],
+                'mood': self.mood()[0], 'war_weariness': self.war_weariness,
+                'amenities_lost_to_war': self.amenities_lost_to_war(),
                 'growth_surplus': stored,
                 'turns_to_grow': math.ceil((threshold - city.food) / stored) if stored > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
@@ -1007,6 +1043,7 @@ class Game:
             unit._event('invalid_move')
             return
         damage, _ = attack(unit, self.city, ranged=True)
+        self.combat_fought()
         unit._event('ranged_attack')
         # Capturing requires a melee action; a ranged strike leaves at least 1 HP.
         self.city.take_damage(damage, aggressor_alive=False)
@@ -1105,7 +1142,8 @@ class Game:
             # Growth progress is coarse (quarters) to keep the tabular state space small.
             progress = min(1.0, city.food / growth_threshold(city.population))
             values.extend([city.population / MAX_CITY_POPULATION, math.floor(4 * progress) / 4,
-                           self.food_surplus() / 10, (self.housing() - city.population) / 10])
+                           self.food_surplus() / 10, (self.housing() - city.population) / 10,
+                           min(1.0, self.war_weariness // WAR_WEARINESS_PER_AMENITY / 10)])
         for civilian in self.civilians:
             values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
                            float(civilian.alive), civilian.charges / BUILDER_CHARGES])

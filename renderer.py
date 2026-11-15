@@ -161,6 +161,7 @@ class Renderer:
         if report is not None:
             status += [f'Pop {report["population"]} (housing {report["housing"]:g})',
                        f'Amenities {report["amenities"]}/{report["amenities_needed"]} {report["mood"]}',
+                       *([f'War weariness {report["war_weariness"]}'] if report['war_weariness'] else []),
                        f'Food {report["food"]:g}/{report["growth_threshold"]} ({report["growth_surplus"]:+g})']
         civilians = self.env.civilian_report()
         if civilians is not None:

@@ -498,13 +498,15 @@ class GameTests(unittest.TestCase):
     def test_growth_observation_and_schema(self):
         env = self.make_env(city_population=2)
         base = self.make_env()
-        self.assertEqual(env.observation_schema, base.observation_schema + ':city_growth:water=fresh:luxuries=0')
-        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 4)
+        self.assertEqual(env.observation_schema,
+                         base.observation_schema + ':city_growth:water=fresh:luxuries=0:weariness=0')
+        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 5)
         self.place_far(env)
-        # Population, growth progress, food surplus, and housing room (5 housing - 2 citizens).
-        np.testing.assert_allclose(env.get_observation()[-4:], [2 / 20, 0, 0.2, 0.3])
+        # Population, growth progress, food surplus, housing room (5 housing - 2 citizens),
+        # and amenities' worth of war weariness.
+        np.testing.assert_allclose(env.get_observation()[-5:], [2 / 20, 0, 0.2, 0.3, 0])
         env.city.food = 13  # just over half of 24, reported in quarters
-        self.assertEqual(env.get_observation()[-3], 0.5)
+        self.assertEqual(env.get_observation()[-4], 0.5)
 
     def test_invalid_city_population_rejected(self):
         for value in (-1, 21, True, 1.5):
@@ -542,7 +544,7 @@ class GameTests(unittest.TestCase):
         self.assertFalse(set(positions) & ({u.position for u in env.units} | {env.city.position}))
         self.assertTrue(all(hex_distance(pos, env.city.position) <= 2 for pos in positions))
         self.assertEqual(env.observation_schema,
-                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:water=fresh:luxuries=0:'
+                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:water=fresh:luxuries=0:weariness=0:'
                          'civilians=builder,builder,settler,settler')
         self.assertEqual(len(env.get_observation()), len(self.make_env(city_population=2).get_observation()) + 16)
 
@@ -640,7 +642,7 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=2)
         self.assertEqual((env.districts, env.buildings), ({}, []))
         self.assertNotIn('built', env.observation_schema)
-        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 4)
+        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 5)
         report = env.city_report()
         self.assertEqual((report['culture'], report['science'], report['faith']), (0, 0, 0))
         self.assertNotIn('producing', report)
@@ -882,6 +884,61 @@ class GameTests(unittest.TestCase):
         self.assertEqual(env.city_yields(), (2, 1))
         for kwargs in ({'city_luxuries': 1}, {'city_population': 1, 'city_luxuries': 9},
                        {'city_population': 1, 'city_luxuries': -1}, {'city_population': 1, 'city_luxuries': True}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                GameConfig(**kwargs)
+
+
+    # War weariness.
+    def test_every_combat_adds_war_weariness_which_fades(self):
+        env = self.make_env(city_population=3, city_luxuries=1, ranged_strength=30, city_war_weariness=1000,
+                            unit_count=2, unit_types=('warrior', 'archer'))
+        self.place(env, [(3, 4), (0, 0)])
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(env.encode_action(['E', 'SPACE']))  # the warrior attacks, then the city strikes back
+        self.assertEqual(env.war_weariness, 1000 + 16 + 16 - 50)
+        self.place(env, [(0, 2), (6, 4)])
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(env.encode_action(['SPACE', 'SHOOT']))  # the archer shoots and the city answers
+        self.assertEqual(env.war_weariness, 982 + 16 + 16 - 50)
+        self.place(env, [(0, 2), (0, 0)])
+        env.step(self.wait(env))
+        self.assertEqual(env.war_weariness, 964 - 50)
+        self.assertEqual(env.city_report()['war_weariness'], 914)
+
+    def test_encampment_strikes_add_war_weariness(self):
+        env = self.make_env(city_population=1, unit_count=1, city_districts=('encampment',))
+        camp = env.districts['encampment']
+        neighbor = next(cell.index for cell in env.map.grid[camp].get_neighbors(env.map.grid)
+                        if not cell.block_path and hex_distance(cell.index, env.city.position) == 3)
+        self.place(env, [neighbor])
+        env.war_weariness = 100
+        with patch('game.attack', return_value=(1, 0)):
+            env.step(self.wait(env))
+        self.assertEqual(env.war_weariness, 100 + 16 - 50)
+
+    def test_war_weariness_costs_amenities_up_to_the_need(self):
+        for population, weariness, lost in [(2, 2000, 0), (3, 399, 0), (3, 1000, 1), (7, 1000, 2), (7, 2000, 3)]:
+            with self.subTest(population=population, weariness=weariness):
+                env = self.make_env(city_population=population, city_luxuries=3, city_war_weariness=weariness)
+                report = env.city_report()
+                self.assertEqual(report['amenities_lost_to_war'], lost)
+                self.assertEqual(report['amenities'], 3 - lost)
+        env = self.make_env(city_population=3, city_luxuries=1, city_war_weariness=1000)
+        self.place_far(env)
+        self.assertEqual(env.city_report()['mood'], 'displeased')
+        self.assertEqual(env.get_observation()[-1], 0.2)  # two amenities' worth of weariness
+        env.war_weariness = 399
+        self.assertEqual(env.city_report()['mood'], 'content')
+
+    def test_war_weariness_needs_city_growth(self):
+        env = self.make_env(ranged_strength=30)
+        self.place(env, [(3, 4), (0, 0), (2, 0)])
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(env.encode_action(['E', 'SPACE', 'SPACE']))
+        self.assertEqual(env.war_weariness, 0)
+        for kwargs in ({'city_war_weariness': 10}, {'city_population': 1, 'city_war_weariness': -1},
+                       {'city_population': 1, 'city_war_weariness': 10001},
+                       {'city_population': 1, 'city_war_weariness': True}):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
 

@@ -322,7 +322,7 @@ class RunnerTests(unittest.TestCase):
     def test_city_population_trains_resumes_and_reports_final_size(self):
         args = self.args('--city-population', '2', '--city-water', 'coast')
         agent = self.make_agent(args)
-        self.assertTrue(agent.observation_schema.endswith(':city_growth:water=coast:luxuries=0'))
+        self.assertTrue(agent.observation_schema.endswith(':city_growth:water=coast:luxuries=0:weariness=0'))
         run_game.train_agent(agent, args)
         agent.save(args.model_path)
         resume_args = self.args()
@@ -334,9 +334,12 @@ class RunnerTests(unittest.TestCase):
             self.make_agent(self.args('--city-water', 'fresh'))
         with self.assertRaisesRegex(ValueError, 'city-luxuries'):
             self.make_agent(self.args('--city-luxuries', '2'))
-        luxury_args = self.args('--fresh', '--city-population', '3', '--city-luxuries', '2')
+        luxury_args = self.args('--fresh', '--city-population', '3', '--city-luxuries', '2',
+                                '--city-war-weariness', '800')
         self.make_agent(luxury_args)
-        self.assertEqual(luxury_args.config.city_luxuries, 2)
+        self.assertEqual((luxury_args.config.city_luxuries, luxury_args.config.city_war_weariness), (2, 800))
+        with self.assertRaisesRegex(ValueError, 'city-war-weariness'):
+            self.make_agent(self.args('--city-war-weariness', '800'))  # the saved model started at 0
         evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
         for summary in evaluations.values():
             self.assertGreaterEqual(summary['average_city_population'], 1)

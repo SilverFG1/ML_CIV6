@@ -16,7 +16,7 @@ DEFAULT_MODEL_PATH = Path("q_learning_model.json")
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 # Scenario fields stored as JSON lists that GameConfig needs as tuples.
 TUPLE_FIELDS = ("city_position", "unit_strengths", "unit_types", "city_districts", "city_buildings",
-                "city_build_queue")
+                "city_build_queue", "enemy_city")
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
                  "random_actions", "policy_actions", "q_table_size", "city_strength")
 
@@ -63,6 +63,9 @@ def parse_args(argv=None):
                         help="luxury resources the city has, each giving one amenity, 0-8 (default: 0)")
     parser.add_argument("--city-war-weariness", type=int,
                         help="war weariness the city's civilization starts with, 0-10000 points (default: 0)")
+    parser.add_argument("--city-loyalty", type=int, help="the city's starting loyalty, 1-100 (default: 100)")
+    parser.add_argument("--enemy-city", type=int, nargs=2, metavar=("POPULATION", "DISTANCE"),
+                        help="a city of the attacker's civilization that pressures the city's loyalty")
     parser.add_argument("--city-builders", type=int, help="builders the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-settlers", type=int, help="settlers the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-districts", choices=tuple(game.DISTRICTS), nargs="+",
@@ -107,7 +110,8 @@ def config_from_args(args, saved=None):
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
                  "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
-                 "city_population", "city_water", "city_luxuries", "city_war_weariness", "city_builders",
+                 "city_population", "city_water", "city_luxuries", "city_war_weariness", "city_loyalty",
+                 "city_builders",
                  "city_settlers",
                  *TUPLE_FIELDS[3:]):
         value = getattr(args, name)
@@ -186,7 +190,7 @@ def _validate_training_state(agent):
             raise ValueError('Checkpoint history contains invalid counts')
         if row['guidance_actions'] + row['random_actions'] + row['policy_actions'] != row['steps']:
             raise ValueError('Checkpoint history action counts disagree')
-        if row['outcome'] not in ('win', 'loss', 'timeout', 'quit') or not 0 <= row['epsilon'] <= 1:
+        if row['outcome'] not in ('win', 'loss', 'timeout', 'quit', 'free_city') or not 0 <= row['epsilon'] <= 1:
             raise ValueError('Checkpoint history contains invalid outcomes or exploration rates')
     best = state.get('best_validation_score')
     if best is not None and (not isinstance(best, list) or len(best) != 2
@@ -356,6 +360,8 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 "losses": sum(row["outcome"] == "loss" for row in rows),
                 "timeouts": sum(row["outcome"] == "timeout" for row in rows),
                 "quits": sum(row["outcome"] == "quit" for row in rows),
+                # The city declared independence: it left its civilization without being captured.
+                "free_cities": sum(row["outcome"] == "free_city" for row in rows),
                 "win_rate": wins / completed if completed else 0.0,
                 "average_reward": sum(row["reward"] for row in rows) / completed if completed else 0.0,
                 "average_steps": sum(row["steps"] for row in rows) / completed if completed else 0.0,
@@ -374,6 +380,7 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 summary = summaries[policy]
                 print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}, "
                       f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}"
+                      + (f", free cities {summary['free_cities']}" if summary['free_cities'] else "")
                       + "".join(f", {label.replace('_', ' ')} {value:.2f}" for label, value in extras.items()))
             if summaries[policy]["quits"]:
                 break

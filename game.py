@@ -78,10 +78,11 @@ FARM_HOUSING = 0.5
 # Amenities (Civ VI): a city needs none for its first two citizens, one for the
 # third, and one more for every two citizens after that. Each luxury resource
 # provides one. The balance sets the city's mood, which changes its growth and
-# its non-food yields. Sources differ between expansions on the yield changes.
+# its non-food yields. Gathering Storm raised the happy and ecstatic thresholds
+# to +3 and +5; sources differ on some yield changes.
 AMENITY_MOODS = (  # (lowest balance, mood, growth change, non-food yield change)
-    (3, 'ecstatic', .20, .10),
-    (1, 'happy', .10, .05),
+    (5, 'ecstatic', .20, .20),
+    (3, 'happy', .10, .10),
     (0, 'content', 0, 0),
     (-2, 'displeased', -.15, -.05),
     (-4, 'unhappy', -.30, -.10),
@@ -99,6 +100,35 @@ WAR_WEARINESS_PER_COMBAT = 16
 WAR_WEARINESS_DECAY = 50
 WAR_WEARINESS_PER_AMENITY = 400
 MAX_WAR_WEARINESS = 10000  # largest starting value a scenario accepts
+# Loyalty (Rise and Fall and Gathering Storm), 0-100. Each citizen within 9
+# tiles adds 1 loyalty a turn, 10% less per tile away; capital citizens count
+# double. Domestic minus foreign pressure is capped at 20 either way. The
+# city's mood adds or removes loyalty. Below 75 loyalty, yields and growth fall
+# by 25%; below 25, yields fall by 50% and growth by 75%. At 0 the city
+# declares independence and becomes a Free City.
+LOYALTY_RANGE = 9
+MAX_PRESSURE = 20
+CAPITAL_PRESSURE = 2
+LOYALTY_FROM_MOOD = {'ecstatic': 6, 'happy': 3, 'content': 0, 'displeased': -3,
+                     'unhappy': -6, 'unrest': -6, 'revolt': -6}
+# The attacker gains this much reward when the city declares independence.
+INDEPENDENCE_REWARD = 5.0
+
+
+def loyalty_effects(loyalty):
+    """Return (growth change, non-food yield change) for a loyalty level."""
+    if loyalty >= 75:
+        return 0, 0
+    if loyalty >= 25:
+        return -.25, -.25
+    return -.75, -.5
+
+
+def citizen_pressure(population, distance, capital=False):
+    """Loyalty a turn from a city's citizens at this distance."""
+    if distance > LOYALTY_RANGE:
+        return 0
+    return population * (10 - distance) / 10 * (CAPITAL_PRESSURE if capital else 1)
 
 
 def amenities_needed(population):
@@ -164,6 +194,7 @@ class BuildingSpec:
     yields: tuple = ()  # (yield type, amount) pairs
     walls: float = 0  # outer defense added to the city's walls
     housing: float = 0
+    loyalty: float = 0
 
 
 # Ancient-era districts and buildings (Gathering Storm). The Water Mill needs a
@@ -176,7 +207,7 @@ DISTRICTS = {
     'encampment': DistrictSpec('Bronze Working', distance=2),
 }
 BUILDINGS = {
-    'monument': BuildingSpec('(none)', 60, yields=(('culture', 2),)),
+    'monument': BuildingSpec('(none)', 60, yields=(('culture', 2),), loyalty=1),
     'granary': BuildingSpec('Pottery', 65, yields=(('food', 1),), housing=2),
     'ancient_walls': BuildingSpec('Masonry', 80, walls=100),
     'library': BuildingSpec('Writing', 80, 'campus', yields=(('science', 2),)),
@@ -221,6 +252,8 @@ class GameConfig:
     city_water: str = 'fresh'
     city_luxuries: int = 0
     city_war_weariness: int = 0
+    city_loyalty: int = 100
+    enemy_city: tuple = ()  # (population, distance) of a city of the attacker's civilization
     city_builders: int = 0
     city_settlers: int = 0
     city_districts: tuple = ()
@@ -277,6 +310,17 @@ class GameConfig:
             raise ValueError(f'city_war_weariness must be an integer between 0 and {MAX_WAR_WEARINESS}')
         if self.city_war_weariness and not self.city_growth:
             raise ValueError('war weariness needs a city with population (city_population >= 1)')
+        if isinstance(self.city_loyalty, bool) or not isinstance(self.city_loyalty, int) or not 1 <= self.city_loyalty <= 100:
+            raise ValueError('city_loyalty must be an integer between 1 and 100')
+        if self.enemy_city:
+            if (not isinstance(self.enemy_city, tuple) or len(self.enemy_city) != 2
+                    or any(isinstance(v, bool) or not isinstance(v, int) for v in self.enemy_city)
+                    or not 1 <= self.enemy_city[0] <= MAX_CITY_POPULATION
+                    or not MIN_CITY_DISTANCE <= self.enemy_city[1] <= LOYALTY_RANGE):
+                raise ValueError(f'enemy_city must be (population 1-{MAX_CITY_POPULATION}, '
+                                 f'distance {MIN_CITY_DISTANCE}-{LOYALTY_RANGE})')
+        if (self.city_loyalty != 100 or self.enemy_city) and not self.city_growth:
+            raise ValueError('loyalty needs a city with population (city_population >= 1)')
         for name in ('city_builders', 'city_settlers'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CIVILIANS:
@@ -488,6 +532,8 @@ class Game:
                                    + ','.join(self.unit_types)
                                    + (f':city_growth:water={self.config.city_water}:luxuries={self.config.city_luxuries}'
                                       f':weariness={self.config.city_war_weariness}'
+                                      f':loyalty={self.config.city_loyalty}'
+                                      + (':enemy={}@{}'.format(*self.config.enemy_city) if self.config.enemy_city else '')
                                       if self.config.city_growth else '')
                                    + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else '')
                                    + (':built=' + ','.join(self.config.city_districts + self.config.city_buildings)
@@ -505,6 +551,8 @@ class Game:
         self.build_progress = {}
         self.completed = []
         self.war_weariness = 0
+        self.loyalty = 100
+        self.independent = False
         self.city = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -548,6 +596,7 @@ class Game:
         self.founded_cities = []
         self.districts, self.buildings, self.build_progress, self.completed = {}, [], {}, []
         self.war_weariness = c.city_war_weariness
+        self.loyalty, self.independent = c.city_loyalty, False
         self._valid_cache_key = self._path_costs = None
         # Starting districts and buildings exist before the squad arrives.
         for item in c.city_districts + c.city_buildings:
@@ -738,6 +787,32 @@ class Game:
             self.grow_city()
         if self.config.city_build_queue:
             self.produce()
+        if self.config.city_growth:
+            self.update_loyalty()
+
+    def loyalty_sources(self):
+        """This turn's loyalty change from each source."""
+        city = self.city
+        domestic = citizen_pressure(city.population, 0, capital=True)
+        domestic += sum(citizen_pressure(1, hex_distance(pos, city.position)) for pos in self.founded_cities)
+        foreign = citizen_pressure(*self.config.enemy_city) if self.config.enemy_city else 0
+        sources = {'citizen_pressure': round(max(-MAX_PRESSURE, min(MAX_PRESSURE, domestic - foreign)), 2),
+                   'amenities': LOYALTY_FROM_MOOD[self.mood()[0]]}
+        buildings = sum(BUILDINGS[building].loyalty for building in self.buildings)
+        if buildings:
+            sources['buildings'] = buildings
+        return sources
+
+    def loyalty_per_turn(self):
+        return round(sum(self.loyalty_sources().values()), 2)
+
+    def update_loyalty(self):
+        """Apply this turn's loyalty change; at 0 and still falling, the city declares independence."""
+        change = self.loyalty_per_turn()
+        self.loyalty = round(min(100, max(0, self.loyalty + change)), 2)
+        if self.loyalty == 0 and change < 0:
+            self.independent = True
+            self.city._event('city_declared_independence')
 
     def combat_fought(self):
         """Each combat around the city adds to its civilization's war weariness."""
@@ -941,8 +1016,8 @@ class Game:
 
     def _mood_adjusted(self, amount):
         """Apply the mood's change to a non-food yield."""
-        change = self.mood()[2]
-        return round(amount * (1 + change), 2) if change else amount
+        change = self.mood()[2] + (loyalty_effects(self.loyalty)[1] if self.config.city_growth else 0)
+        return round(amount * max(0, 1 + change), 2) if change else amount
 
     def city_output(self):
         """All the city's yields per turn: food, production, culture, science and faith."""
@@ -970,11 +1045,12 @@ class Game:
     def growth_surplus(self):
         """The food stored this turn.
 
-        Amenities and housing scale a surplus, but never a shortfall.
+        Amenities, loyalty and housing scale a surplus, but never a shortfall.
         """
         surplus = self.food_surplus()
         if surplus > 0:
-            rate = (1 + self.mood()[1]) * housing_growth_rate(self.city.population, self.housing())
+            change = self.mood()[1] + loyalty_effects(self.loyalty)[0]
+            rate = max(0, 1 + change) * housing_growth_rate(self.city.population, self.housing())
             if rate != 1:
                 surplus = round(surplus * rate, 4)
         return surplus
@@ -995,6 +1071,8 @@ class Game:
                 'amenities': self.amenities()[0], 'amenities_needed': self.amenities()[1],
                 'mood': self.mood()[0], 'war_weariness': self.war_weariness,
                 'amenities_lost_to_war': self.amenities_lost_to_war(),
+                'loyalty': self.loyalty, 'loyalty_per_turn': self.loyalty_per_turn(),
+                'loyalty_sources': self.loyalty_sources(),
                 'growth_surplus': stored,
                 'turns_to_grow': math.ceil((threshold - city.food) / stored) if stored > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
@@ -1051,6 +1129,8 @@ class Game:
     def _outcome(self):
         if not self.city.alive or self.city.hp <= 0:
             return 'win'
+        if self.independent:
+            return 'free_city'
         if not any(u.alive and u.hp > 0 and not u.support for u in self.units):
             return 'loss'
         return 'ongoing'
@@ -1087,6 +1167,8 @@ class Game:
                 reward -= CITY_FOUNDED_PENALTY
             elif kind == 'city_built':
                 reward -= BUILD_REWARD
+            elif kind == 'city_declared_independence':
+                reward += INDEPENDENCE_REWARD
         if self.last_info['outcome'] == 'win':
             reward += 10
         elif self.last_info['outcome'] == 'loss':
@@ -1143,7 +1225,8 @@ class Game:
             progress = min(1.0, city.food / growth_threshold(city.population))
             values.extend([city.population / MAX_CITY_POPULATION, math.floor(4 * progress) / 4,
                            self.food_surplus() / 10, (self.housing() - city.population) / 10,
-                           min(1.0, self.war_weariness // WAR_WEARINESS_PER_AMENITY / 10)])
+                           min(1.0, self.war_weariness // WAR_WEARINESS_PER_AMENITY / 10),
+                           math.floor(self.loyalty / 10) / 10])
         for civilian in self.civilians:
             values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
                            float(civilian.alive), civilian.charges / BUILDER_CHARGES])

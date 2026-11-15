@@ -78,6 +78,8 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--city-water fresh\|coast\|none` | Set the city's water supply, which gives 5, 3 or 2 starting housing (default: `fresh`). |
 | `--city-luxuries N` | Give the city N luxury resources (0–8), each worth one amenity (default: 0). |
 | `--city-war-weariness POINTS` | Start the city's civilization with this much war weariness (0–10000; default: 0). |
+| `--city-loyalty N` | Set the city's starting loyalty (1–100; default: 100). |
+| `--enemy-city POPULATION DISTANCE` | Add a city of the attacker's civilization 4–9 hexes away, whose citizens pressure the city's loyalty. |
 | `--city-builders N`, `--city-settlers N` | Give the city up to two builders and two settlers; requires `--city-population`. |
 | `--city-districts ...`, `--city-buildings ...` | Ancient-era districts and buildings the city starts with; requires `--city-population`. |
 | `--build-queue ...` | Districts and buildings the city produces, in order, during the game. |
@@ -130,20 +132,28 @@ python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman b
 
   | Amenities vs. needed | Mood | Growth | Production, culture, science, faith |
   | --- | --- | --- | --- |
-  | +3 or more | Ecstatic | +20% | +10% |
-  | +1 to +2 | Happy | +10% | +5% |
-  | 0 | Content | — | — |
+  | +5 or more | Ecstatic | +20% | +20% |
+  | +3 to +4 | Happy | +10% | +10% |
+  | 0 to +2 | Content | — | — |
   | −1 to −2 | Displeased | −15% | −5% |
   | −3 to −4 | Unhappy | −30% | −10% |
   | −5 to −6 | Unrest | stops | −15% |
   | −7 or fewer | Revolt | stops | −20% |
 
-  The mood's growth change and the housing limit both scale stored food: a displeased city one citizen below its housing stores 0.85 × 0.5 of its surplus. Neither affects a shortfall. Sources agree on the growth changes but differ between expansions on the yield changes, so check the table against your game if exact values matter. Rebels and loyalty are not modeled.
+  The mood's growth change and the housing limit both scale stored food: a displeased city one citizen below its housing stores 0.85 × 0.5 of its surplus. Low loyalty (below) adds to the mood's change. None of these affects a shortfall. These are Gathering Storm's tiers, which raised the happy and ecstatic thresholds from +1 and +3. Sources differ between expansions on some yield changes, so check the table against your game if exact values matter. Rebels are not modeled.
 - **War weariness.** Every combat around the city adds 16 points of war weariness to its civilization: a unit attacking the city in melee or at range, a city strike, or an encampment strike. While at war, weariness fades by 50 points a turn. Every 400 points cost the city one amenity, but never more amenities than it needs, as in Gathering Storm. These are Gathering Storm's ancient-era values. Combat on foreign land counts double and a lost unit triples it, but the defender fights on its own land and has no units. At these rates, a single siege rarely builds lasting weariness. In 20 heuristic games, it peaked below 50 points. `--city-war-weariness` sets the weariness the civilization brings from earlier fighting, which is where it matters most.
+- **Loyalty.** The city has loyalty from 0 to 100 (`--city-loyalty`, default 100), which changes every turn:
+  - *Citizen pressure.* Each citizen within 9 tiles adds 1 loyalty a turn, 10% less for each tile away. The city's own citizens count double because it is the capital, and cities founded by its settlers add their citizens too. Citizens of an enemy city (`--enemy-city POPULATION DISTANCE`) subtract loyalty the same way. The enemy city is not drawn on the map. Pressure is capped at 20 either way.
+  - *Mood.* Ecstatic +6, happy +3, displeased −3, and unhappy or worse −6.
+  - *Monument.* +1.
+
+  Below 75 loyalty, the city's yields and growth fall by 25%. Below 25, yields fall by 50% and growth by 75%. When loyalty reaches 0 and is still falling, the city declares independence and becomes a Free City. The game ends with the outcome `free_city`, the attacker gains 5 reward, and evaluation summaries count `free_cities`. What the Free City does next, such as training units or joining another civilization, is not simulated.
+
+  These follow Civ VI's Civilopedia and wiki. Civ VI's exact conversion from pressure to loyalty is not documented, so 1 loyalty per citizen is an approximation. Governors, religion, golden and dark ages, and policies are not modeled. An isolated city stays loyal. A large enemy city nearby can turn a long siege into a loyalty flip: with a size-12 enemy city 4 hexes away, a squad that stayed back saw a size-3 capital declare independence in 16 of 20 games.
 - **Starvation.** If the city's food store would drop below zero, it empties and the city loses a citizen (never going below one).
 - **Reward.** The attacker loses 1 reward each time the city grows and gains 1 each time it starves. Units standing next to the city therefore blockade it as well as besiege it.
 
-Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), and war weariness in whole amenities (points ÷ 400). The observation schema ends with `:city_growth:water=...:luxuries=N:weariness=N`, so turning growth on or changing the water supply, luxuries or starting weariness requires `--fresh`; growth models trained before housing, amenities and war weariness were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
+Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), war weariness in whole amenities (points ÷ 400), and loyalty in tenths. The observation schema ends with `:city_growth:water=...:luxuries=N:weariness=N:loyalty=N` (and `:enemy=POPULATION@DISTANCE` when there is an enemy city), so turning growth on or changing any of these requires `--fresh`; growth models trained before housing, amenities, war weariness and loyalty were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-path runs/growth/model.json --metrics-dir runs/growth --fresh
@@ -182,7 +192,7 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 
 | Building | District | Cost | Effect in this simulation |
 | --- | --- | --- | --- |
-| `monument` | City center | 60 | +2 culture |
+| `monument` | City center | 60 | +2 culture, +1 loyalty |
 | `granary` | City center | 65 | +1 food, +2 housing |
 | `ancient_walls` | City center | 80 | +100 wall HP and a city ranged strike |
 | `library` | Campus | 80 | +2 science |
@@ -191,11 +201,11 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 
 - **Placement.** A district goes on the free tile with the best adjacency bonus, then the lowest yields. The city center counts as a district for adjacency. A district tile is no longer worked by citizens, and a district placed on a farm replaces it. A tile with a unit or civilian on it cannot take a district.
 - **District limit.** A city can have one district, plus one more for every three citizens beyond the first (1 at population 1–3, 2 at 4–6, and so on). A starting configuration that exceeds the limit is rejected.
-- **Production.** The city's production (1 from the city center, 1 from each worked forest, and 1 from barracks) is scaled by the city's mood and goes to the first queued item it can build. An item waits while its district is missing, the district limit is reached, or no tile is free; partial progress is kept. Leftover production carries over to the next item, and production is lost when nothing in the queue can be built. Blockading forest tiles therefore slows construction.
+- **Production.** The city's production (1 from the city center, 1 from each worked forest, and 1 from barracks) is scaled by the city's mood and loyalty and goes to the first queued item it can build. An item waits while its district is missing, the district limit is reached, or no tile is free; partial progress is kept. Leftover production carries over to the next item, and production is lost when nothing in the queue can be built. Blockading forest tiles therefore slows construction.
 - **Combat.** Ancient Walls add 100 wall HP and give the city a ranged strike, as walls do in Civ VI. The encampment shoots a unit within 2 hexes of it each turn. Units cannot enter the encampment, which cannot be attacked. Both strikes use the city's ranged strength, or 15 (Civ VI's value for a civilization without ranged units) when the city has none. Battering rams help against these walls as they do against `--wall-hp`.
 - **Reward.** The attacker loses 1 each time the city completes a district or building.
 
-Culture, science and faith are scaled by the city's mood and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
+Culture, science and faith are scaled by the city's mood and loyalty and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
 
 The observation adds a built flag for each listed district and building, plus the current item's production progress in quarters. An encampment appears as impassable in the terrain grid. The schema ends with `:built=...` and `:queue=...`, so changing them requires `--fresh`. Evaluation summaries report `average_builds_completed` when there is a queue.
 
@@ -209,7 +219,7 @@ During playback, districts are outlined in their own color (blue campus, gold ho
 
 Each run writes to `--metrics-dir` (default `training_metrics`):
 
-- `training.csv`: episode-level training metrics, including reward, win/termination outcome, length, Q-table size, and guidance usage.
+- `training.csv`: episode-level training metrics, including reward, outcome (`win`, `loss`, `timeout`, `quit`, or `free_city`), length, Q-table size, and guidance usage.
 - `metrics.json`: scenario and learning settings, seeds, training history, and evaluation summaries for comparing runs.
 - `learning_curve.svg`: training curves that open in a browser without extra plotting packages.
 

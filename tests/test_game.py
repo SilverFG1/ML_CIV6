@@ -10,8 +10,8 @@ import numpy as np
 
 import constants
 from class_hex import HexMap
-from game import (C_Unit, Game, GameConfig, amenities_needed, amenity_mood, attack, growth_threshold,
-                  hex_distance, housing_growth_rate)
+from game import (C_Unit, Game, GameConfig, amenities_needed, amenity_mood, attack, citizen_pressure,
+                  growth_threshold, hex_distance, housing_growth_rate, loyalty_effects)
 
 
 class GameTests(unittest.TestCase):
@@ -499,14 +499,14 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=2)
         base = self.make_env()
         self.assertEqual(env.observation_schema,
-                         base.observation_schema + ':city_growth:water=fresh:luxuries=0:weariness=0')
-        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 5)
+                         base.observation_schema + ':city_growth:water=fresh:luxuries=0:weariness=0:loyalty=100')
+        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 6)
         self.place_far(env)
         # Population, growth progress, food surplus, housing room (5 housing - 2 citizens),
-        # and amenities' worth of war weariness.
-        np.testing.assert_allclose(env.get_observation()[-5:], [2 / 20, 0, 0.2, 0.3, 0])
+        # war weariness in whole amenities, and loyalty in tenths.
+        np.testing.assert_allclose(env.get_observation()[-6:], [2 / 20, 0, 0.2, 0.3, 0, 1])
         env.city.food = 13  # just over half of 24, reported in quarters
-        self.assertEqual(env.get_observation()[-4], 0.5)
+        self.assertEqual(env.get_observation()[-5], 0.5)
 
     def test_invalid_city_population_rejected(self):
         for value in (-1, 21, True, 1.5):
@@ -545,7 +545,7 @@ class GameTests(unittest.TestCase):
         self.assertTrue(all(hex_distance(pos, env.city.position) <= 2 for pos in positions))
         self.assertEqual(env.observation_schema,
                          'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:water=fresh:luxuries=0:weariness=0:'
-                         'civilians=builder,builder,settler,settler')
+                         'loyalty=100:civilians=builder,builder,settler,settler')
         self.assertEqual(len(env.get_observation()), len(self.make_env(city_population=2).get_observation()) + 16)
 
     def test_builder_farms_grassland_until_its_charges_run_out(self):
@@ -642,7 +642,7 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=2)
         self.assertEqual((env.districts, env.buildings), ({}, []))
         self.assertNotIn('built', env.observation_schema)
-        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 5)
+        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 6)
         report = env.city_report()
         self.assertEqual((report['culture'], report['science'], report['faith']), (0, 0, 0))
         self.assertNotIn('producing', report)
@@ -824,7 +824,9 @@ class GameTests(unittest.TestCase):
     # Amenities.
     def test_amenities_needed_and_moods_follow_civ6(self):
         self.assertEqual([amenities_needed(pop) for pop in (1, 2, 3, 4, 5, 6, 11, 12)], [0, 0, 1, 1, 2, 2, 5, 5])
-        for balance, mood in [(5, 'ecstatic'), (3, 'ecstatic'), (2, 'happy'), (1, 'happy'), (0, 'content'),
+        # Gathering Storm thresholds: happy from +3, ecstatic from +5.
+        for balance, mood in [(6, 'ecstatic'), (5, 'ecstatic'), (4, 'happy'), (3, 'happy'), (2, 'content'),
+                              (1, 'content'), (0, 'content'),
                               (-1, 'displeased'), (-2, 'displeased'), (-3, 'unhappy'), (-4, 'unhappy'),
                               (-5, 'unrest'), (-6, 'unrest'), (-7, 'revolt'), (-12, 'revolt')]:
             with self.subTest(balance=balance):
@@ -832,8 +834,8 @@ class GameTests(unittest.TestCase):
         self.assertEqual(amenity_mood(-5)[1], -1.0)  # unrest stops growth
 
     def test_mood_scales_growth(self):
-        for luxuries, mood, stored in [(0, 'displeased', 1.7), (1, 'content', 2), (2, 'happy', 2.2),
-                                       (4, 'ecstatic', 2.4)]:
+        for luxuries, mood, stored in [(0, 'displeased', 1.7), (1, 'content', 2), (3, 'content', 2),
+                                       (4, 'happy', 2.2), (6, 'ecstatic', 2.4)]:
             with self.subTest(luxuries=luxuries):
                 env = self.make_env(city_population=3, city_luxuries=luxuries)
                 self.place_far(env)
@@ -864,7 +866,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual(env.city.population, 10)
 
     def test_mood_scales_non_food_yields(self):
-        for luxuries, scale in [(0, 0.95), (1, 1.0), (4, 1.1)]:
+        for luxuries, scale in [(0, 0.95), (1, 1.0), (4, 1.1), (6, 1.2)]:
             with self.subTest(luxuries=luxuries):
                 env = self.make_env(city_population=3, city_luxuries=luxuries, city_buildings=('monument',),
                                     city_build_queue=('granary',))
@@ -926,7 +928,7 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=3, city_luxuries=1, city_war_weariness=1000)
         self.place_far(env)
         self.assertEqual(env.city_report()['mood'], 'displeased')
-        self.assertEqual(env.get_observation()[-1], 0.2)  # two amenities' worth of weariness
+        self.assertEqual(env.get_observation()[-2], 0.2)  # two amenities' worth of weariness
         env.war_weariness = 399
         self.assertEqual(env.city_report()['mood'], 'content')
 
@@ -941,6 +943,78 @@ class GameTests(unittest.TestCase):
                        {'city_population': 1, 'city_war_weariness': True}):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
+
+
+    # Loyalty.
+    def test_citizen_pressure_and_loyalty_effects(self):
+        self.assertEqual(citizen_pressure(3, 0, capital=True), 6)
+        self.assertEqual(citizen_pressure(10, 4), 6)
+        self.assertAlmostEqual(citizen_pressure(1, 9), 0.1)
+        self.assertEqual(citizen_pressure(5, 10), 0)
+        for loyalty, effects in [(100, (0, 0)), (75, (0, 0)), (74, (-.25, -.25)), (25, (-.25, -.25)),
+                                 (24, (-.75, -.5)), (1, (-.75, -.5))]:
+            with self.subTest(loyalty=loyalty):
+                self.assertEqual(loyalty_effects(loyalty), effects)
+
+    def test_isolated_capital_stays_loyal(self):
+        env = self.make_env(city_population=3)
+        self.place_far(env)
+        self.assertEqual(env.loyalty_sources(), {'citizen_pressure': 6, 'amenities': -3})
+        env.step(self.wait(env))
+        self.assertEqual(env.loyalty, 100)
+        report = env.city_report()
+        self.assertEqual((report['loyalty'], report['loyalty_per_turn']), (100, 3))
+
+    def test_enemy_city_pressure_wears_loyalty_down(self):
+        env = self.make_env(city_population=3, city_loyalty=80, enemy_city=(10, 4), city_buildings=('monument',))
+        self.place_far(env)
+        # 6 domestic - 6 foreign, -3 for a displeased city, +1 from the monument.
+        self.assertEqual(env.loyalty_sources(), {'citizen_pressure': 0, 'amenities': -3, 'buildings': 1})
+        env.step(self.wait(env))
+        self.assertEqual(env.loyalty, 78)
+        self.assertEqual(env.get_observation()[-2], 0.7)  # loyalty, before the monument's built flag
+        env.founded_cities.append((0, 0))  # six hexes away: one citizen adds 0.4
+        self.assertAlmostEqual(env.loyalty_sources()['citizen_pressure'], 0.4)
+
+    def test_pressure_is_capped_at_twenty(self):
+        env = self.make_env(city_population=15, city_luxuries=8)
+        self.assertEqual(env.loyalty_sources()['citizen_pressure'], 20)
+        env = self.make_env(city_population=1, enemy_city=(20, 4))
+        self.assertEqual(env.loyalty_sources()['citizen_pressure'], 2 - 12)
+
+    def test_low_loyalty_cuts_growth_and_yields(self):
+        for luxuries, loyalty, stored, production in [(1, 100, 2, 1), (1, 50, 1.5, 0.75), (1, 20, 0.5, 0.5),
+                                                      (0, 50, 1.2, 0.7)]:
+            with self.subTest(luxuries=luxuries, loyalty=loyalty):
+                env = self.make_env(city_population=3, city_luxuries=luxuries)
+                self.place_far(env)
+                env.loyalty = loyalty
+                self.assertAlmostEqual(env.growth_surplus(), stored)
+                self.assertAlmostEqual(env.city_yields()[1], production)
+
+    def test_city_declares_independence_at_zero_loyalty(self):
+        env = self.make_env(city_population=3, city_loyalty=5, enemy_city=(20, 4))
+        self.place_far(env)
+        self.assertEqual(env.loyalty_per_turn(), -9)
+        _, reward, done = env.step(self.wait(env))
+        self.assertTrue(done)
+        self.assertEqual((env.loyalty, env.last_info['outcome']), (0, 'free_city'))
+        self.assertIn({'type': 'city_declared_independence', 'object': 'Ottertopia'}, env.events)
+        self.assertAlmostEqual(reward, 4.95)
+        self.assertEqual(env.step(self.wait(env))[1:], (0.0, True))
+
+    def test_loyalty_needs_growth_and_valid_settings(self):
+        env = self.make_env()
+        env.step(self.wait(env))
+        self.assertEqual(env.loyalty, 100)
+        for kwargs in ({'city_loyalty': 50}, {'enemy_city': (5, 5)},
+                       {'city_population': 1, 'city_loyalty': 0}, {'city_population': 1, 'city_loyalty': 101},
+                       {'city_population': 1, 'city_loyalty': True}, {'city_population': 1, 'enemy_city': (5, 3)},
+                       {'city_population': 1, 'enemy_city': (5, 10)}, {'city_population': 1, 'enemy_city': (0, 5)},
+                       {'city_population': 1, 'enemy_city': [5, 5]}, {'city_population': 1, 'enemy_city': (5,)}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                GameConfig(**kwargs)
+        self.assertTrue(self.make_env(city_population=1, enemy_city=(5, 9)).observation_schema.endswith(':enemy=5@9'))
 
 
 if __name__ == '__main__':

@@ -322,7 +322,7 @@ class RunnerTests(unittest.TestCase):
     def test_city_population_trains_resumes_and_reports_final_size(self):
         args = self.args('--city-population', '2', '--city-water', 'coast')
         agent = self.make_agent(args)
-        self.assertTrue(agent.observation_schema.endswith(':city_growth:water=coast:luxuries=0:weariness=0'))
+        self.assertTrue(agent.observation_schema.endswith(':city_growth:water=coast:luxuries=0:weariness=0:loyalty=100'))
         run_game.train_agent(agent, args)
         agent.save(args.model_path)
         resume_args = self.args()
@@ -340,6 +340,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((luxury_args.config.city_luxuries, luxury_args.config.city_war_weariness), (2, 800))
         with self.assertRaisesRegex(ValueError, 'city-war-weariness'):
             self.make_agent(self.args('--city-war-weariness', '800'))  # the saved model started at 0
+        with self.assertRaisesRegex(ValueError, 'enemy-city'):
+            self.make_agent(self.args('--enemy-city', '8', '5'))
+        rebel_args = self.args('--fresh', '--no-save', '--city-population', '3', '--city-loyalty', '5',
+                               '--enemy-city', '20', '4')
+        rebel = self.make_agent(rebel_args)
+        self.assertEqual((rebel_args.config.city_loyalty, rebel_args.config.enemy_city), (5, (20, 4)))
+        summary = run_game.compare_policies(rebel, rebel_args, policies=['random'], verbose=False)['random']
+        self.assertEqual(summary['free_cities'], 2)  # loyalty 5 falls 9 a turn: independence on turn 1
+        run_game.train_agent(rebel, rebel_args)
+        self.assertEqual({row['outcome'] for row in rebel.training_state['metrics']}, {'free_city'})
+        rebel.save(self.root / 'rebel.json')
+        run_game._validate_training_state(QLearningAgent.load(self.root / 'rebel.json'))
         evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
         for summary in evaluations.values():
             self.assertGreaterEqual(summary['average_city_population'], 1)

@@ -160,6 +160,7 @@ class Renderer:
                   f'Walls {city.wall_hp:.0f}']
         if report is not None:
             status += [f'Pop {report["population"]} (housing {report["housing"]:g})',
+                       f'Amenities {report["amenities"]}/{report["amenities_needed"]} {report["mood"]}',
                        f'Food {report["food"]:g}/{report["growth_threshold"]} ({report["growth_surplus"]:+g})']
         civilians = self.env.civilian_report()
         if civilians is not None:
@@ -169,8 +170,8 @@ class Renderer:
             status.append('Built: ' + ', '.join(name.replace('_', ' ') for name in self.env.buildings))
         if report is not None and report.get('producing'):
             status.append(f'Producing {report["producing"].replace("_", " ")} '
-                          f'{report["production_progress"]}/{report["production_cost"]} '
-                          f'(+{report["production_yield"]})')
+                          f'{report["production_progress"]:g}/{report["production_cost"]} '
+                          f'(+{report["production_yield"]:g})')
         lines = ['']
         for part in status:
             proposed = (lines[-1] + '   ' + part).strip()

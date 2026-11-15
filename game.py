@@ -75,6 +75,33 @@ WATER_HOUSING = {'fresh': 5, 'coast': 3, 'none': 2}
 FARM_HOUSING = 0.5
 
 
+# Amenities (Civ VI): a city needs none for its first two citizens, one for the
+# third, and one more for every two citizens after that. Each luxury resource
+# provides one. The balance sets the city's mood, which changes its growth and
+# its non-food yields. Sources differ between expansions on the yield changes.
+AMENITY_MOODS = (  # (lowest balance, mood, growth change, non-food yield change)
+    (3, 'ecstatic', .20, .10),
+    (1, 'happy', .10, .05),
+    (0, 'content', 0, 0),
+    (-2, 'displeased', -.15, -.05),
+    (-4, 'unhappy', -.30, -.10),
+    (-6, 'unrest', -1.0, -.15),
+    (None, 'revolt', -1.0, -.20),
+)
+MAX_LUXURIES = 8
+
+
+def amenities_needed(population):
+    return max(0, (population - 1) // 2)
+
+
+def amenity_mood(balance):
+    """Return (mood, growth change, non-food yield change) for an amenity balance."""
+    for lowest, mood, growth, yields in AMENITY_MOODS:
+        if lowest is None or balance >= lowest:
+            return mood, growth, yields
+
+
 def housing_growth_rate(population, housing):
     """Civ VI's share of surplus food that goes to growth, given housing.
 
@@ -180,6 +207,7 @@ class GameConfig:
     difficulty: str = 'normal'
     city_population: int = 0
     city_water: str = 'fresh'
+    city_luxuries: int = 0
     city_builders: int = 0
     city_settlers: int = 0
     city_districts: tuple = ()
@@ -226,6 +254,11 @@ class GameConfig:
             raise ValueError(f'city_population must be an integer between 0 and {MAX_CITY_POPULATION}')
         if self.city_water not in WATER_HOUSING:
             raise ValueError(f'city_water must be one of: {", ".join(WATER_HOUSING)}')
+        if (isinstance(self.city_luxuries, bool) or not isinstance(self.city_luxuries, int)
+                or not 0 <= self.city_luxuries <= MAX_LUXURIES):
+            raise ValueError(f'city_luxuries must be an integer between 0 and {MAX_LUXURIES}')
+        if self.city_luxuries and not self.city_growth:
+            raise ValueError('luxuries need a city with population (city_population >= 1)')
         for name in ('city_builders', 'city_settlers'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CIVILIANS:
@@ -435,7 +468,8 @@ class Game:
                                + ('settler',) * self.config.city_settlers)
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
-                                   + (f':city_growth:water={self.config.city_water}' if self.config.city_growth else '')
+                                   + (f':city_growth:water={self.config.city_water}:luxuries={self.config.city_luxuries}'
+                                      if self.config.city_growth else '')
                                    + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else '')
                                    + (':built=' + ','.join(self.config.city_districts + self.config.city_buildings)
                                       if self.config.city_districts or self.config.city_buildings else '')
@@ -760,10 +794,10 @@ class Game:
                 return  # nothing can be built now, so the production is lost
             needed = self.build_cost(item) - self.build_progress.get(item, 0)
             if production < needed:
-                self.build_progress[item] = self.build_progress.get(item, 0) + production
+                self.build_progress[item] = round(self.build_progress.get(item, 0) + production, 4)
                 return
             self.build_progress[item] = self.build_cost(item)
-            production -= needed
+            production = round(production - needed, 4)
             self.complete_build(item)
 
     def _steps_to(self, goals, blocked):
@@ -857,7 +891,23 @@ class Game:
         for building in self.buildings:
             yields = dict(BUILDINGS[building].yields)
             food, production = food + yields.get('food', 0), production + yields.get('production', 0)
-        return food, production
+        return food, self._mood_adjusted(production)
+
+    def amenities(self):
+        """Return (amenities available, amenities needed)."""
+        return self.config.city_luxuries, amenities_needed(self.city.population)
+
+    def mood(self):
+        """The city's mood and its growth and non-food yield changes; content without growth."""
+        if not self.config.city_growth:
+            return amenity_mood(0)
+        available, needed = self.amenities()
+        return amenity_mood(available - needed)
+
+    def _mood_adjusted(self, amount):
+        """Apply the mood's change to a non-food yield."""
+        change = self.mood()[2]
+        return round(amount * (1 + change), 2) if change else amount
 
     def city_output(self):
         """All the city's yields per turn: food, production, culture, science and faith."""
@@ -870,6 +920,8 @@ class Game:
             for kind, amount in BUILDINGS[building].yields:
                 if kind not in ('food', 'production'):
                     output[kind] += amount
+        for kind in ('culture', 'science', 'faith'):
+            output[kind] = self._mood_adjusted(output[kind])
         return output
 
     def food_surplus(self):
@@ -881,12 +933,15 @@ class Game:
                 + sum(BUILDINGS[building].housing for building in self.buildings))
 
     def growth_surplus(self):
-        """The food stored this turn: housing limits a surplus but never a shortfall."""
+        """The food stored this turn.
+
+        Amenities and housing scale a surplus, but never a shortfall.
+        """
         surplus = self.food_surplus()
         if surplus > 0:
-            rate = housing_growth_rate(self.city.population, self.housing())
-            if rate < 1:
-                surplus *= rate
+            rate = (1 + self.mood()[1]) * housing_growth_rate(self.city.population, self.housing())
+            if rate != 1:
+                surplus = round(surplus * rate, 4)
         return surplus
 
     def city_report(self):
@@ -902,6 +957,8 @@ class Game:
         return {'population': city.population, 'food': city.food, 'growth_threshold': threshold,
                 'food_yield': food, 'production_yield': production, 'food_surplus': surplus,
                 'housing': housing, 'growth_rate': housing_growth_rate(city.population, housing),
+                'amenities': self.amenities()[0], 'amenities_needed': self.amenities()[1],
+                'mood': self.mood()[0],
                 'growth_surplus': stored,
                 'turns_to_grow': math.ceil((threshold - city.food) / stored) if stored > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
@@ -931,7 +988,7 @@ class Game:
     def grow_city(self):
         """Store this turn's surplus; grow at the threshold, or starve once food runs out."""
         city = self.city
-        city.food += self.growth_surplus()
+        city.food = round(city.food + self.growth_surplus(), 4)
         threshold = growth_threshold(city.population)
         if city.food >= threshold:
             city.food -= threshold

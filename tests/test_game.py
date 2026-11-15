@@ -10,7 +10,8 @@ import numpy as np
 
 import constants
 from class_hex import HexMap
-from game import C_Unit, Game, GameConfig, attack, growth_threshold, hex_distance, housing_growth_rate
+from game import (C_Unit, Game, GameConfig, amenities_needed, amenity_mood, attack, growth_threshold,
+                  hex_distance, housing_growth_rate)
 
 
 class GameTests(unittest.TestCase):
@@ -446,7 +447,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual((state['population'], state['growth_threshold']), (2, 24))
 
     def test_citizens_prefer_woods_skip_mountains_and_avoid_occupied_tiles(self):
-        env = self.make_env(city_population=3)
+        env = self.make_env(city_population=3, city_luxuries=1)  # content, so production is unchanged
         grid = env.map.grid
         grid[(4, 3)].set_terrain('MOUNTAIN')
         grid[(3, 5)].set_terrain('FOREST')
@@ -497,7 +498,7 @@ class GameTests(unittest.TestCase):
     def test_growth_observation_and_schema(self):
         env = self.make_env(city_population=2)
         base = self.make_env()
-        self.assertEqual(env.observation_schema, base.observation_schema + ':city_growth:water=fresh')
+        self.assertEqual(env.observation_schema, base.observation_schema + ':city_growth:water=fresh:luxuries=0')
         self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 4)
         self.place_far(env)
         # Population, growth progress, food surplus, and housing room (5 housing - 2 citizens).
@@ -541,7 +542,7 @@ class GameTests(unittest.TestCase):
         self.assertFalse(set(positions) & ({u.position for u in env.units} | {env.city.position}))
         self.assertTrue(all(hex_distance(pos, env.city.position) <= 2 for pos in positions))
         self.assertEqual(env.observation_schema,
-                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:water=fresh:'
+                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:water=fresh:luxuries=0:'
                          'civilians=builder,builder,settler,settler')
         self.assertEqual(len(env.get_observation()), len(self.make_env(city_population=2).get_observation()) + 16)
 
@@ -660,7 +661,8 @@ class GameTests(unittest.TestCase):
         self.assertEqual(config.builds[-1], 'shrine')
 
     def test_district_adjacency_and_yields(self):
-        env = self.make_env(city_population=4, city_build_queue=('campus', 'holy_site', 'library', 'shrine'))
+        env = self.make_env(city_population=4, city_luxuries=1,
+                            city_build_queue=('campus', 'holy_site', 'library', 'shrine'))
         self.place_far(env)
         for pos in [(5, 2), (4, 2)]:
             env.map.grid[pos].set_terrain('MOUNTAIN')
@@ -816,6 +818,73 @@ class GameTests(unittest.TestCase):
         self.assertEqual(env.growth_surplus(), env.food_surplus())
         env.step(self.wait(env))
         self.assertEqual(env.city.population, 6)
+
+    # Amenities.
+    def test_amenities_needed_and_moods_follow_civ6(self):
+        self.assertEqual([amenities_needed(pop) for pop in (1, 2, 3, 4, 5, 6, 11, 12)], [0, 0, 1, 1, 2, 2, 5, 5])
+        for balance, mood in [(5, 'ecstatic'), (3, 'ecstatic'), (2, 'happy'), (1, 'happy'), (0, 'content'),
+                              (-1, 'displeased'), (-2, 'displeased'), (-3, 'unhappy'), (-4, 'unhappy'),
+                              (-5, 'unrest'), (-6, 'unrest'), (-7, 'revolt'), (-12, 'revolt')]:
+            with self.subTest(balance=balance):
+                self.assertEqual(amenity_mood(balance)[0], mood)
+        self.assertEqual(amenity_mood(-5)[1], -1.0)  # unrest stops growth
+
+    def test_mood_scales_growth(self):
+        for luxuries, mood, stored in [(0, 'displeased', 1.7), (1, 'content', 2), (2, 'happy', 2.2),
+                                       (4, 'ecstatic', 2.4)]:
+            with self.subTest(luxuries=luxuries):
+                env = self.make_env(city_population=3, city_luxuries=luxuries)
+                self.place_far(env)
+                report = env.city_report()
+                self.assertEqual((report['amenities'], report['amenities_needed'], report['mood']),
+                                 (luxuries, 1, mood))
+                self.assertEqual(report['food_surplus'], 2)
+                self.assertAlmostEqual(report['growth_surplus'], stored)
+                env.step(self.wait(env))
+                self.assertAlmostEqual(env.city.food, stored)
+
+    def test_mood_and_housing_combine(self):
+        env = self.make_env(city_population=3, city_water='none', city_buildings=('granary',))
+        self.place_far(env)
+        self.assertEqual((env.housing(), env.food_surplus(), env.mood()[0]), (4, 3, 'displeased'))
+        # Displeased (-15%) and one citizen below housing (half): 3 * 0.85 * 0.5.
+        self.assertAlmostEqual(env.growth_surplus(), 1.275)
+
+    def test_unrest_stops_growth_but_not_starvation(self):
+        env = self.make_env(city_population=11)
+        self.place_far(env)
+        self.assertEqual(env.city_report()['mood'], 'unrest')
+        self.assertLess(env.food_surplus(), 0)
+        self.assertEqual(env.growth_surplus(), env.food_surplus())
+        with patch.object(env, 'food_surplus', return_value=4):
+            self.assertEqual(env.growth_surplus(), 0)
+        env.step(self.wait(env))
+        self.assertEqual(env.city.population, 10)
+
+    def test_mood_scales_non_food_yields(self):
+        for luxuries, scale in [(0, 0.95), (1, 1.0), (4, 1.1)]:
+            with self.subTest(luxuries=luxuries):
+                env = self.make_env(city_population=3, city_luxuries=luxuries, city_buildings=('monument',),
+                                    city_build_queue=('granary',))
+                self.place_far(env)
+                for pos in env.territory():
+                    env.map.grid[pos].set_terrain('FOREST')
+                food, production = env.city_yields()
+                self.assertEqual(food, 8)  # food is not a non-food yield
+                self.assertAlmostEqual(production, 4 * scale)  # city center 1 + three worked forests
+                self.assertAlmostEqual(env.city_output()['culture'], 2 * scale)  # monument
+                env.step(self.wait(env))
+                self.assertAlmostEqual(env.build_progress['granary'], production)
+
+    def test_amenities_need_growth_and_valid_luxuries(self):
+        env = self.make_env()
+        self.assertEqual(env.mood()[0], 'content')
+        self.assertEqual(env.city_yields(), (2, 1))
+        for kwargs in ({'city_luxuries': 1}, {'city_population': 1, 'city_luxuries': 9},
+                       {'city_population': 1, 'city_luxuries': -1}, {'city_population': 1, 'city_luxuries': True}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                GameConfig(**kwargs)
+
 
 if __name__ == '__main__':
     unittest.main()

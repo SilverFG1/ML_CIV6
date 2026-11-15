@@ -76,6 +76,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--no-city-healing` | Disable city healing. |
 | `--city-population N` | Start the city with N citizens (0–20) and simulate worked tiles and growth; 0 (the default) turns this off. |
 | `--city-water fresh\|coast\|none` | Set the city's water supply, which gives 5, 3 or 2 starting housing (default: `fresh`). |
+| `--city-luxuries N` | Give the city N luxury resources (0–8), each worth one amenity (default: 0). |
 | `--city-builders N`, `--city-settlers N` | Give the city up to two builders and two settlers; requires `--city-population`. |
 | `--city-districts ...`, `--city-buildings ...` | Ancient-era districts and buildings the city starts with; requires `--city-population`. |
 | `--build-queue ...` | Districts and buildings the city produces, in order, during the game. |
@@ -124,10 +125,23 @@ python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman b
 - **Worked tiles.** The city owns the six tiles around its center, like a newly founded Civ VI city. Each citizen works one free tile, choosing the most food, then the most production. A tile with a unit on it cannot be worked, and citizens are reassigned whenever units move. A citizen with no free tile still eats.
 - **Growth.** Each citizen eats 2 food. The surplus is stored, and the city gains a citizen when the store reaches the Civ VI threshold of 15 + 8n + n^1.5 food, where n is the population minus one (15, 24, 33, 44, …). Leftover food carries over.
 - **Housing.** A city starts with 5 housing on fresh water (a river, lake or oasis), 3 on the coast, and 2 without water; `--city-water` chooses which. The water source is not drawn on the map. Each farm adds 0.5 housing, a granary 2, and barracks 1. As in Civ VI, a city one citizen below its housing stores only half its surplus food. At or above its housing, it stores a quarter, and five or more citizens over, it stops growing. Housing never reduces a food shortfall.
+- **Amenities.** A city needs no amenities for its first two citizens, one for the third, and one more for every two citizens after that (1 at population 3–4, 2 at 5–6, and so on). Each luxury resource from `--city-luxuries` provides one; there are no other ancient-era sources here, since the Arena and entertainment buildings arrive in the Classical era. The balance sets the city's mood:
+
+  | Amenities vs. needed | Mood | Growth | Production, culture, science, faith |
+  | --- | --- | --- | --- |
+  | +3 or more | Ecstatic | +20% | +10% |
+  | +1 to +2 | Happy | +10% | +5% |
+  | 0 | Content | — | — |
+  | −1 to −2 | Displeased | −15% | −5% |
+  | −3 to −4 | Unhappy | −30% | −10% |
+  | −5 to −6 | Unrest | stops | −15% |
+  | −7 or fewer | Revolt | stops | −20% |
+
+  The mood's growth change and the housing limit both scale stored food: a displeased city one citizen below its housing stores 0.85 × 0.5 of its surplus. Neither affects a shortfall. Sources agree on the growth changes but differ between expansions on the yield changes, so check the table against your game if exact values matter. Rebels, war weariness and loyalty are not modeled.
 - **Starvation.** If the city's food store would drop below zero, it empties and the city loses a citizen (never going below one).
 - **Reward.** The attacker loses 1 reward each time the city grows and gains 1 each time it starves. Units standing next to the city therefore blockade it as well as besiege it.
 
-Amenities and territory expansion are not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, and housing room (housing minus population). The observation schema ends with `:city_growth:water=...`, so turning growth on or changing the water supply requires `--fresh`; growth models trained before housing was added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
+Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, and housing room (housing minus population). The observation schema ends with `:city_growth:water=...:luxuries=N`, so turning growth on or changing the water supply or luxuries requires `--fresh`; growth models trained before housing and amenities were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-path runs/growth/model.json --metrics-dir runs/growth --fresh
@@ -175,11 +189,11 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 
 - **Placement.** A district goes on the free tile with the best adjacency bonus, then the lowest yields. The city center counts as a district for adjacency. A district tile is no longer worked by citizens, and a district placed on a farm replaces it. A tile with a unit or civilian on it cannot take a district.
 - **District limit.** A city can have one district, plus one more for every three citizens beyond the first (1 at population 1–3, 2 at 4–6, and so on). A starting configuration that exceeds the limit is rejected.
-- **Production.** The city's production (1 from the city center, 1 from each worked forest, and 1 from barracks) goes to the first queued item it can build. An item waits while its district is missing, the district limit is reached, or no tile is free; partial progress is kept. Leftover production carries over to the next item, and production is lost when nothing in the queue can be built. Blockading forest tiles therefore slows construction.
+- **Production.** The city's production (1 from the city center, 1 from each worked forest, and 1 from barracks) is scaled by the city's mood and goes to the first queued item it can build. An item waits while its district is missing, the district limit is reached, or no tile is free; partial progress is kept. Leftover production carries over to the next item, and production is lost when nothing in the queue can be built. Blockading forest tiles therefore slows construction.
 - **Combat.** Ancient Walls add 100 wall HP and give the city a ranged strike, as walls do in Civ VI. The encampment shoots a unit within 2 hexes of it each turn. Units cannot enter the encampment, which cannot be attacked. Both strikes use the city's ranged strength, or 15 (Civ VI's value for a civilization without ranged units) when the city has none. Battering rams help against these walls as they do against `--wall-hp`.
 - **Reward.** The attacker loses 1 each time the city completes a district or building.
 
-Culture, science and faith are tracked and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
+Culture, science and faith are scaled by the city's mood and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
 
 The observation adds a built flag for each listed district and building, plus the current item's production progress in quarters. An encampment appears as impassable in the terrain grid. The schema ends with `:built=...` and `:queue=...`, so changing them requires `--fresh`. Evaluation summaries report `average_builds_completed` when there is a queue.
 

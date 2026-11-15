@@ -1,10 +1,10 @@
 """Optional Pygame display and playback controls for the simulation."""
 
+import math
 import time
 
 import constants
-
-RAIDER_COLOR = (255, 110, 100)
+from class_hex import direction_between
 
 # Warriors share the plain unit sprite; other types get a short coloured label.
 UNIT_LABELS = {
@@ -14,6 +14,23 @@ UNIT_LABELS = {
     'archer': ('ARCHER', (255, 235, 140)),
     'battering_ram': ('RAM', (200, 200, 200)),
 }
+RIVER_COLOR = (64, 140, 225)
+# Polygon corner indices (from _polygon) for the side facing each neighbour.
+SIDE_CORNERS = {'NE': (0, 1), 'E': (1, 2), 'SE': (2, 3), 'SW': (3, 4), 'W': (4, 5), 'NW': (5, 0)}
+LAND_COLORS = {'GRASSLAND': (107, 137, 78), 'PLAINS': (158, 150, 84), 'DESERT': (214, 190, 126),
+               'TUNDRA': (122, 128, 106), 'SNOW': (224, 229, 236)}
+WATER_COLORS = {'COAST': (80, 140, 192), 'OCEAN': (40, 78, 130)}
+MOUNTAIN_COLOR, PEAK_COLOR = (99, 109, 121), (165, 175, 185)
+FOREST_COLOR = (42, 89, 56)
+YIELD_COLORS = {'food': (104, 200, 88), 'production': (214, 130, 56), 'gold': (240, 206, 72),
+                'science': (90, 160, 235), 'culture': (190, 110, 220), 'faith': (236, 236, 236)}
+TERRITORY_COLOR, CITIZEN_COLOR = (232, 72, 72), (250, 250, 250)
+MONUMENT_COLOR, GRANARY_COLOR, GRANARY_ROOF = (214, 208, 196), (206, 164, 92), (150, 104, 56)
+# Horizontal position of each building's icon on the city tile.
+BUILDING_SPOTS = {'monument': .24, 'granary': .76}
+WALL_COLOR = (196, 184, 156)
+RUINED_WALL_COLOR = (112, 102, 90)
+WALL_OUTLINE = (70, 62, 52)
 
 
 class Renderer:
@@ -30,7 +47,9 @@ class Renderer:
                                int(720 / (env.config.height * .75 + .25))))
         self.margin = 24
         width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
-        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + 118
+        # Text panel under the map; the economy adds a line or two.
+        self.panel_height = 118 + (44 if env.config.economy else 0)
+        height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + self.panel_height
         self.surface = pygame.display.set_mode((width, height))
         pygame.display.set_caption('ML_CIV6 — training and evaluation')
         self.font = pygame.font.SysFont('Segoe UI', 16)
@@ -40,6 +59,7 @@ class Renderer:
         self.delay_ms = None
         self._open = True
         self.selected_unit = 0
+        self.show_yields = True
         self.images = {}
         for name, path in [('unit', 'data/Otter_Warrior.png'), ('city', 'data/Ottertopia.png')]:
             loaded = pygame.image.load(constants.resource_path(path)).convert_alpha()
@@ -60,12 +80,13 @@ class Renderer:
         font = self.small_font if small else self.font
         self.surface.blit(font.render(text, True, color), pos)
 
-    def _wrapped_text(self, text, pos):
+    def _wrapped_text(self, text, pos, separator='   '):
+        """Draw text over several lines, breaking only between separator-delimited fields."""
         lines = ['']
-        for word in text.split():
-            proposed = (lines[-1] + ' ' + word).strip()
+        for field in text.split(separator):
+            proposed = lines[-1] + separator + field if lines[-1] else field
             if lines[-1] and self.font.size(proposed)[0] > self.surface.get_width() - 2 * self.margin:
-                lines.append(word)
+                lines.append(field)
             else:
                 lines[-1] = proposed
         for index, line in enumerate(lines):
@@ -75,38 +96,25 @@ class Renderer:
     def draw(self):
         p = self.pygame
         self.surface.fill(constants.COLOR_DEFAULT_BG)
-        colors = {'GRASSLAND': (107, 137, 78), 'FOREST': (42, 89, 56),
-                  'MOUNTAIN': (99, 109, 121), 'EDGE': (99, 109, 121)}
         for cell in self.env.map.grid.values():
-            polygon = self._polygon(cell.index)
-            p.draw.polygon(self.surface, colors[cell.terrain_type], polygon)
-            p.draw.polygon(self.surface, (44, 64, 48), polygon, 1)
-            if cell.terrain_type == 'MOUNTAIN':
-                x, y = self._position(cell.index)
-                s = self.size
-                p.draw.polygon(self.surface, (165, 175, 185),
-                               [(x + s * .2, y + s * .7), (x + s * .5, y + s * .2),
-                                (x + s * .8, y + s * .7)])
-        cities = self.env.cities
-        capital = self.env.capital
-        towns = cities + ([capital] if capital is not None else [])
-        raiders = self.env.living_raiders()
-        # Cities first, so a unit standing in a captured city is drawn on top.
-        for obj in towns + raiders + self.env.units:
+            self._draw_tile(cell)
+        self._draw_rivers()
+        if self.env.economy is not None:
+            self._draw_territory()
+        if self.show_yields:
+            for cell in self.env.map.grid.values():
+                self._draw_yields(cell)
+        if self.env.economy is not None:
+            for position in self.env.economy.worked_tiles():
+                center = self.citizen_marker(position)
+                p.draw.circle(self.surface, CITIZEN_COLOR, center, max(3, self.size // 14))
+                p.draw.circle(self.surface, TERRITORY_COLOR, center, max(3, self.size // 14), 2)
+        for obj in self.env.objects:
             x, y = self._position(obj.position)
-            is_city = obj in towns
-            if obj in raiders:
-                p.draw.polygon(self.surface, RAIDER_COLOR, self._polygon(obj.position), 3)
-            if obj.alive or is_city:
-                image = self.images['city' if is_city else 'unit']
+            if obj.alive:
+                image = self.images['city' if obj is self.env.city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
                 label = UNIT_LABELS.get(getattr(obj, 'unit_type', None))
-                if obj is capital:
-                    label = ('CAPITAL', (150, 200, 255)) if obj.alive else ('LOST', RAIDER_COLOR)
-                elif obj in raiders:
-                    label = ('RAIDER', RAIDER_COLOR)
-                elif is_city and not obj.alive:
-                    label = ('CAPTURED', (140, 230, 140))
                 if label is not None:
                     self._text(label[0], (x + 2, y + 2), label[1], small=True)
             else:
@@ -115,35 +123,161 @@ class Renderer:
                             (x + 2 * s / 3, y + 2 * s / 3), 3)
                 p.draw.line(self.surface, constants.COLOR_RED, (x + 2 * s / 3, y + s / 3),
                             (x + s / 3, y + 2 * s / 3), 3)
-            walls = f' W{obj.wall_hp:.0f}' if is_city and obj.alive and obj.wall_hp > 0 and len(cities) > 1 else ''
-            self._text(f'{obj.name_instance} {obj.hp:.0f}{walls}', (x + 2, y + self.size * .7), small=True)
+            if obj is self.env.city:
+                self._draw_walls()
+                self._draw_buildings()
+            self._text(f'{obj.name_instance} {obj.hp:.0f}', (x + 2, y + self.size * .7), small=True)
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
-        y = self.surface.get_height() - 109
-        city = self.env.city
-        outcome = self.env.last_info['outcome']
-        if outcome == 'win':
-            outcome = 'DOMINATION VICTORY'
-        elif outcome == 'loss' and capital is not None and not capital.alive:
-            outcome = 'CAPITAL LOST'
-        else:
-            outcome = outcome.upper()
-        if len(cities) == 1:
-            status = f'City {city.hp:.0f}/{city.hp_max:.0f}   Walls {city.wall_hp:.0f}'
-        else:
-            status = f'Cities captured {self.env.cities_captured()}/{len(cities)}'
-        if capital is not None:
-            status += f'   Capital {capital.hp:.0f}/{capital.hp_max:.0f}'
-        self._text(f'Turn {self.env.turn_number}   {status}   {outcome}', (self.margin, y))
+        y = self.surface.get_height() - self.panel_height + 9
+        y += 22 * self._wrapped_text(self.status_text(), (self.margin, y))
+        if self.env.economy is not None:
+            y += 22 * self._wrapped_text(self.env.economy.status_text(), (self.margin, y))
         if self.env.human:
-            controls = 'Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   R: restart   Esc: quit'
+            controls = ('Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   '
+                        'Y: yields   R: restart   Esc: quit')
         else:
-            controls = f'Space: pause   Right: one turn   +/-: speed   Esc: quit   Delay {self.delay_ms or 0}ms'
-        control_lines = self._wrapped_text(controls, (self.margin, y + 27))
+            controls = (f'Space: pause   Right: one turn   +/-: speed   Y: yields   Esc: quit   '
+                        f'Delay {self.delay_ms or 0}ms')
+        control_lines = self._wrapped_text(controls, (self.margin, y + 5))
         if self.paused:
-            self._text('PAUSED', (self.margin, y + 31 + 22 * control_lines), (255, 220, 100))
+            self._text('PAUSED', (self.margin, y + 9 + 22 * control_lines), (255, 220, 100))
         p.display.flip()
+
+    def status_text(self):
+        city = self.env.city
+        walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
+                 if city.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
+        text = (f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   {walls}   '
+                f'{self.env.last_info["outcome"].upper()}')
+        if city.buildings:
+            effects = [f'+{amount} {kind}' for kind, amount in city.building_yields.items()]
+            if city.building_housing:
+                effects.append(f'+{city.building_housing} housing')
+            names = ', '.join(name.title() for name in city.buildings)
+            text += f'   {names} ({", ".join(effects)})'
+        return text
+
+    def citizen_marker(self, position):
+        """Where a worked tile shows its citizen marker."""
+        x, y = self._position(position)
+        return x + self.size / 2, y + self.size * .84
+
+    def _draw_territory(self):
+        """Outline the city's territory just inside its edge tiles."""
+        territory = self.env.economy.territory
+        width = max(2, self.size // 22)
+        for position in territory:
+            polygon = self._polygon(position)
+            cx = sum(x for x, _ in polygon) / 6
+            cy = sum(y for _, y in polygon) / 6
+            inset = [(cx + (x - cx) * .9, cy + (y - cy) * .9) for x, y in polygon]
+            x, y = position
+            for direction, (first, second) in SIDE_CORNERS.items():
+                dx, dy = constants.movement_delta(direction, y)
+                if (x + dx, y + dy) not in territory:
+                    self.pygame.draw.line(self.surface, TERRITORY_COLOR, inset[first], inset[second], width)
+
+    def building_spot(self, name):
+        """Centre-bottom point of a building's icon on the city tile."""
+        x, y = self._position(self.env.city.position)
+        return x + self.size * BUILDING_SPOTS[name], y + self.size * .52
+
+    def _draw_buildings(self):
+        p, s = self.pygame, self.size
+        outline = (40, 36, 32)
+        for name in self.env.city.buildings:
+            cx, base = self.building_spot(name)
+            if name == 'monument':
+                obelisk = [(cx - s * .05, base), (cx - s * .03, base - s * .2), (cx, base - s * .25),
+                           (cx + s * .03, base - s * .2), (cx + s * .05, base)]
+                p.draw.polygon(self.surface, MONUMENT_COLOR, obelisk)
+                p.draw.polygon(self.surface, outline, obelisk, 1)
+            elif name == 'granary':
+                body = p.Rect(int(cx - s * .07), int(base - s * .11), int(s * .14), int(s * .11))
+                p.draw.rect(self.surface, GRANARY_COLOR, body)
+                p.draw.rect(self.surface, outline, body, 1)
+                roof = [(cx - s * .09, base - s * .11), (cx, base - s * .2), (cx + s * .09, base - s * .11)]
+                p.draw.polygon(self.surface, GRANARY_ROOF, roof)
+                p.draw.polygon(self.surface, outline, roof, 1)
+
+    def _draw_tile(self, cell):
+        p, s = self.pygame, self.size
+        polygon = self._polygon(cell.index)
+        x, y = self._position(cell.index)
+        terrain = cell.spec
+        if terrain.water:
+            color = WATER_COLORS[cell.terrain_type]
+        elif terrain.land_type is None or terrain.elevation == 'MOUNTAIN':
+            color = MOUNTAIN_COLOR
+        else:
+            color = LAND_COLORS[terrain.land_type]
+        if cell.feature == 'FOREST':
+            color = tuple(round(a * .3 + b * .7) for a, b in zip(color, FOREST_COLOR))
+        p.draw.polygon(self.surface, color, polygon)
+        p.draw.polygon(self.surface, (44, 64, 48), polygon, 1)
+        shade = tuple(round(c * .62) for c in color)
+        if terrain.elevation == 'MOUNTAIN':
+            p.draw.polygon(self.surface, PEAK_COLOR, [(x + s * .2, y + s * .7), (x + s * .5, y + s * .2),
+                                                      (x + s * .8, y + s * .7)])
+        elif terrain.elevation == 'HILLS':
+            for left in (.16, .48):
+                p.draw.arc(self.surface, shade, p.Rect(x + s * left, y + s * .5, s * .36, s * .3),
+                           0, math.pi, max(2, s // 24))
+        if cell.feature == 'FOREST':
+            for tx, ty in ((.3, .42), (.5, .34), (.7, .42)):
+                p.draw.polygon(self.surface, shade, [(x + s * (tx - .07), y + s * (ty + .12)),
+                                                     (x + s * tx, y + s * (ty - .02)),
+                                                     (x + s * (tx + .07), y + s * (ty + .12))])
+
+    def _draw_yields(self, cell):
+        """One small dot per yield point near the top of the tile."""
+        dots = [YIELD_COLORS[name] for name, amount in cell.yields.items() for _ in range(amount)]
+        if not dots:
+            return
+        x, y = self._position(cell.index)
+        radius = max(2, self.size // 19)
+        step = 2.5 * radius
+        left = x + self.size / 2 - step * (len(dots) - 1) / 2
+        for index, color in enumerate(dots):
+            center = (left + index * step, y + self.size * .2)
+            self.pygame.draw.circle(self.surface, color, center, radius)
+            self.pygame.draw.circle(self.surface, (30, 30, 30), center, radius, 1)
+
+    def _draw_rivers(self):
+        width = max(3, self.size // 12)
+        for edge in sorted(self.env.map.rivers, key=sorted):
+            origin, neighbor = sorted(edge)
+            polygon = self._polygon(origin)
+            start, end = (polygon[i] for i in SIDE_CORNERS[direction_between(origin, neighbor)])
+            self.pygame.draw.line(self.surface, RIVER_COLOR, start, end, width)
+            for point in (start, end):  # Round the joints between river segments.
+                self.pygame.draw.circle(self.surface, RIVER_COLOR, point, width / 2)
+
+    def _wall_ring(self):
+        """Corners of the city's walls, just inside its tile."""
+        polygon = self._polygon(self.env.city.position)
+        cx = sum(x for x, _ in polygon) / 6
+        cy = sum(y for _, y in polygon) / 6
+        return [(cx + (x - cx) * .9, cy + (y - cy) * .9) for x, y in polygon]
+
+    def _draw_walls(self):
+        """A stone ring with corner towers; broken walls leave only ruined towers."""
+        city = self.env.city
+        if city.wall_hp_max <= 0:
+            return
+        ring = self._wall_ring()
+        intact = city.wall_hp > 0
+        color = WALL_COLOR if intact else RUINED_WALL_COLOR
+        if intact:
+            self.pygame.draw.polygon(self.surface, WALL_OUTLINE, ring, max(5, self.size // 10))
+            self.pygame.draw.polygon(self.surface, color, ring, max(3, self.size // 14))
+        half = max(3, self.size // 16)
+        for x, y in ring:
+            tower = self.pygame.Rect(int(x - half), int(y - half), 2 * half, 2 * half)
+            self.pygame.draw.rect(self.surface, color, tower)
+            self.pygame.draw.rect(self.surface, WALL_OUTLINE, tower, 1)
 
     def _events(self):
         advance = False
@@ -160,6 +294,8 @@ class Renderer:
                     self.delay_ms = max(0, (self.delay_ms or 0) // 2 - 10)
                 elif event.key in (p.K_MINUS, p.K_KP_MINUS):
                     self.delay_ms = min(3000, (self.delay_ms or 0) * 2 + 50)
+                elif event.key == p.K_y:
+                    self.show_yields = not self.show_yields
         return advance
 
     def frame(self, delay_ms=0):
@@ -187,6 +323,8 @@ class Renderer:
                         self.selected_unit = (self.selected_unit + 1) % len(self.env.units)
                     elif event.key == p.K_r:
                         self.env.reset()
+                    elif event.key == p.K_y:
+                        self.show_yields = not self.show_yields
                     elif event.key in bindings or event.key == p.K_f:
                         directions = ['SPACE'] * len(self.env.units)
                         direction = 'SHOOT' if event.key == p.K_f else bindings[event.key]

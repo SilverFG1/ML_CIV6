@@ -2,6 +2,8 @@
 
 import random
 import subprocess
+from collections import Counter
+from dataclasses import asdict
 import sys
 import unittest
 from unittest.mock import patch
@@ -9,8 +11,8 @@ from unittest.mock import patch
 import numpy as np
 
 import constants
-from class_hex import HexMap
-from game import MAX_RAIDERS, MIN_CITY_DISTANCE, C_Raider, C_Unit, Game, GameConfig, attack, hex_distance
+from class_hex import HexMap, _edge_corners
+from game import BUILDING_SPECS, C_City, C_Unit, Game, GameConfig, attack, hex_distance
 
 
 class GameTests(unittest.TestCase):
@@ -23,10 +25,6 @@ class GameTests(unittest.TestCase):
     def place(self, env, positions):
         for unit, pos in zip(env.units, positions):
             unit.x, unit.y = pos
-
-    def place_cities(self, env, positions):
-        for city, pos in zip(env.cities, positions):
-            city.x, city.y = pos
 
     def wait(self, env):
         return env.encode_action(['SPACE'] * len(env.units))
@@ -226,11 +224,12 @@ class GameTests(unittest.TestCase):
                        {'unit_strengths': (20, 30)}, {'city_strength': float('nan')},
                        {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)},
                        {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')},
-                       {'city_count': 0}, {'city_count': 5}, {'city_count': True},
-                       {'width': 3, 'height': 3, 'city_count': 2},
-                       {'player_capital': 1}, {'capital_strength': 0}, {'raider_strength': 101},
-                       {'raid_interval': -1}, {'raid_interval': 2.5},
-                       {'player_capital': True, 'width': 3, 'height': 3}]:
+                       {'river_count': -1}, {'river_count': 11}, {'river_count': True},
+                       {'river_count': 1.5}, {'walls': 'medieval'}, {'walls': None},
+                       {'walls': ['ancient']}, {'land_types': ('lava',)},
+                       {'land_types': ('plains', 'plains')}, {'land_types': 5}, {'hills_density': 1.5},
+                       {'water_density': -.1}, {'mountain_density': .3, 'water_density': .3, 'forest_density': .3},
+                       {'buildings': ('library',)}, {'buildings': ('monument', 'monument')}, {'buildings': 5}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -416,294 +415,266 @@ class GameTests(unittest.TestCase):
         self.place(env, [(0, 0), (5, 4)])
         self.assertEqual(env.actions[env.guided_action(random.Random(1))][1], 'SPACE')
 
-    def test_single_city_game_keeps_its_layout(self):
+    def test_rivers_are_off_by_default_and_use_no_randomness(self):
         env = self.make_env()
-        self.assertEqual(env.cities, [env.city])
-        self.assertEqual(env.city.name_instance, 'Ottertopia')
+        self.assertEqual(env.map.rivers, set())
         self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior')
-        self.assertEqual(env.last_info['cities_captured'], 0)
-
-    def test_multiple_cities_are_spaced_reachable_and_besiegeable(self):
-        for seed in range(12):
-            env = Game(config=GameConfig(city_count=3, forest_density=.2, mountain_density=.15), seed=seed)
-            env.reset(seed=seed)
-            positions = [city.position for city in env.cities]
-            self.assertEqual([c.name_instance for c in env.cities], ['Ottertopia', 'Kelpford', 'Clamhaven'])
-            self.assertEqual(positions[0], (4, 4))
-            for i, first in enumerate(positions):
-                for second in positions[i + 1:]:
-                    self.assertGreaterEqual(hex_distance(first, second), MIN_CITY_DISTANCE)
-                open_tiles = [cell for cell in env.map.grid[first].get_neighbors(env.map.grid) if not cell.block_path]
-                self.assertGreaterEqual(len(open_tiles), 3)
-            self.assertTrue(set(positions) <= env.map.reachable(positions[0]))
-            self.assertFalse({u.position for u in env.units} & set(positions))
-            self.assertIn(env.guided_action(), env.valid_actions())
-        self.assertEqual(env.get_observation().shape, (7 * 3 + 8 * 3 + 64,))
-        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior:cities=3')
-
-    def test_domination_requires_capturing_every_city(self):
-        env = self.make_env(unit_count=2, city_count=2, city_heals=False, ranged_strength=20)
-        self.place_cities(env, [(4, 4), (1, 1)])
-        self.place(env, [(3, 4), (6, 6)])
-        env.city.hp = 1
-        with patch('game.attack', return_value=(5, 0)):
-            _, reward, done = env.step(env.encode_action(['E', 'W']))
-        self.assertFalse(done)
-        self.assertFalse(env.city.alive)
-        self.assertEqual(env.last_info['outcome'], 'ongoing')
-        self.assertEqual(env.last_info['cities_captured'], 1)
-        # Turn cost, city damage, capture bonus, and the other unit's step toward the next city.
-        self.assertAlmostEqual(reward, -.05 + .03 + 5 + .05)
-        # Later units still act, and the captured city no longer shoots.
-        self.assertEqual(env.units[1].position, (5, 6))
-        self.assertEqual(env.units[0].hp, 100)
-        # A captured city's tile is open to the squad.
-        self.assertIn(env.encode_action(['E', 'SPACE']), env.valid_actions())
-        env.step(env.encode_action(['E', 'SPACE']))
-        self.assertEqual(env.units[0].position, (4, 4))
-        self.place(env, [(2, 1), (6, 6)])
-        env.cities[1].hp = 1
-        with patch('game.attack', return_value=(5, 0)):
-            _, reward, done = env.step(env.encode_action(['W', 'SPACE']))
-        self.assertTrue(done)
-        self.assertEqual(env.last_info['outcome'], 'win')
-        self.assertEqual(env.last_info['cities_captured'], 2)
-        self.assertAlmostEqual(reward, -.05 + .03 + 10)
-
-    def test_every_uncaptured_city_shoots_and_heals(self):
-        env = self.make_env(unit_count=2, city_count=2, ranged_strength=20)
-        self.place_cities(env, [(4, 4), (1, 1)])
-        self.place(env, [(2, 4), (1, 3)])
-        for city in env.cities:
-            city.hp = 50
-        with patch('game.attack', return_value=(5, 0)):
-            env.step(self.wait(env))
-        self.assertEqual([u.hp for u in env.units], [95, 95])
-        self.assertEqual([c.hp for c in env.cities], [60, 60])
-        env.cities[1].death()
-        with patch('game.attack', return_value=(5, 0)):
-            env.step(self.wait(env))
-        # Both units heal back to full; only the capital still shoots.
-        self.assertEqual([u.hp for u in env.units], [95, 100])
-        self.assertEqual([c.hp for c in env.cities], [70, 0])
-
-    def test_shot_hits_closest_city_then_weakest(self):
-        env = self.make_env(unit_count=1, unit_types=('archer',), city_count=2, city_heals=False)
-        self.place_cities(env, [(4, 4), (4, 0)])
-        self.place(env, [(3, 2)])
-        env.cities[1].hp = 50
-        self.assertIs(env.shoot_target(env.units[0]), env.cities[1])
-        env.cities[0].hp = 40
-        self.assertIs(env.shoot_target(env.units[0]), env.cities[0])
-        with patch('game.attack', return_value=(10, 0)):
-            env.step(env.encode_action(['SHOOT']))
-        self.assertEqual([c.hp for c in env.cities], [30, 50])
-        self.place(env, [(4, 1)])
-        self.assertIs(env.shoot_target(env.units[0]), env.cities[1])
-
-    def test_ram_only_helps_against_the_city_it_is_next_to(self):
-        env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_count=2,
-                            wall_hp=30, city_heals=False)
-        self.place_cities(env, [(4, 4), (1, 1)])
-        self.place(env, [(2, 1), (5, 4)])
-        with patch('game.attack', return_value=(20, 0)):
-            env.step(env.encode_action(['W', 'SPACE']))
-        self.assertEqual(env.cities[1].wall_hp, 20)
-        self.place(env, [(2, 1), (1, 2)])
-        with patch('game.attack', return_value=(20, 0)):
-            env.step(env.encode_action(['W', 'SPACE']))
-        self.assertEqual(env.cities[1].wall_hp, 0)
-
-    def test_heuristic_focuses_on_one_city(self):
-        env = self.make_env(unit_count=3, city_count=2, city_heals=False)
-        self.place_cities(env, [(4, 4), (1, 1)])
-        self.place(env, [(0, 7), (1, 7), (2, 7)])
-        env.cities[1].hp = 20
-        self.assertIs(env.target_city(), env.cities[1])
-        costs = env._distances(env.target_city())
-        self.assertEqual(costs[(1, 1)], 0)
-        self.assertNotIn((4, 4), costs)
-        env.cities[0].hp = 10
-        self.assertIs(env.target_city(), env.cities[0])
-        env.cities[0].death()
-        self.assertIs(env.target_city(), env.cities[1])
-
-    # Player capital and raiders. capital_env pins the capital to (1, 6), four hexes
-    # from the enemy city at (4, 4), and turns raids off unless a test asks for them.
-    def capital_env(self, **kwargs):
-        env = self.make_env(**{'player_capital': True, 'raid_interval': 0, 'city_heals': False, **kwargs})
-        env.capital.x, env.capital.y = 1, 6
-        return env
-
-    def add_raider(self, env, position, hp=100):
-        raider = C_Raider(*position, name_instance=f'Raider {len(env.raiders) + 1}', hp=hp, strength=20, env=env)
-        env.raiders.append(raider)
-        return raider
-
-    def test_player_capital_is_off_by_default(self):
-        env = self.make_env()
-        self.assertIsNone(env.capital)
-        self.assertEqual(env.raiders, [])
         self.assertEqual(env.get_observation().shape, (7 + 8 * 3 + 64,))
-        self.assertNotIn(':capital', env.observation_schema)
-        env.step(self.wait(env))
-        self.assertFalse(env.last_info['capital_lost'])
+        rng = random.Random(5)
+        state = rng.getstate()
+        HexMap(8, 8).generate_rivers(0, rng)
+        self.assertEqual(rng.getstate(), state)
 
-    def test_player_capital_is_placed_away_from_enemies_with_the_squad_beside_it(self):
-        for seed in range(12):
-            env = Game(config=GameConfig(player_capital=True, city_count=2, forest_density=.2,
-                                         mountain_density=.1), seed=seed)
+    def test_generated_rivers_lie_between_adjacent_tiles_and_are_reproducible(self):
+        first = self.make_env(river_count=2, forest_density=.2)
+        second = self.make_env(river_count=2, forest_density=.2)
+        self.assertTrue(first.map.rivers)
+        self.assertEqual(first.map.rivers, second.map.rivers)
+        layouts = set()
+        for seed in range(5):
+            first.reset(seed=seed)
+            layouts.add(frozenset(first.map.rivers))
+            for a, b in first.map.rivers:
+                self.assertIn(a, first.map.grid)
+                self.assertIn(b, first.map.grid)
+                self.assertEqual(hex_distance(a, b), 1)
+        self.assertGreater(len(layouts), 1)
+
+    def test_a_generated_river_is_one_unbroken_line(self):
+        for seed in range(20):
+            hex_map = HexMap(8, 8)
+            hex_map.generate_rivers(1, random.Random(seed))
+            corners = Counter(c for edge in hex_map.rivers for c in _edge_corners(edge))
+            self.assertLessEqual(max(corners.values()), 2)
+            self.assertEqual(sum(n == 1 for n in corners.values()), 2)
+
+    def test_add_river_rejects_sides_that_are_not_shared_on_the_map(self):
+        hex_map = HexMap(4, 4)
+        for first, second in [((0, 0), (2, 0)), ((0, 0), (-1, 0)), ((1, 1), (1, 1))]:
+            with self.subTest(first=first, second=second), self.assertRaises(ValueError):
+                hex_map.add_river(first, second)
+        hex_map.add_river((1, 1), (1, 0))
+        self.assertTrue(hex_map.has_river((1, 0), (1, 1)))
+
+    def test_rivers_do_not_block_movement_but_crossing_costs_extra(self):
+        rewards = []
+        for river in (False, True):
+            env = self.make_env(unit_count=1, city_heals=False)
+            self.place(env, [(0, 0)])
+            if river:
+                env.map.add_river((0, 0), (1, 0))
+            move = env.encode_action(['E'])
+            self.assertIn(move, env.valid_actions())
+            _, reward, _ = env.step(move)
+            self.assertEqual(env.units[0].position, (1, 0))
+            moved = next(e for e in env.events if e['type'] == 'moved')
+            self.assertEqual(moved['cost'], 2 if river else 1)
+            rewards.append(reward)
+        self.assertAlmostEqual(rewards[0] - rewards[1], .01)
+        env.map.grid[(2, 0)].set_terrain('FOREST')
+        env.map.add_river((1, 0), (2, 0))
+        self.assertEqual(env.map.movement_cost((1, 0), (2, 0)), 2)
+
+    def test_city_gains_river_defense_against_melee_attacks_only(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'archer'), city_heals=False)
+        self.place(env, [(3, 4), (5, 4)])
+        dry_melee = attack(env.units[0], env.city, rng=random.Random(9))
+        dry_shot = attack(env.units[1], env.city, ranged=True, rng=random.Random(9))
+        env.map.add_river((3, 4), (4, 4))
+        env.map.add_river((5, 4), (4, 4))
+        river_melee = attack(env.units[0], env.city, rng=random.Random(9))
+        self.assertLess(river_melee[0], dry_melee[0])
+        self.assertGreater(river_melee[1], dry_melee[1])
+        self.assertEqual(attack(env.units[1], env.city, ranged=True, rng=random.Random(9)), dry_shot)
+        # River defense is exactly +5 city strength for that attack.
+        env.map.rivers.clear()
+        env.city.strength += 5
+        self.assertEqual(attack(env.units[0], env.city, rng=random.Random(9)), river_melee)
+
+    def test_river_observation_flags_each_side_once(self):
+        env = self.make_env(river_count=1)
+        base = 7 + 8 * 3 + 64
+        observation = env.get_observation()
+        self.assertEqual(observation.shape, (base + 3 * 64,))
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior:rivers')
+        self.assertEqual(observation[base:].sum(), len(env.map.rivers))
+        env.map.rivers.clear()
+        env.map.add_river((2, 3), (2, 4))
+        flags = env.get_observation()[base:].reshape(8, 8, 3)
+        self.assertEqual(flags[3, 2].tolist(), [0, 0, 1])
+        self.assertEqual(flags.sum(), 1)
+
+    def test_heuristic_path_costs_and_attacks_account_for_rivers(self):
+        env = self.make_env(unit_count=1, city_heals=False)
+        self.place(env, [(3, 4)])
+        self.assertEqual(env._distances()[(3, 4)], 1)
+        env.map.add_river((3, 4), (4, 4))
+        self.assertEqual(env._distances()[(3, 4)], 2)
+        # With a dry bank one step away, the heuristic moves there instead of attacking.
+        direction = env.actions[env.guided_action(random.Random(1))][0]
+        dx, dy = constants.movement_delta(direction, 4)
+        self.assertIn((3 + dx, 4 + dy), [(3, 3), (3, 5)])
+        # When every nearby bank is across the river, it attacks anyway.
+        env.map.add_river((3, 3), (4, 4))
+        env.map.add_river((3, 5), (4, 4))
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))], ('E',))
+
+    def test_river_games_are_reproducible_and_playable(self):
+        first = self.make_env(river_count=3, forest_density=.2, mountain_density=.1)
+        second = self.make_env(river_count=3, forest_density=.2, mountain_density=.1)
+        rng1, rng2 = random.Random(4), random.Random(4)
+        for _ in range(60):
+            action1, action2 = first.guided_action(rng1), second.guided_action(rng2)
+            self.assertEqual(action1, action2)
+            next1, reward1, done1 = first.step(action1)
+            next2, reward2, done2 = second.step(action2)
+            np.testing.assert_array_equal(next1, next2)
+            self.assertEqual((reward1, done1, first.events), (reward2, done2, second.events))
+            if done1:
+                break
+        for seed in range(10):
+            env = self.make_env(width=3, height=3, unit_count=2, river_count=10)
             env.reset(seed=seed)
-            home = env.capital.position
-            self.assertEqual(env.capital.name_instance, 'Otterholt')
-            for city in env.cities:
-                self.assertGreaterEqual(hex_distance(home, city.position), MIN_CITY_DISTANCE)
-            open_tiles = [cell for cell in env.map.grid[home].get_neighbors(env.map.grid) if not cell.block_path]
-            self.assertGreaterEqual(len(open_tiles), 3)
-            self.assertIn(home, env.map.reachable(env.city.position))
-            self.assertTrue(all(hex_distance(u.position, home) <= 2 for u in env.units))
-            self.assertNotIn(home, [u.position for u in env.units])
-        self.assertEqual(env.get_observation().shape, (14 + 24 + 4 + 4 * MAX_RAIDERS + 64,))
-        self.assertTrue(env.observation_schema.endswith(':cities=2:capital'))
+            self.assertIn(env.guided_action(), env.valid_actions())
 
-    def test_units_cannot_enter_their_own_capital(self):
-        env = self.capital_env()
-        self.place(env, [(2, 6), (7, 0), (6, 0)])
-        blocked = env.encode_action(['W', 'SPACE', 'SPACE'])
-        self.assertNotIn(blocked, env.valid_actions())
-        env.step(blocked)
-        self.assertEqual(env.units[0].position, (2, 6))
-        self.assertIn('blocked_move', [e['type'] for e in env.events])
-
-    def test_raids_take_turns_between_enemy_cities(self):
-        env = self.capital_env(city_count=2, raid_interval=2)
-        expected = {1: None, 2: env.cities[0], 3: None, 4: env.cities[1], 6: env.cities[0]}
-        for turn, city in expected.items():
-            env.turn_number = turn
-            self.assertIs(env.raiding_city(), city)
-        env.cities[1].death()
-        env.turn_number = 4
-        self.assertIsNone(env.raiding_city())
-        env.turn_number = 2
-        env.spawn_raiders()
-        raider = env.raiders[0]
-        self.assertEqual(hex_distance(raider.position, env.cities[0].position), 1)
-        self.assertIn('raider_spawned', [e['type'] for e in env.events])
-        quiet = self.capital_env(raid_interval=0)
-        quiet.turn_number = 6
-        self.assertIsNone(quiet.raiding_city())
-
-    def test_raiders_are_capped_and_reuse_slots(self):
-        env = self.capital_env(raid_interval=1)
-        for position in [(7, 0), (7, 1), (7, 2), (7, 3)]:
-            self.add_raider(env, position)
-        env.turn_number = 1
-        env.spawn_raiders()
-        self.assertEqual(len(env.living_raiders()), MAX_RAIDERS)
-        env.raiders[1].death_unit()
-        env.spawn_raiders()
-        self.assertEqual(len(env.raiders), MAX_RAIDERS)
-        self.assertTrue(env.raiders[1].alive)
-        self.assertEqual(env.raiders[1].name_instance, 'Raider 2')
-        self.assertEqual(hex_distance(env.raiders[1].position, env.city.position), 1)
-
-    def test_raider_marches_on_the_capital_and_attacks_it(self):
-        env = self.capital_env()
-        self.place(env, [(7, 0), (6, 0), (5, 0)])
-        raider = self.add_raider(env, (4, 6))
-        distances = []
-        for _ in range(2):
+    def test_ancient_walls_give_outer_defense_and_a_ranged_strike(self):
+        self.assertFalse(self.make_env().city.ranged_combat)
+        env = self.make_env(walls='ancient', unit_count=1, city_heals=False)
+        self.assertEqual((env.city.wall_hp, env.city.wall_hp_max), (100, 100))
+        self.assertTrue(env.city.ranged_combat)
+        self.assertEqual(env.city.strength_ranged, 15)
+        self.assertEqual(env.city.strength, 28)
+        observation = env.get_observation()
+        self.assertEqual(observation.shape, (7 + 8 + 64,))
+        self.assertAlmostEqual(observation[3], .1)
+        self.assertAlmostEqual(observation[5], .15)
+        self.place(env, [(6, 4)])
+        with patch('game.attack', return_value=(12, 0)) as mocked:
             env.step(self.wait(env))
-            distances.append(hex_distance(raider.position, env.capital.position))
-        self.assertEqual(distances, [2, 1])
-        with patch('game.attack', return_value=(10, 5)):
-            _, reward, done = env.step(self.wait(env))
-        self.assertFalse(done)
-        self.assertEqual((env.capital.hp, raider.hp), (90, 95))
-        # Turn cost, capital damage, and the damage the capital dealt back.
-        self.assertAlmostEqual(reward, -.05 - .3 + .025)
-        self.assertNotIn('capital_healed', [e['type'] for e in env.events])
-
-    def test_raider_steps_around_the_squad_but_attacks_a_full_blockade(self):
-        env = self.capital_env()
-        self.place(env, [(7, 0), (6, 0), (5, 0)])
-        costs = env._raider_costs()
-
-        def forward(position):
-            return [cell.index for cell in env.map.grid[position].get_neighbors(env.map.grid)
-                    if costs.get(cell.index, 1e9) < costs[position]]
-
-        start = next(p for p in sorted(costs) if hex_distance(p, env.capital.position) == 3
-                     and len(forward(p)) == 2 and env.occupant(p) is None
-                     and hex_distance(p, env.city.position) > 1)
-        first, second = sorted(forward(start), key=lambda p: costs[p])
-        raider = self.add_raider(env, start)
-        self.place(env, [first, (7, 0), (6, 0)])
-        env.step(self.wait(env))
-        self.assertEqual(raider.position, second)
-        self.assertEqual(env.units[0].hp, 100)
-        env.raiders.clear()
-        raider = self.add_raider(env, start)
-        self.place(env, [first, second, (6, 0)])
-        env.units[1].hp = 60
-        with patch('game.attack', return_value=(20, 5)):
+        mocked.assert_called_once_with(env.city, env.units[0], ranged=True)
+        self.assertEqual(env.units[0].hp, 88)
+        self.place(env, [(7, 4)])
+        with patch('game.attack', return_value=(12, 0)) as mocked:
             env.step(self.wait(env))
-        self.assertEqual(raider.position, start)
-        self.assertEqual([u.hp for u in env.units[:2]], [100, 50])
+        mocked.assert_not_called()
 
-    def test_capital_heals_only_without_a_raider_beside_it(self):
-        env = self.capital_env()
-        self.place(env, [(7, 0), (6, 0), (5, 0)])
-        env.capital.hp = 50
-        env.step(self.wait(env))
-        self.assertEqual(env.capital.hp, 60)
-        self.assertIn('capital_healed', [e['type'] for e in env.events])
-        self.add_raider(env, (2, 6))
-        with patch('game.attack', return_value=(0, 0)):
-            env.step(self.wait(env))
-        self.assertEqual(env.capital.hp, 60)
+    def test_ancient_wall_defaults_can_be_overridden(self):
+        config = GameConfig(walls='ancient', wall_hp=60, ranged_strength=25)
+        self.assertEqual((config.wall_hp, config.ranged_strength), (60, 25))
+        ancient = GameConfig(walls='ancient')
+        self.assertEqual(GameConfig(**asdict(ancient)), ancient)
+        self.assertEqual(GameConfig(wall_hp=40).walls, 'none')
 
-    def test_losing_the_capital_loses_the_game(self):
-        env = self.capital_env()
-        self.place(env, [(7, 0), (6, 0), (5, 0)])
-        self.add_raider(env, (2, 6))
-        env.capital.hp = 5
-        with patch('game.attack', return_value=(10, 0)):
-            _, reward, done = env.step(self.wait(env))
-        self.assertTrue(done)
-        self.assertEqual(env.last_info['outcome'], 'loss')
-        self.assertTrue(env.last_info['capital_lost'])
-        self.assertAlmostEqual(reward, -.05 - .15 - 10)
+    def test_battering_rams_breach_ancient_walls(self):
+        for unit_types, positions, wall_hp in ((('warrior',), [(3, 4)], 90),
+                                               (('warrior', 'battering_ram'), [(3, 4), (5, 4)], 80)):
+            with self.subTest(unit_types=unit_types):
+                env = self.make_env(unit_count=len(unit_types), unit_types=unit_types,
+                                    walls='ancient', city_heals=False)
+                self.place(env, positions)
+                with patch('game.attack', return_value=(20, 0)):
+                    env.step(env.encode_action(['E'] + ['SPACE'] * (len(unit_types) - 1)))
+                self.assertEqual((env.city.wall_hp, env.city.hp), (wall_hp, 100))
 
-    def test_squad_fights_raiders_in_melee_and_at_range(self):
-        env = self.capital_env()
-        self.place(env, [(4, 2), (7, 7), (6, 7)])
-        raider = self.add_raider(env, (3, 2))
-        with patch('game.attack', return_value=(30, 10)):
-            _, reward, _ = env.step(env.encode_action(['W', 'SPACE', 'SPACE']))
-        self.assertEqual((raider.hp, env.units[0].hp, env.units[0].position), (70, 90, (4, 2)))
-        self.assertNotEqual(raider.position, (3, 2))
-        self.assertAlmostEqual(reward, -.05 + .15 - .05)
-        archers = self.capital_env(unit_count=2, unit_types=('archer', 'battering_ram'))
-        self.place(archers, [(3, 0), (2, 2)])
-        raider = self.add_raider(archers, (3, 2), hp=20)
-        self.assertIs(archers.shoot_target(archers.units[0]), raider)
-        self.assertNotIn(archers.encode_action(['SPACE', 'E']), archers.valid_actions())
-        with patch('game.attack', return_value=(30, 0)):
-            archers.step(archers.encode_action(['SHOOT', 'SPACE']))
-        self.assertFalse(raider.alive)
-        self.assertIn('raider_killed', [e['type'] for e in archers.events])
+    def terrain_env(self, **kwargs):
+        options = dict(land_types=('grassland', 'plains', 'desert', 'tundra', 'snow'), hills_density=.3,
+                       water_density=.15, mountain_density=.05, forest_density=.25)
+        options.update(kwargs)
+        return self.make_env(**options)
 
-    def test_heuristic_defends_only_when_the_capital_could_fall(self):
-        env = self.capital_env()
-        self.place(env, [(3, 6), (7, 0), (6, 0)])
-        raider = self.add_raider(env, (2, 6))
-        self.assertIsNone(env.threat())
-        env.capital.hp = 60
-        self.assertIs(env.threat(), raider)
-        self.assertEqual(env.actions[env.guided_action(random.Random(1))][0], 'W')
-        env.city.hp = 30
-        self.assertIsNone(env.threat())
+    def test_new_terrain_options_generate_valid_reproducible_maps(self):
+        env = self.terrain_env()
+        self.assertTrue(env.config.extended_terrain)
+        self.assertFalse(self.make_env(land_types=('grassland',)).config.extended_terrain)
+        seen = set()
+        for seed in range(15):
+            env.reset(seed=seed)
+            city = env.map.grid[env.city.position]
+            self.assertEqual((city.spec.elevation, city.feature), ('FLAT', None))
+            self.assertFalse(city.block_path)
+            for unit in env.units:
+                self.assertFalse(env.map.grid[unit.position].block_path)
+                self.assertIn(unit.position, env.map.reachable(env.city.position))
+            for cell in env.map.grid.values():
+                seen.add(cell.terrain_type)
+                if cell.feature:
+                    self.assertIn(cell.spec.land_type, ('GRASSLAND', 'PLAINS', 'TUNDRA'))
+            self.assertIn(env.guided_action(), env.valid_actions())
+        self.assertTrue({'PLAINS', 'DESERT_HILLS', 'COAST', 'SNOW'} <= seen)
+        other = self.terrain_env()
+        for seed in (3, 4):
+            env.reset(seed=seed)
+            other.reset(seed=seed)
+            self.assertEqual([(c.terrain_type, c.feature) for c in env.map.grid.values()],
+                             [(c.terrain_type, c.feature) for c in other.map.grid.values()])
+
+    def test_extended_terrain_observation_reports_combat_properties(self):
+        env = self.terrain_env(unit_count=1)
+        base = 7 + 8
+        observation = env.get_observation()
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior:terrain')
+        self.assertEqual(observation.shape, (base + 3 * 64,))
+        env.map.grid[(0, 0)].set_terrain('PLAINS_HILLS')
+        env.map.grid[(0, 0)].set_feature('FOREST')
+        env.map.grid[(1, 0)].set_terrain('OCEAN')
+        env.map.grid[(2, 0)].set_terrain('DESERT')
+        tiles = env.get_observation()[base:].reshape(8, 8, 3)
+        self.assertEqual(tiles[0, 0].tolist(), [0, 1, 1])
+        self.assertEqual(tiles[0, 1].tolist(), [1, 0, 0])
+        self.assertEqual(tiles[0, 2].tolist(), [0, 0, 0])
+
+    def test_hills_and_forest_protect_units_and_cost_movement(self):
+        env = self.make_env(unit_count=1, city_heals=False, ranged_strength=20)
+        self.place(env, [(3, 4)])
+        damage = []
+        for terrain, feature in (('GRASSLAND', None), ('GRASSLAND_HILLS', None), ('GRASSLAND_HILLS', 'FOREST')):
+            env.map.grid[(3, 4)].set_terrain(terrain)
+            env.map.grid[(3, 4)].set_feature(feature)
+            damage.append(attack(env.city, env.units[0], ranged=True, rng=random.Random(2))[0])
+        self.assertGreater(damage[0], damage[1])
+        self.assertGreater(damage[1], damage[2])
+        env.map.grid[(2, 4)].set_terrain('PLAINS_HILLS')
+        env.map.grid[(2, 3)].set_terrain('TUNDRA_HILLS')
+        env.map.grid[(2, 3)].set_feature('FOREST')
+        self.assertEqual(env.map.movement_cost((3, 4), (2, 4)), 2)
+        self.assertEqual(env.map.movement_cost((2, 4), (2, 3)), 3)
+        env.step(env.encode_action(['W']))
+        self.assertEqual(next(e['cost'] for e in env.events if e['type'] == 'moved'), 2)
+        env.step(env.encode_action(['NE']))
+        self.assertEqual(env.units[0].position, (2, 3))
+        self.assertEqual(next(e['cost'] for e in env.events if e['type'] == 'moved'), 3)
+
+    def test_units_cannot_enter_water(self):
+        env = self.make_env(unit_count=1)
+        self.place(env, [(0, 0)])
+        env.map.grid[(1, 0)].set_terrain('COAST')
+        self.assertNotIn(env.encode_action(['E']), env.valid_actions())
+
+    def test_monument_and_granary_add_yields_and_housing(self):
+        self.assertEqual((BUILDING_SPECS['monument'].cost, BUILDING_SPECS['granary'].cost), (60, 65))
+        self.assertEqual(BUILDING_SPECS['granary'].technology, 'TECH_POTTERY')
+        for buildings, yields, housing in [((), {}, 0), (('monument',), {'culture': 2}, 0),
+                                           (('granary',), {'food': 1}, 2),
+                                           (('granary', 'monument'), {'food': 1, 'culture': 2}, 2)]:
+            with self.subTest(buildings=buildings):
+                env = self.make_env(buildings=buildings)
+                self.assertEqual(env.city.buildings, buildings)
+                self.assertEqual((env.city.building_yields, env.city.building_housing), (yields, housing))
+        with self.assertRaises(ValueError):
+            C_City(0, 0, buildings=('library',))
+
+    def test_buildings_do_not_change_play(self):
+        def trace(buildings):
+            env = self.make_env(forest_density=.2, wall_hp=30, ranged_strength=15, buildings=buildings)
+            rng = random.Random(5)
+            steps = [(env.observation_schema, env.get_observation().tolist())]
+            for _ in range(30):
+                observation, reward, done = env.step(env.guided_action(rng))
+                steps.append((observation.tolist(), reward, done, env.events))
+                if done:
+                    break
+            return steps
+        self.assertEqual(trace(('monument', 'granary')), trace(()))
 
 
 if __name__ == '__main__':

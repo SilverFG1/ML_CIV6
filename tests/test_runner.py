@@ -293,38 +293,98 @@ class RunnerTests(unittest.TestCase):
         evaluations = run_game.compare_policies(agent, args, verbose=False)
         self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
 
-    def test_domination_scenario_reports_cities_captured(self):
-        args = self.args('--city-count', '2')
+    def test_rivers_resume_evaluate_and_reject_changes(self):
+        args = self.args('--river-count', '2', '--forest-density', '0.1')
         agent = self.make_agent(args)
-        self.assertEqual(args.config.city_count, 2)
+        self.assertTrue(agent.observation_schema.endswith(':rivers'))
         run_game.train_agent(agent, args)
         agent.save(args.model_path)
-        evaluations = run_game.compare_policies(agent, args, verbose=False)
-        for summary in evaluations.values():
-            self.assertIn('average_cities_captured', summary)
-            self.assertTrue(all(0 <= row['cities_captured'] <= 2 for row in summary['episodes_detail']))
         resume_args = self.args()
-        self.make_agent(resume_args)
-        self.assertEqual(resume_args.config.city_count, 2)
+        resumed = self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.river_count, 2)
+        self.assertEqual(resumed.observation_size, agent.observation_size)
+        evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
+        self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
         with self.assertRaisesRegex(ValueError, 'fresh'):
-            self.make_agent(self.args('--city-count', '3'))
+            self.make_agent(self.args('--river-count', '1'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--river-count', '11'])
 
-    def test_player_capital_scenario_reports_capital_losses(self):
-        args = self.args('--player-capital', '--raid-interval', '3')
+    def test_ancient_walls_resume_and_reject_changes(self):
+        args = self.args('--walls', 'ancient', '--unit-count', '2', '--unit-types', 'warrior', 'archer')
         agent = self.make_agent(args)
-        self.assertTrue(args.config.player_capital)
+        self.assertEqual((args.config.wall_hp, args.config.ranged_strength), (100, 15))
         run_game.train_agent(agent, args)
         agent.save(args.model_path)
-        evaluations = run_game.compare_policies(agent, args, verbose=False)
-        for summary in evaluations.values():
-            self.assertLessEqual(summary['capital_losses'], summary['losses'])
-            self.assertTrue(all('capital_lost' in row for row in summary['episodes_detail']))
         resume_args = self.args()
         self.make_agent(resume_args)
-        self.assertTrue(resume_args.config.player_capital)
-        self.assertEqual(resume_args.config.raid_interval, 3)
+        self.assertEqual(resume_args.config, args.config)
         with self.assertRaisesRegex(ValueError, 'fresh'):
-            self.make_agent(self.args('--raid-interval', '5'))
+            self.make_agent(self.args('--walls', 'none'))
+        custom = self.args('--walls', 'ancient', '--wall-hp', '60', '--fresh')
+        self.make_agent(custom)
+        self.assertEqual((custom.config.wall_hp, custom.config.ranged_strength), (60, 15))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--walls', 'medieval'])
+
+    def test_terrain_options_resume_and_reject_changes(self):
+        args = self.args('--land-types', 'plains', 'desert', '--hills-density', '0.2', '--water-density', '0.1')
+        agent = self.make_agent(args)
+        self.assertTrue(agent.observation_schema.endswith(':terrain'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, args.config)
+        self.assertEqual(resume_args.config.land_types, ('plains', 'desert'))
+        for flags in [('--land-types', 'plains'), ('--hills-density', '0.3'), ('--water-density', '0')]:
+            with self.assertRaisesRegex(ValueError, 'fresh'):
+                self.make_agent(self.args(*flags))
+        for flags in [('--land-types', 'lava'), ('--hills-density', '2')]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run_game.parse_args(list(flags))
+
+    def test_buildings_resume_and_reject_changes(self):
+        args = self.args('--buildings', 'monument', 'granary')
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.buildings, ('monument', 'granary'))
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--buildings', 'monument'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--buildings', 'library'])
+
+    def test_economy_resumes_and_rejects_changes(self):
+        args = self.args('--economy', '--city-population', '2', '--build-queue', 'ancient_walls', 'monument')
+        agent = self.make_agent(args)
+        self.assertTrue(agent.observation_schema.endswith(':economy'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, args.config)
+        self.assertEqual(resume_args.config.build_queue, ('ancient_walls', 'monument'))
+        for flags in [('--city-population', '3'), ('--build-queue', 'monument')]:
+            with self.assertRaisesRegex(ValueError, 'fresh'):
+                self.make_agent(self.args(*flags))
+        with self.assertRaisesRegex(ValueError, 'need the city economy'):
+            self.make_agent(self.args('--city-population', '2', '--fresh'))
+        for flags in [('--build-queue', 'palace'), ('--city-population', '0')]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run_game.parse_args(list(flags))
+
+    def test_checkpoint_without_river_setting_resumes_without_rivers(self):
+        args = self.args()
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        del agent.training_state['config']['river_count']
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.river_count, 0)
 
     def test_runner_rejects_corrupt_progress_metadata(self):
         args = self.args()

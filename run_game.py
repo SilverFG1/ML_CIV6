@@ -13,6 +13,7 @@ from learning_ai import QLearningAgent
 
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
+TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types", "buildings", "build_queue")
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
                  "random_actions", "policy_actions", "q_table_size", "city_strength")
@@ -49,17 +50,25 @@ def parse_args(argv=None):
     parser.add_argument("--no-guidance", action="store_true", help="train without heuristic fallback")
     parser.add_argument("--log-every", type=int, default=50)
     for flag, kind in (("width", int), ("height", int), ("city-strength", float), ("wall-hp", float),
-                       ("ranged-strength", float), ("mountain-density", float), ("forest-density", float)):
+                       ("ranged-strength", float), ("mountain-density", float), ("forest-density", float),
+                       ("hills-density", float), ("water-density", float)):
         parser.add_argument("--" + flag, type=kind)
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
-    parser.add_argument("--city-count", type=int, choices=range(1, game.MAX_CITIES + 1),
-                        help="enemy capitals; capture them all for a domination victory (default: 1)")
-    parser.add_argument("--player-capital", action="store_true",
-                        help="give the squad its own capital to defend against raiders; losing it loses the game")
-    parser.add_argument("--raid-interval", type=int,
-                        help="turns between raids on the player's capital; 0 disables raids (default: 6)")
-    parser.add_argument("--capital-strength", type=float, help="player's capital combat strength (default: 28)")
-    parser.add_argument("--raider-strength", type=float, help="raider combat strength (default: 20)")
+    parser.add_argument("--land-types", nargs="+", choices=game.LAND_TYPES,
+                        help="Civ VI land types to fill the map with, in regions (default: grassland)")
+    parser.add_argument("--buildings", nargs="+", choices=game.BUILDING_TYPES,
+                        help="city buildings: monument (+2 culture), granary (+1 food, +2 housing)")
+    parser.add_argument("--economy", action="store_true",
+                        help="run the city's economy: growth, production of --build-queue, and border growth")
+    parser.add_argument("--city-population", type=int, choices=range(1, game.MAX_CITY_POPULATION + 1), metavar="N",
+                        help=f"starting city population with --economy (1-{game.MAX_CITY_POPULATION}, default: 1)")
+    parser.add_argument("--build-queue", nargs="+", choices=game.BUILD_ITEMS,
+                        help="what the city builds, in order, with --economy (default: "
+                             + " ".join(game.DEFAULT_BUILD_QUEUE) + ")")
+    parser.add_argument("--walls", choices=game.WALL_TYPES,
+                        help="city walls; ancient gives 100 wall HP and a 15-strength ranged strike")
+    parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
+                        help=f"rivers to generate along hex sides (0-{game.MAX_RIVERS}, default: 0)")
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--no-city-healing", action="store_true")
     parser.add_argument("--unit-strengths", type=float, nargs="+")
@@ -78,7 +87,7 @@ def parse_args(argv=None):
     if args.curriculum_episodes is not None and args.curriculum_episodes < 0:
         parser.error("--curriculum-episodes must be non-negative")
     for name in ("epsilon", "epsilon_decay", "epsilon_min", "guided_exploration", "discount_factor",
-                 "mountain_density", "forest_density"):
+                 "mountain_density", "forest_density", "hills_density", "water_density"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 1:
             parser.error(f"--{name.replace('_', '-')} must lie between 0 and 1")
@@ -93,23 +102,24 @@ def config_from_args(args, saved=None):
     values = asdict(game.GameConfig())
     values.update(saved)
     explicit = {}
-    for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
-                 "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
-                 "city_count", "raid_interval", "capital_strength", "raider_strength"):
+    for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp", "walls",
+                 "buildings", "ranged_strength", "mountain_density", "forest_density", "land_types", "hills_density",
+                 "water_density", "river_count", "unit_strengths", "unit_types", "difficulty",
+                 "city_population", "build_queue"):
         value = getattr(args, name)
         if value is not None:
-            explicit[name] = tuple(value) if name in ("city_position", "unit_strengths", "unit_types") else value
+            explicit[name] = tuple(value) if name in TUPLE_SETTINGS else value
     if args.no_city_healing:
         explicit["city_heals"] = False
-    if args.player_capital:
-        explicit["player_capital"] = True
+    if args.economy:
+        explicit["economy"] = True
     if args.difficulty is not None and args.city_strength is None:
         explicit["city_strength"] = DIFFICULTY_STRENGTHS[args.difficulty]
     elif not saved and args.city_strength is None:
         values["city_strength"] = DIFFICULTY_STRENGTHS[values["difficulty"]]
     for name, value in explicit.items():
         old = values.get(name)
-        if name in ("city_position", "unit_strengths", "unit_types") and old is not None:
+        if name in TUPLE_SETTINGS and old is not None:
             old = tuple(old)
         if saved and old != value:
             raise ValueError(f"--{name.replace('_', '-')} differs from the checkpoint; use --fresh for a new scenario")
@@ -117,6 +127,9 @@ def config_from_args(args, saved=None):
     values["city_position"] = None if values["city_position"] is None else tuple(values["city_position"])
     values["unit_strengths"] = tuple(values["unit_strengths"])
     values["unit_types"] = tuple(values["unit_types"])
+    values["land_types"] = tuple(values["land_types"])
+    values["buildings"] = tuple(values["buildings"])
+    values["build_queue"] = tuple(values["build_queue"])
     return game.GameConfig(**values)
 
 
@@ -243,8 +256,6 @@ class EpisodeResult:
     guidance_actions: int = 0
     random_actions: int = 0
     policy_actions: int = 0
-    cities_captured: int = 0
-    capital_lost: bool = False
 
     @property
     def won(self):
@@ -293,8 +304,7 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
             break
     if train:
         agent.finish_episode()
-    return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"],
-                         env.last_info.get("cities_captured", 0), env.last_info.get("capital_lost", False))
+    return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"])
 
 
 def compare_policies(agent, args, *, count=None, seed=None, config=None, policies=None, render=False, verbose=True):
@@ -339,18 +349,12 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 "win_rate": wins / completed if completed else 0.0,
                 "average_reward": sum(row["reward"] for row in rows) / completed if completed else 0.0,
                 "average_steps": sum(row["steps"] for row in rows) / completed if completed else 0.0,
-                "average_cities_captured": (sum(row["cities_captured"] for row in rows) / completed
-                                            if completed else 0.0),
-                "capital_losses": sum(row["capital_lost"] for row in rows),
                 "episodes_detail": rows,
             }
             if verbose:
                 summary = summaries[policy]
-                captured = (f", average cities captured {summary['average_cities_captured']:.2f}/{config.city_count}"
-                            if config.city_count > 1 else "")
-                capital = f" (capital lost {summary['capital_losses']})" if config.player_capital else ""
-                print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}{capital}, "
-                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}{captured}")
+                print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}, "
+                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}")
             if summaries[policy]["quits"]:
                 break
     finally:

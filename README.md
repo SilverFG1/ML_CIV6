@@ -80,6 +80,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--city-war-weariness POINTS` | Start the city's civilization with this much war weariness (0–10000; default: 0). |
 | `--city-loyalty N` | Set the city's starting loyalty (1–100; default: 100). |
 | `--enemy-city POPULATION DISTANCE` | Add a city of the attacker's civilization 4–9 hexes away, whose citizens pressure the city's loyalty. |
+| `--city-governor NAME`, `--governor-promotion NAME` | Appoint one governor to the city at the start, with up to one promotion; requires `--city-population`. |
 | `--city-builders N`, `--city-settlers N` | Give the city up to two builders and two settlers; requires `--city-population`. |
 | `--city-districts ...`, `--city-buildings ...` | Ancient-era districts and buildings the city starts with; requires `--city-population`. |
 | `--build-queue ...` | Districts and buildings the city produces, in order, during the game. |
@@ -149,11 +150,22 @@ python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman b
 
   Below 75 loyalty, the city's yields and growth fall by 25%. Below 25, yields fall by 50% and growth by 75%. When loyalty reaches 0 and is still falling, the city declares independence and becomes a Free City. The game ends with the outcome `free_city`, the attacker gains 5 reward, and evaluation summaries count `free_cities`. What the Free City does next, such as training units or joining another civilization, is not simulated.
 
-  These follow Civ VI's Civilopedia and wiki. Civ VI's exact conversion from pressure to loyalty is not documented, so 1 loyalty per citizen is an approximation. Governors, religion, golden and dark ages, and policies are not modeled. An isolated city stays loyal. A large enemy city nearby can turn a long siege into a loyalty flip: with a size-12 enemy city 4 hexes away, a squad that stayed back saw a size-3 capital declare independence in 16 of 20 games.
+  These follow Civ VI's Civilopedia and wiki. Civ VI's exact conversion from pressure to loyalty is not documented, so 1 loyalty per citizen is an approximation. Religion, golden and dark ages, and policies are not modeled. An isolated city stays loyal. A large enemy city nearby can turn a long siege into a loyalty flip: with a size-12 enemy city 4 hexes away, a squad that stayed back saw a size-3 capital declare independence in 16 of 20 games.
+- **Governors.** `--city-governor` appoints one governor when the game starts. In the ancient era, Early Empire and State Workforce give two governor titles: one appoints the governor, and the other can buy one promotion (`--governor-promotion`). The governor takes effect once established, after 5 turns (3 for Victor). An established governor adds 8 loyalty a turn. Each governor's first title and promotions do the following here:
+
+  | Governor | First title | Effect here | Promotions offered |
+  | --- | --- | --- | --- |
+  | `victor` | Redoubt | None: it strengthens a garrison, and the city has none | `defense_logistics`: the city cannot be put under siege, so it heals even when surrounded. `garrison_commander`: no effect here (no defending units or other cities). |
+  | `magnus` | Groundbreaker | None: there are no harvests | `surplus_logistics`: +20% food. `provision`: no effect here (no settlers are trained). |
+  | `liang` | Guildmaster | None: no builders are trained during the game | `zoning_commissioner`: +20% production toward districts. `reinforced_materials`: no effect here (no disasters). |
+  | `pingala` | Librarian | +15% science and culture | `connoisseur`: +1 culture per citizen. `researcher`: +1 science per citizen. |
+  | `reyna`, `amani`, `moksha` | Land Acquisition, Messenger, Bishop | None (trade, city-states, religion) | None offered |
+
+  An established governor's 8 loyalty outweighs a large enemy city. With a size-12 enemy city 4 hexes away, a size-3 capital that declared independence in 16 of 20 games against a squad that held back did not do so once with a governor. The 5- and 3-turn establishment times, Magnus's +20% food, and Liang's +20% district production come from community sources rather than the game files. Governor promotions beyond the ancient era's one, and moving governors between cities, are not modeled.
 - **Starvation.** If the city's food store would drop below zero, it empties and the city loses a citizen (never going below one).
 - **Reward.** The attacker loses 1 reward each time the city grows and gains 1 each time it starves. Units standing next to the city therefore blockade it as well as besiege it.
 
-Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), war weariness in whole amenities (points ÷ 400), and loyalty in tenths. The observation schema ends with `:city_growth:water=...:luxuries=N:weariness=N:loyalty=N` (and `:enemy=POPULATION@DISTANCE` when there is an enemy city), so turning growth on or changing any of these requires `--fresh`; growth models trained before housing, amenities, war weariness and loyalty were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
+Territory expansion is not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, housing room (housing minus population), war weariness in whole amenities (points ÷ 400), loyalty in tenths, and whether a governor is established. The observation schema ends with `:city_growth:water=...:luxuries=N:weariness=N:loyalty=N`, plus `:enemy=POPULATION@DISTANCE` with an enemy city and `:governor=NAME+PROMOTION` with a governor, so turning growth on or changing any of these requires `--fresh`; growth models trained before housing, amenities, war weariness and loyalty were added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-path runs/growth/model.json --metrics-dir runs/growth --fresh

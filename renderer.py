@@ -163,6 +163,12 @@ class Renderer:
                        f'Amenities {report["amenities"]}/{report["amenities_needed"]} {report["mood"]}',
                        *([f'War weariness {report["war_weariness"]}'] if report['war_weariness'] else []),
                        f'Loyalty {report["loyalty"]:g} ({report["loyalty_per_turn"]:+g})',
+                       *([f'Governor {report["governor"].capitalize()}'
+                          + (f' ({report["governor_promotion"].replace("_", " ")})' if report['governor_promotion'] else '')
+                          + ('' if report['governor_established']
+                             else f', establishing: {report["turns_to_establish"]} turn'
+                                  + ('' if report['turns_to_establish'] == 1 else 's'))]
+                         if 'governor' in report else []),
                        f'Food {report["food"]:g}/{report["growth_threshold"]} ({report["growth_surplus"]:+g})']
         civilians = self.env.civilian_report()
         if civilians is not None:

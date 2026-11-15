@@ -66,6 +66,11 @@ def parse_args(argv=None):
     parser.add_argument("--city-loyalty", type=int, help="the city's starting loyalty, 1-100 (default: 100)")
     parser.add_argument("--enemy-city", type=int, nargs=2, metavar=("POPULATION", "DISTANCE"),
                         help="a city of the attacker's civilization that pressures the city's loyalty")
+    parser.add_argument("--city-governor", choices=tuple(game.GOVERNORS),
+                        help="the governor appointed to the city when the game starts")
+    parser.add_argument("--governor-promotion", dest="city_governor_promotion",
+                        choices=sorted({name for spec in game.GOVERNORS.values() for name in spec.promotions}),
+                        help="the governor's one ancient-era promotion")
     parser.add_argument("--city-builders", type=int, help="builders the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-settlers", type=int, help="settlers the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-districts", choices=tuple(game.DISTRICTS), nargs="+",
@@ -111,7 +116,7 @@ def config_from_args(args, saved=None):
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
                  "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
                  "city_population", "city_water", "city_luxuries", "city_war_weariness", "city_loyalty",
-                 "city_builders",
+                 "city_governor", "city_governor_promotion", "city_builders",
                  "city_settlers",
                  *TUPLE_FIELDS[3:]):
         value = getattr(args, name)
@@ -128,7 +133,8 @@ def config_from_args(args, saved=None):
         if name in TUPLE_FIELDS and old is not None:
             old = tuple(old)
         if saved and old != value:
-            flag = "build-queue" if name == "city_build_queue" else name.replace('_', '-')
+            flag = {"city_build_queue": "build-queue", "city_governor_promotion": "governor-promotion"}.get(
+                name, name.replace('_', '-'))
             raise ValueError(f"--{flag} differs from the checkpoint; use --fresh for a new scenario")
         values[name] = value
     values["city_position"] = None if values["city_position"] is None else tuple(values["city_position"])

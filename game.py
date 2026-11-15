@@ -124,6 +124,34 @@ def loyalty_effects(loyalty):
     return -.75, -.5
 
 
+@dataclass(frozen=True)
+class GovernorSpec:
+    title: str  # the governor's first title, which comes with the appointment
+    establish_turns: int = 5
+    promotions: tuple = ()  # the first-tier promotions this simulation offers
+
+
+# Governors (Rise and Fall and Gathering Storm). The ancient era's two governor
+# titles, from Early Empire and State Workforce, appoint one governor and give
+# it one promotion. The governor arrives when the game starts and takes effect
+# once established: after 5 turns, or 3 for Victor. An established governor adds
+# 8 loyalty a turn. Promotions are offered only for governors whose promotions
+# can matter here.
+GOVERNORS = {
+    'victor': GovernorSpec('Redoubt', 3, ('garrison_commander', 'defense_logistics')),
+    'liang': GovernorSpec('Guildmaster', promotions=('zoning_commissioner', 'reinforced_materials')),
+    'magnus': GovernorSpec('Groundbreaker', promotions=('provision', 'surplus_logistics')),
+    'pingala': GovernorSpec('Librarian', promotions=('connoisseur', 'researcher')),
+    'reyna': GovernorSpec('Land Acquisition'),
+    'amani': GovernorSpec('Messenger'),
+    'moksha': GovernorSpec('Bishop'),
+}
+GOVERNOR_LOYALTY = 8
+LIBRARIAN_BONUS = .15  # Pingala: +15% science and culture
+SURPLUS_LOGISTICS_FOOD = .20  # Magnus: +20% food
+ZONING_COMMISSIONER_BONUS = .20  # Liang: +20% production toward districts
+
+
 def citizen_pressure(population, distance, capital=False):
     """Loyalty a turn from a city's citizens at this distance."""
     if distance > LOYALTY_RANGE:
@@ -254,6 +282,8 @@ class GameConfig:
     city_war_weariness: int = 0
     city_loyalty: int = 100
     enemy_city: tuple = ()  # (population, distance) of a city of the attacker's civilization
+    city_governor: str = ''
+    city_governor_promotion: str = ''
     city_builders: int = 0
     city_settlers: int = 0
     city_districts: tuple = ()
@@ -321,6 +351,14 @@ class GameConfig:
                                  f'distance {MIN_CITY_DISTANCE}-{LOYALTY_RANGE})')
         if (self.city_loyalty != 100 or self.enemy_city) and not self.city_growth:
             raise ValueError('loyalty needs a city with population (city_population >= 1)')
+        if self.city_governor not in ('', *GOVERNORS):
+            raise ValueError(f'city_governor must be one of: {", ".join(GOVERNORS)}')
+        if self.city_governor and not self.city_growth:
+            raise ValueError('a governor needs a city with population (city_population >= 1)')
+        offered = GOVERNORS[self.city_governor].promotions if self.city_governor else ()
+        if self.city_governor_promotion and self.city_governor_promotion not in offered:
+            raise ValueError('city_governor_promotion must be one of: '
+                             + (', '.join(offered) if offered else 'none for this governor'))
         for name in ('city_builders', 'city_settlers'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CIVILIANS:
@@ -534,6 +572,9 @@ class Game:
                                       f':weariness={self.config.city_war_weariness}'
                                       f':loyalty={self.config.city_loyalty}'
                                       + (':enemy={}@{}'.format(*self.config.enemy_city) if self.config.enemy_city else '')
+                                      + (f':governor={self.config.city_governor}' if self.config.city_governor else '')
+                                      + (f'+{self.config.city_governor_promotion}'
+                                         if self.config.city_governor_promotion else '')
                                       if self.config.city_growth else '')
                                    + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else '')
                                    + (':built=' + ','.join(self.config.city_districts + self.config.city_buildings)
@@ -553,6 +594,7 @@ class Game:
         self.war_weariness = 0
         self.loyalty = 100
         self.independent = False
+        self.governor_turns = 0
         self.city = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -597,6 +639,7 @@ class Game:
         self.districts, self.buildings, self.build_progress, self.completed = {}, [], {}, []
         self.war_weariness = c.city_war_weariness
         self.loyalty, self.independent = c.city_loyalty, False
+        self.governor_turns = 0
         self._valid_cache_key = self._path_costs = None
         # Starting districts and buildings exist before the squad arrives.
         for item in c.city_districts + c.city_buildings:
@@ -755,6 +798,8 @@ class Game:
     def city_turn(self):
         if not self.city.alive:
             return
+        if self.config.city_governor:
+            self.governor_turns += 1
         if self.city.ranged_combat:
             targets = [u for u in self.units if u.alive and hex_distance(u.position, self.city.position) <= 2]
             if targets:
@@ -773,7 +818,8 @@ class Game:
                 target.take_damage(damage)
         if self.city.heal:
             besiegers = sum(u.alive and hex_distance(u.position, self.city.position) == 1 for u in self.units)
-            if besiegers < min(3, self.config.unit_count):
+            # Victor's Defense Logistics: the city cannot be put under siege.
+            if besiegers < min(3, self.config.unit_count) or self.governor_has('defense_logistics'):
                 healed = min(10, self.city.hp_max - self.city.hp)
                 if healed > 0:
                     self.city.hp += healed
@@ -801,7 +847,25 @@ class Game:
         buildings = sum(BUILDINGS[building].loyalty for building in self.buildings)
         if buildings:
             sources['buildings'] = buildings
+        if self.governor_established():
+            sources['governor'] = GOVERNOR_LOYALTY
         return sources
+
+    def governor_established(self):
+        governor = self.config.city_governor
+        return bool(governor) and self.governor_turns >= GOVERNORS[governor].establish_turns
+
+    def governor_has(self, effect):
+        """Whether the established governor has this title: its first title or its promotion."""
+        if not self.governor_established():
+            return False
+        return effect in (self.config.city_governor, self.config.city_governor_promotion)
+
+    def governor_report(self):
+        governor = self.config.city_governor
+        return {'governor': governor, 'governor_promotion': self.config.city_governor_promotion or None,
+                'governor_established': self.governor_established(),
+                'turns_to_establish': max(0, GOVERNORS[governor].establish_turns - self.governor_turns)}
 
     def loyalty_per_turn(self):
         return round(sum(self.loyalty_sources().values()), 2)
@@ -901,12 +965,14 @@ class Game:
             item = self.current_build()
             if item is None:
                 return  # nothing can be built now, so the production is lost
+            # Liang's Zoning Commissioner speeds up districts.
+            rate = 1 + ZONING_COMMISSIONER_BONUS if item in DISTRICTS and self.governor_has('zoning_commissioner') else 1
             needed = self.build_cost(item) - self.build_progress.get(item, 0)
-            if production < needed:
-                self.build_progress[item] = round(self.build_progress.get(item, 0) + production, 4)
+            if production * rate < needed:
+                self.build_progress[item] = round(self.build_progress.get(item, 0) + production * rate, 4)
                 return
             self.build_progress[item] = self.build_cost(item)
-            production = round(production - needed, 4)
+            production = round(production - needed / rate, 4)
             self.complete_build(item)
 
     def _steps_to(self, goals, blocked):
@@ -1000,6 +1066,8 @@ class Game:
         for building in self.buildings:
             yields = dict(BUILDINGS[building].yields)
             food, production = food + yields.get('food', 0), production + yields.get('production', 0)
+        if self.governor_has('surplus_logistics'):
+            food = round(food * (1 + SURPLUS_LOGISTICS_FOOD), 2)
         return food, self._mood_adjusted(production)
 
     def amenities(self):
@@ -1014,9 +1082,9 @@ class Game:
         available, needed = self.amenities()
         return amenity_mood(available - needed)
 
-    def _mood_adjusted(self, amount):
-        """Apply the mood's change to a non-food yield."""
-        change = self.mood()[2] + (loyalty_effects(self.loyalty)[1] if self.config.city_growth else 0)
+    def _mood_adjusted(self, amount, bonus=0):
+        """Apply the mood's and loyalty's changes, plus any bonus, to a non-food yield."""
+        change = bonus + self.mood()[2] + (loyalty_effects(self.loyalty)[1] if self.config.city_growth else 0)
         return round(amount * max(0, 1 + change), 2) if change else amount
 
     def city_output(self):
@@ -1030,8 +1098,14 @@ class Game:
             for kind, amount in BUILDINGS[building].yields:
                 if kind not in ('food', 'production'):
                     output[kind] += amount
+        # Pingala: Connoisseur and Researcher add 1 per citizen; Librarian adds 15%.
+        if self.governor_has('connoisseur'):
+            output['culture'] += self.city.population
+        if self.governor_has('researcher'):
+            output['science'] += self.city.population
+        librarian = LIBRARIAN_BONUS if self.governor_has('pingala') else 0
         for kind in ('culture', 'science', 'faith'):
-            output[kind] = self._mood_adjusted(output[kind])
+            output[kind] = self._mood_adjusted(output[kind], librarian if kind != 'faith' else 0)
         return output
 
     def food_surplus(self):
@@ -1073,6 +1147,7 @@ class Game:
                 'amenities_lost_to_war': self.amenities_lost_to_war(),
                 'loyalty': self.loyalty, 'loyalty_per_turn': self.loyalty_per_turn(),
                 'loyalty_sources': self.loyalty_sources(),
+                **(self.governor_report() if self.config.city_governor else {}),
                 'growth_surplus': stored,
                 'turns_to_grow': math.ceil((threshold - city.food) / stored) if stored > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
@@ -1227,6 +1302,8 @@ class Game:
                            self.food_surplus() / 10, (self.housing() - city.population) / 10,
                            min(1.0, self.war_weariness // WAR_WEARINESS_PER_AMENITY / 10),
                            math.floor(self.loyalty / 10) / 10])
+            if c.city_governor:
+                values.append(float(self.governor_established()))
         for civilian in self.civilians:
             values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
                            float(civilian.alive), civilian.charges / BUILDER_CHARGES])

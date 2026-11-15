@@ -1017,5 +1017,83 @@ class GameTests(unittest.TestCase):
         self.assertTrue(self.make_env(city_population=1, enemy_city=(5, 9)).observation_schema.endswith(':enemy=5@9'))
 
 
+    # Governors.
+    def test_governor_establishes_then_adds_loyalty(self):
+        for governor, turns in [('victor', 3), ('reyna', 5), ('pingala', 5)]:
+            with self.subTest(governor=governor):
+                env = self.make_env(city_population=3, city_loyalty=60, enemy_city=(12, 4), city_governor=governor)
+                self.place_far(env)
+                self.assertEqual(env.city_report()['turns_to_establish'], turns)
+                for _ in range(turns - 1):
+                    env.step(self.wait(env))
+                self.assertNotIn('governor', env.loyalty_sources())
+                self.assertEqual(env.get_observation()[-1], 0.0)
+                before = env.loyalty
+                env.step(self.wait(env))
+                self.assertTrue(env.city_report()['governor_established'])
+                self.assertEqual(env.loyalty_sources()['governor'], 8)
+                self.assertAlmostEqual(env.loyalty, before - 4.2 + 8)
+                self.assertEqual(env.get_observation()[-1], 1.0)
+
+    def test_no_governor_by_default(self):
+        env = self.make_env(city_population=2)
+        self.assertNotIn('governor', env.city_report())
+        self.assertNotIn('governor', env.observation_schema)
+        self.assertFalse(env.governor_has('victor'))
+
+    def test_defense_logistics_lets_a_surrounded_city_heal(self):
+        for promotion, healed in [('defense_logistics', True), ('garrison_commander', False), ('', False)]:
+            with self.subTest(promotion=promotion):
+                env = self.make_env(city_population=3, city_luxuries=1, city_governor='victor',
+                                    city_governor_promotion=promotion)
+                self.place(env, [(3, 4), (5, 4), (4, 3)])
+                env.governor_turns = 3
+                env.city.hp = 80
+                env.step(self.wait(env))
+                self.assertEqual(env.city.hp, 90 if healed else 80)
+
+    def test_surplus_logistics_adds_food(self):
+        env = self.make_env(city_population=1, city_governor='magnus', city_governor_promotion='surplus_logistics')
+        self.place_far(env)
+        self.assertEqual(env.city_yields()[0], 4)
+        env.governor_turns = 5
+        self.assertAlmostEqual(env.city_yields()[0], 4.8)
+        self.assertAlmostEqual(env.food_surplus(), 2.8)
+
+    def test_zoning_commissioner_speeds_districts_only(self):
+        env = self.make_env(city_population=1, city_governor='liang', city_governor_promotion='zoning_commissioner',
+                            city_build_queue=('campus', 'monument'))
+        self.place_far(env)
+        env.governor_turns = 5
+        env.build_progress['campus'] = 53
+        env.step(self.wait(env))
+        self.assertIn('campus', env.districts)
+        # 1 production became 1.2 toward the campus; the unused 1 - 1 / 1.2 goes to the monument.
+        self.assertAlmostEqual(env.build_progress['monument'], 1 - 1 / 1.2, places=3)
+        env.step(self.wait(env))
+        self.assertAlmostEqual(env.build_progress['monument'], 1 - 1 / 1.2 + 1, places=3)
+
+    def test_pingala_raises_science_and_culture(self):
+        for promotion, culture, science in [('', 2.3, 0), ('connoisseur', 3.45, 0), ('researcher', 2.3, 1.15)]:
+            with self.subTest(promotion=promotion):
+                env = self.make_env(city_population=1, city_governor='pingala', city_governor_promotion=promotion,
+                                    city_buildings=('monument',))
+                self.assertEqual(env.city_output()['culture'], 2)  # not yet established
+                env.governor_turns = 5
+                output = env.city_output()
+                self.assertAlmostEqual(output['culture'], culture)
+                self.assertAlmostEqual(output['science'], science)
+
+    def test_governor_settings_are_validated(self):
+        self.assertTrue(self.make_env(city_population=1, city_governor='victor', city_governor_promotion='defense_logistics')
+                        .observation_schema.endswith(':governor=victor+defense_logistics'))
+        for kwargs in ({'city_governor': 'victor'}, {'city_population': 1, 'city_governor': 'ibrahim'},
+                       {'city_population': 1, 'city_governor_promotion': 'defense_logistics'},
+                       {'city_population': 1, 'city_governor': 'magnus', 'city_governor_promotion': 'defense_logistics'},
+                       {'city_population': 1, 'city_governor': 'reyna', 'city_governor_promotion': 'harbormaster'}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                GameConfig(**kwargs)
+
+
 if __name__ == '__main__':
     unittest.main()

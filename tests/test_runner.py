@@ -342,6 +342,18 @@ class RunnerTests(unittest.TestCase):
             self.make_agent(self.args('--city-war-weariness', '800'))  # the saved model started at 0
         with self.assertRaisesRegex(ValueError, 'enemy-city'):
             self.make_agent(self.args('--enemy-city', '8', '5'))
+        with self.assertRaisesRegex(ValueError, '--city-governor differs'):
+            self.make_agent(self.args('--city-governor', 'victor'))
+        with self.assertRaisesRegex(ValueError, '--governor-promotion differs'):
+            self.make_agent(self.args('--governor-promotion', 'defense_logistics'))
+        governed = self.args('--fresh', '--no-save', '--city-population', '3', '--city-governor', 'victor',
+                             '--governor-promotion', 'defense_logistics')
+        self.make_agent(governed)
+        self.assertEqual((governed.config.city_governor, governed.config.city_governor_promotion),
+                         ('victor', 'defense_logistics'))
+        with self.assertRaisesRegex(ValueError, 'promotion'):
+            self.make_agent(self.args('--fresh', '--no-save', '--city-population', '3', '--city-governor', 'magnus',
+                                      '--governor-promotion', 'defense_logistics'))
         rebel_args = self.args('--fresh', '--no-save', '--city-population', '3', '--city-loyalty', '5',
                                '--enemy-city', '20', '4')
         rebel = self.make_agent(rebel_args)

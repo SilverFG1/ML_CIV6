@@ -75,6 +75,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
 | `--no-city-healing` | Disable city healing. |
 | `--city-population N` | Start the city with N citizens (0–20) and simulate worked tiles and growth; 0 (the default) turns this off. |
+| `--city-water fresh\|coast\|none` | Set the city's water supply, which gives 5, 3 or 2 starting housing (default: `fresh`). |
 | `--city-builders N`, `--city-settlers N` | Give the city up to two builders and two settlers; requires `--city-population`. |
 | `--city-districts ...`, `--city-buildings ...` | Ancient-era districts and buildings the city starts with; requires `--city-population`. |
 | `--build-queue ...` | Districts and buildings the city produces, in order, during the game. |
@@ -122,10 +123,11 @@ python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman b
 
 - **Worked tiles.** The city owns the six tiles around its center, like a newly founded Civ VI city. Each citizen works one free tile, choosing the most food, then the most production. A tile with a unit on it cannot be worked, and citizens are reassigned whenever units move. A citizen with no free tile still eats.
 - **Growth.** Each citizen eats 2 food. The surplus is stored, and the city gains a citizen when the store reaches the Civ VI threshold of 15 + 8n + n^1.5 food, where n is the population minus one (15, 24, 33, 44, …). Leftover food carries over.
+- **Housing.** A city starts with 5 housing on fresh water (a river, lake or oasis), 3 on the coast, and 2 without water; `--city-water` chooses which. The water source is not drawn on the map. Each farm adds 0.5 housing, a granary 2, and barracks 1. As in Civ VI, a city one citizen below its housing stores only half its surplus food. At or above its housing, it stores a quarter, and five or more citizens over, it stops growing. Housing never reduces a food shortfall.
 - **Starvation.** If the city's food store would drop below zero, it empties and the city loses a citizen (never going below one).
 - **Reward.** The attacker loses 1 reward each time the city grows and gains 1 each time it starves. Units standing next to the city therefore blockade it as well as besiege it.
 
-Housing, amenities, and territory expansion are not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), and food surplus, and the observation schema ends with `:city_growth`, so turning growth on for an existing model requires `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
+Amenities and territory expansion are not modeled. When growth is enabled, the observation adds the population, food progress (in quarters), food surplus, and housing room (housing minus population). The observation schema ends with `:city_growth:water=...`, so turning growth on or changing the water supply requires `--fresh`; growth models trained before housing was added also need `--fresh`. Evaluation summaries also report `average_city_population`, the city's size at the end of each game. Without `--city-population`, scenarios, observations, and existing checkpoints are unchanged.
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --city-population 3 --model-path runs/growth/model.json --metrics-dir runs/growth --fresh
@@ -137,7 +139,7 @@ During playback, the city's territory is outlined, gold dots mark worked tiles, 
 
 `--city-builders N` and `--city-settlers N` (up to two each) give a populated city civilians that start on free tiles in its territory. Civilians move one hex per turn after the squad moves, walking around units, other civilians, and the city itself.
 
-- **Builders** have Civ VI's three build charges. A builder farms the unfarmed grassland tiles in the city's territory, using one charge per farm, and is used up when the charges run out. A farm adds 1 food, so a farmed tile yields 3 food, and citizens work farms first. Civ VI does not allow farms on woods, so forests are not farmed.
+- **Builders** have Civ VI's three build charges. A builder farms the unfarmed grassland tiles in the city's territory, using one charge per farm, and is used up when the charges run out. A farm adds 1 food and 0.5 housing, so a farmed tile yields 3 food, and citizens work farms first. Civ VI does not allow farms on woods, so forests are not farmed.
 - **Settlers** walk to the nearest tile at least 4 hexes from every city (Civ VI's minimum spacing) and found a city there on the following turn. The new city is recorded and drawn but is not otherwise simulated.
 - **Capture.** A unit that moves onto a civilian captures it and takes its tile. Battering rams cannot capture civilians, just as they cannot capture the city.
 - **Reward.** Capturing a builder is worth +2 and capturing a settler +4. A city founded by a settler costs the attacker 5.
@@ -165,11 +167,11 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 | Building | District | Cost | Effect in this simulation |
 | --- | --- | --- | --- |
 | `monument` | City center | 60 | +2 culture |
-| `granary` | City center | 65 | +1 food |
+| `granary` | City center | 65 | +1 food, +2 housing |
 | `ancient_walls` | City center | 80 | +100 wall HP and a city ranged strike |
 | `library` | Campus | 80 | +2 science |
 | `shrine` | Holy Site | 65 | +2 faith |
-| `barracks` | Encampment | 80 | +1 production |
+| `barracks` | Encampment | 80 | +1 production, +1 housing |
 
 - **Placement.** A district goes on the free tile with the best adjacency bonus, then the lowest yields. The city center counts as a district for adjacency. A district tile is no longer worked by citizens, and a district placed on a farm replaces it. A tile with a unit or civilian on it cannot take a district.
 - **District limit.** A city can have one district, plus one more for every three citizens beyond the first (1 at population 1–3, 2 at 4–6, and so on). A starting configuration that exceeds the limit is rejected.
@@ -177,7 +179,7 @@ A populated city can have the ancient-era districts and buildings from Civ VI's 
 - **Combat.** Ancient Walls add 100 wall HP and give the city a ranged strike, as walls do in Civ VI. The encampment shoots a unit within 2 hexes of it each turn. Units cannot enter the encampment, which cannot be attacked. Both strikes use the city's ranged strength, or 15 (Civ VI's value for a civilization without ranged units) when the city has none. Battering rams help against these walls as they do against `--wall-hp`.
 - **Reward.** The attacker loses 1 each time the city completes a district or building.
 
-Culture, science and faith are tracked and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, housing, building maintenance, and pillaging. The Water Mill is left out because these maps have no rivers. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
+Culture, science and faith are tracked and shown, but nothing spends them. Several things are not modeled: border growth, rising district costs as Civ VI's tech and civics progress, building maintenance, and pillaging. The Water Mill is left out because it needs a river on the map, and `--city-water fresh` only sets housing. The Government Plaza is left out because its buildings need Classical-era governments. In Civ VI, an Encampment can be placed only on a tile the city owns that is not next to the city center. Without border growth, this simulation places it two hexes out. Building costs come from community references, since the game's data files were not available here. Check them against your game's Civilopedia if exact values matter.
 
 The observation adds a built flag for each listed district and building, plus the current item's production progress in quarters. An encampment appears as impassable in the terrain grid. The schema ends with `:built=...` and `:queue=...`, so changing them requires `--fresh`. Evaluation summaries report `average_builds_completed` when there is a queue.
 

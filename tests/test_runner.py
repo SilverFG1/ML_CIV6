@@ -320,16 +320,18 @@ class RunnerTests(unittest.TestCase):
 
 
     def test_city_population_trains_resumes_and_reports_final_size(self):
-        args = self.args('--city-population', '2')
+        args = self.args('--city-population', '2', '--city-water', 'coast')
         agent = self.make_agent(args)
-        self.assertTrue(agent.observation_schema.endswith(':city_growth'))
+        self.assertTrue(agent.observation_schema.endswith(':city_growth:water=coast'))
         run_game.train_agent(agent, args)
         agent.save(args.model_path)
         resume_args = self.args()
         resumed = self.make_agent(resume_args)
-        self.assertEqual(resume_args.config.city_population, 2)
+        self.assertEqual((resume_args.config.city_population, resume_args.config.city_water), (2, 'coast'))
         with self.assertRaisesRegex(ValueError, 'city-population'):
             self.make_agent(self.args('--city-population', '3'))
+        with self.assertRaisesRegex(ValueError, 'city-water'):
+            self.make_agent(self.args('--city-water', 'fresh'))
         evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
         for summary in evaluations.values():
             self.assertGreaterEqual(summary['average_city_population'], 1)

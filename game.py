@@ -69,6 +69,25 @@ MAX_CITY_POPULATION = 20
 # The attacker loses this much reward when the city grows and gains it when
 # the city starves.
 POPULATION_REWARD = 1.0
+# Housing (Civ VI): a city starts with 5 housing on fresh water (a river, lake
+# or oasis), 3 on the coast and 2 otherwise. Each farm adds 0.5.
+WATER_HOUSING = {'fresh': 5, 'coast': 3, 'none': 2}
+FARM_HOUSING = 0.5
+
+
+def housing_growth_rate(population, housing):
+    """Civ VI's share of surplus food that goes to growth, given housing.
+
+    Growth is halved one citizen below the housing limit, cut to a quarter
+    at the limit, and stops five citizens above it.
+    """
+    if population >= housing + 5:
+        return 0.0
+    if population >= housing:
+        return 0.25
+    if population >= housing - 1:
+        return 0.5
+    return 1.0
 
 
 # Civilians belong to a populated city. A builder has Civ VI's 3 build charges
@@ -105,10 +124,11 @@ class BuildingSpec:
     district: str = 'city_center'
     yields: tuple = ()  # (yield type, amount) pairs
     walls: float = 0  # outer defense added to the city's walls
+    housing: float = 0
 
 
 # Ancient-era districts and buildings (Gathering Storm). The Water Mill needs a
-# river, which these maps lack. The Government Plaza is omitted because its
+# river on the map, which this sim does not model. The Government Plaza is omitted because its
 # buildings need Classical governments. The Encampment cannot be next to the
 # city center; this sim has no border growth, so it goes two hexes out.
 DISTRICTS = {
@@ -118,11 +138,11 @@ DISTRICTS = {
 }
 BUILDINGS = {
     'monument': BuildingSpec('(none)', 60, yields=(('culture', 2),)),
-    'granary': BuildingSpec('Pottery', 65, yields=(('food', 1),)),
+    'granary': BuildingSpec('Pottery', 65, yields=(('food', 1),), housing=2),
     'ancient_walls': BuildingSpec('Masonry', 80, walls=100),
     'library': BuildingSpec('Writing', 80, 'campus', yields=(('science', 2),)),
     'shrine': BuildingSpec('Astrology', 65, 'holy_site', yields=(('faith', 2),)),
-    'barracks': BuildingSpec('Bronze Working', 80, 'encampment', yields=(('production', 1),)),
+    'barracks': BuildingSpec('Bronze Working', 80, 'encampment', yields=(('production', 1),), housing=1),
 }
 # Walls and encampments give the city a ranged strike; Civ VI uses the
 # strongest ranged unit's strength, or 15 without one. The city has no units.
@@ -159,6 +179,7 @@ class GameConfig:
     unit_types: tuple = ()
     difficulty: str = 'normal'
     city_population: int = 0
+    city_water: str = 'fresh'
     city_builders: int = 0
     city_settlers: int = 0
     city_districts: tuple = ()
@@ -203,6 +224,8 @@ class GameConfig:
         if (isinstance(self.city_population, bool) or not isinstance(self.city_population, int)
                 or not 0 <= self.city_population <= MAX_CITY_POPULATION):
             raise ValueError(f'city_population must be an integer between 0 and {MAX_CITY_POPULATION}')
+        if self.city_water not in WATER_HOUSING:
+            raise ValueError(f'city_water must be one of: {", ".join(WATER_HOUSING)}')
         for name in ('city_builders', 'city_settlers'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CIVILIANS:
@@ -412,7 +435,7 @@ class Game:
                                + ('settler',) * self.config.city_settlers)
         self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
                                    + ','.join(self.unit_types)
-                                   + (':city_growth' if self.config.city_growth else '')
+                                   + (f':city_growth:water={self.config.city_water}' if self.config.city_growth else '')
                                    + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else '')
                                    + (':built=' + ','.join(self.config.city_districts + self.config.city_buildings)
                                       if self.config.city_districts or self.config.city_buildings else '')
@@ -852,6 +875,20 @@ class Game:
     def food_surplus(self):
         return self.city_yields()[0] - FOOD_PER_CITIZEN * self.city.population
 
+    def housing(self):
+        """Housing from the city's water supply, farms and buildings."""
+        return (WATER_HOUSING[self.config.city_water] + FARM_HOUSING * len(self.farms)
+                + sum(BUILDINGS[building].housing for building in self.buildings))
+
+    def growth_surplus(self):
+        """The food stored this turn: housing limits a surplus but never a shortfall."""
+        surplus = self.food_surplus()
+        if surplus > 0:
+            rate = housing_growth_rate(self.city.population, self.housing())
+            if rate < 1:
+                surplus *= rate
+        return surplus
+
     def city_report(self):
         """Population, stored food and tile use, or None when growth is off."""
         if not self.config.city_growth:
@@ -859,10 +896,14 @@ class Game:
         city = self.city
         food, production = self.city_yields()
         surplus = food - FOOD_PER_CITIZEN * city.population
+        stored = self.growth_surplus()
         threshold = growth_threshold(city.population)
+        housing = self.housing()
         return {'population': city.population, 'food': city.food, 'growth_threshold': threshold,
                 'food_yield': food, 'production_yield': production, 'food_surplus': surplus,
-                'turns_to_grow': math.ceil((threshold - city.food) / surplus) if surplus > 0 else None,
+                'housing': housing, 'growth_rate': housing_growth_rate(city.population, housing),
+                'growth_surplus': stored,
+                'turns_to_grow': math.ceil((threshold - city.food) / stored) if stored > 0 else None,
                 'worked_tiles': [list(pos) for pos in self.worked_tiles()],
                 'blocked_tiles': [list(pos) for pos in self.blocked_tiles()],
                 'farms': [list(pos) for pos in sorted(self.farms, key=lambda pos: (pos[1], pos[0]))],
@@ -890,7 +931,7 @@ class Game:
     def grow_city(self):
         """Store this turn's surplus; grow at the threshold, or starve once food runs out."""
         city = self.city
-        city.food += self.food_surplus()
+        city.food += self.growth_surplus()
         threshold = growth_threshold(city.population)
         if city.food >= threshold:
             city.food -= threshold
@@ -1007,7 +1048,7 @@ class Game:
             # Growth progress is coarse (quarters) to keep the tabular state space small.
             progress = min(1.0, city.food / growth_threshold(city.population))
             values.extend([city.population / MAX_CITY_POPULATION, math.floor(4 * progress) / 4,
-                           self.food_surplus() / 10])
+                           self.food_surplus() / 10, (self.housing() - city.population) / 10])
         for civilian in self.civilians:
             values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
                            float(civilian.alive), civilian.charges / BUILDER_CHARGES])

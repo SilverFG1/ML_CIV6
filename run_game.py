@@ -57,6 +57,8 @@ def parse_args(argv=None):
     parser.add_argument("--unit-count", type=int, choices=range(1, 5))
     parser.add_argument("--city-population", type=int,
                         help="starting city population; enables worked tiles and growth (default: 0, off)")
+    parser.add_argument("--city-water", choices=tuple(game.WATER_HOUSING),
+                        help="the city's water supply, which sets its starting housing (default: fresh)")
     parser.add_argument("--city-builders", type=int, help="builders the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-settlers", type=int, help="settlers the city starts with, 0-2 (needs --city-population)")
     parser.add_argument("--city-districts", choices=tuple(game.DISTRICTS), nargs="+",
@@ -101,7 +103,7 @@ def config_from_args(args, saved=None):
     explicit = {}
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp",
                  "ranged_strength", "mountain_density", "forest_density", "unit_strengths", "unit_types", "difficulty",
-                 "city_population", "city_builders", "city_settlers") + TUPLE_FIELDS[3:]:
+                 "city_population", "city_water", "city_builders", "city_settlers") + TUPLE_FIELDS[3:]:
         value = getattr(args, name)
         if value is not None:
             explicit[name] = tuple(value) if name in TUPLE_FIELDS else value

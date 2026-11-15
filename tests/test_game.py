@@ -10,7 +10,7 @@ import numpy as np
 
 import constants
 from class_hex import HexMap
-from game import C_Unit, Game, GameConfig, attack, growth_threshold, hex_distance
+from game import C_Unit, Game, GameConfig, attack, growth_threshold, hex_distance, housing_growth_rate
 
 
 class GameTests(unittest.TestCase):
@@ -497,12 +497,13 @@ class GameTests(unittest.TestCase):
     def test_growth_observation_and_schema(self):
         env = self.make_env(city_population=2)
         base = self.make_env()
-        self.assertEqual(env.observation_schema, base.observation_schema + ':city_growth')
-        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 3)
+        self.assertEqual(env.observation_schema, base.observation_schema + ':city_growth:water=fresh')
+        self.assertEqual(len(env.get_observation()), len(base.get_observation()) + 4)
         self.place_far(env)
-        np.testing.assert_allclose(env.get_observation()[-3:], [2 / 20, 0, 0.2])
+        # Population, growth progress, food surplus, and housing room (5 housing - 2 citizens).
+        np.testing.assert_allclose(env.get_observation()[-4:], [2 / 20, 0, 0.2, 0.3])
         env.city.food = 13  # just over half of 24, reported in quarters
-        self.assertEqual(env.get_observation()[-2], 0.5)
+        self.assertEqual(env.get_observation()[-3], 0.5)
 
     def test_invalid_city_population_rejected(self):
         for value in (-1, 21, True, 1.5):
@@ -540,7 +541,8 @@ class GameTests(unittest.TestCase):
         self.assertFalse(set(positions) & ({u.position for u in env.units} | {env.city.position}))
         self.assertTrue(all(hex_distance(pos, env.city.position) <= 2 for pos in positions))
         self.assertEqual(env.observation_schema,
-                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:civilians=builder,builder,settler,settler')
+                         'ml_civ6.v2:8x8:warrior,warrior,warrior:city_growth:water=fresh:'
+                         'civilians=builder,builder,settler,settler')
         self.assertEqual(len(env.get_observation()), len(self.make_env(city_population=2).get_observation()) + 16)
 
     def test_builder_farms_grassland_until_its_charges_run_out(self):
@@ -637,7 +639,7 @@ class GameTests(unittest.TestCase):
         env = self.make_env(city_population=2)
         self.assertEqual((env.districts, env.buildings), ({}, []))
         self.assertNotIn('built', env.observation_schema)
-        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 3)
+        self.assertEqual(len(env.get_observation()), 7 + 8 * 3 + 64 + 4)
         report = env.city_report()
         self.assertEqual((report['culture'], report['science'], report['faith']), (0, 0, 0))
         self.assertNotIn('producing', report)
@@ -772,6 +774,48 @@ class GameTests(unittest.TestCase):
         campus = self.make_env(city_population=1, forest_density=.2, city_districts=('campus',))
         self.assertEqual([u.position for u in plain.units], [u.position for u in campus.units])
 
+
+    # Housing.
+    def test_housing_growth_rate_follows_civ6(self):
+        for population, housing, rate in [(3, 5, 1.0), (4, 5, 0.5), (5, 5, 0.25), (9, 5, 0.25), (10, 5, 0.0),
+                                          (4, 5.5, 1.0), (5, 5.5, 0.5), (6, 5.5, 0.25)]:
+            with self.subTest(population=population, housing=housing):
+                self.assertEqual(housing_growth_rate(population, housing), rate)
+
+    def test_housing_comes_from_water_farms_and_buildings(self):
+        for water, housing in [('fresh', 5), ('coast', 3), ('none', 2)]:
+            with self.subTest(water=water):
+                self.assertEqual(self.make_env(city_population=1, city_water=water).housing(), housing)
+        env = self.make_env(city_population=4, city_water='none', city_districts=('encampment',),
+                            city_buildings=('granary', 'barracks'))
+        self.assertEqual(env.housing(), 2 + 2 + 1)
+        env.farms.update(env.territory()[:3])
+        self.assertEqual(env.housing(), 6.5)
+        self.assertEqual(env.city_report()['housing'], 6.5)
+        with self.assertRaisesRegex(ValueError, 'city_water'):
+            GameConfig(city_population=1, city_water='river')
+
+    def test_growth_slows_as_population_reaches_housing(self):
+        env = self.make_env(city_population=2, city_water='none')
+        self.place_far(env)
+        report = env.city_report()
+        # Two citizens fill two housing: a +2 surplus stores only a quarter.
+        self.assertEqual((report['food_surplus'], report['growth_rate'], report['growth_surplus']), (2, 0.25, 0.5))
+        self.assertEqual(report['turns_to_grow'], 48)
+        env.step(self.wait(env))
+        self.assertEqual(env.city.food, 0.5)
+        roomy = self.make_env(city_population=2, city_water='coast')
+        self.place_far(roomy)
+        self.assertEqual(roomy.growth_surplus(), 1)  # one below housing: half
+
+    def test_housing_limits_a_surplus_but_not_starvation(self):
+        env = self.make_env(city_population=7, city_water='none')
+        self.place(env, [(3, 4), (5, 4), (4, 3)])
+        self.assertEqual(env.city_report()['growth_rate'], 0.0)  # 7 citizens on 2 housing: growth has stopped
+        self.assertLess(env.food_surplus(), 0)
+        self.assertEqual(env.growth_surplus(), env.food_surplus())
+        env.step(self.wait(env))
+        self.assertEqual(env.city.population, 6)
 
 if __name__ == '__main__':
     unittest.main()

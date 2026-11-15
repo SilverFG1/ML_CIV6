@@ -159,8 +159,8 @@ class Renderer:
         status = [f'Turn {self.env.turn_number}', f'City {city.hp:.0f}/{city.hp_max:.0f}',
                   f'Walls {city.wall_hp:.0f}']
         if report is not None:
-            status += [f'Pop {report["population"]}',
-                       f'Food {report["food"]}/{report["growth_threshold"]} ({report["food_surplus"]:+d})']
+            status += [f'Pop {report["population"]} (housing {report["housing"]:g})',
+                       f'Food {report["food"]:g}/{report["growth_threshold"]} ({report["growth_surplus"]:+g})']
         civilians = self.env.civilian_report()
         if civilians is not None:
             status += [f'Captured {civilians["captured"]}', f'Founded {len(civilians["founded_cities"])}']

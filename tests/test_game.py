@@ -2,6 +2,8 @@
 
 import random
 import subprocess
+from collections import Counter
+from dataclasses import asdict
 import sys
 import unittest
 from unittest.mock import patch
@@ -9,8 +11,8 @@ from unittest.mock import patch
 import numpy as np
 
 import constants
-from class_hex import HexMap
-from game import C_Unit, Game, GameConfig, attack, hex_distance
+from class_hex import HexMap, _edge_corners
+from game import BUILDING_SPECS, C_City, C_Unit, Game, GameConfig, attack, hex_distance
 
 
 class GameTests(unittest.TestCase):
@@ -221,7 +223,13 @@ class GameTests(unittest.TestCase):
                        {'wall_hp': -1}, {'forest_density': .9},
                        {'unit_strengths': (20, 30)}, {'city_strength': float('nan')},
                        {'unit_types': ('archer',)}, {'unit_count': 1, 'unit_types': ('cavalry',)},
-                       {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')}]:
+                       {'unit_count': 2, 'unit_types': ('battering_ram', 'battering_ram')},
+                       {'river_count': -1}, {'river_count': 11}, {'river_count': True},
+                       {'river_count': 1.5}, {'walls': 'medieval'}, {'walls': None},
+                       {'walls': ['ancient']}, {'land_types': ('lava',)},
+                       {'land_types': ('plains', 'plains')}, {'land_types': 5}, {'hills_density': 1.5},
+                       {'water_density': -.1}, {'mountain_density': .3, 'water_density': .3, 'forest_density': .3},
+                       {'buildings': ('library',)}, {'buildings': ('monument', 'monument')}, {'buildings': 5}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -406,6 +414,274 @@ class GameTests(unittest.TestCase):
         env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_heals=False)
         self.place(env, [(0, 0), (5, 4)])
         self.assertEqual(env.actions[env.guided_action(random.Random(1))][1], 'SPACE')
+
+    def test_rivers_are_off_by_default_and_use_no_randomness(self):
+        env = self.make_env()
+        self.assertEqual(env.map.rivers, set())
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior')
+        self.assertEqual(env.get_observation().shape, (7 + 8 * 3 + 64,))
+        rng = random.Random(5)
+        state = rng.getstate()
+        HexMap(8, 8).generate_rivers(0, rng)
+        self.assertEqual(rng.getstate(), state)
+
+    def test_generated_rivers_lie_between_adjacent_tiles_and_are_reproducible(self):
+        first = self.make_env(river_count=2, forest_density=.2)
+        second = self.make_env(river_count=2, forest_density=.2)
+        self.assertTrue(first.map.rivers)
+        self.assertEqual(first.map.rivers, second.map.rivers)
+        layouts = set()
+        for seed in range(5):
+            first.reset(seed=seed)
+            layouts.add(frozenset(first.map.rivers))
+            for a, b in first.map.rivers:
+                self.assertIn(a, first.map.grid)
+                self.assertIn(b, first.map.grid)
+                self.assertEqual(hex_distance(a, b), 1)
+        self.assertGreater(len(layouts), 1)
+
+    def test_a_generated_river_is_one_unbroken_line(self):
+        for seed in range(20):
+            hex_map = HexMap(8, 8)
+            hex_map.generate_rivers(1, random.Random(seed))
+            corners = Counter(c for edge in hex_map.rivers for c in _edge_corners(edge))
+            self.assertLessEqual(max(corners.values()), 2)
+            self.assertEqual(sum(n == 1 for n in corners.values()), 2)
+
+    def test_add_river_rejects_sides_that_are_not_shared_on_the_map(self):
+        hex_map = HexMap(4, 4)
+        for first, second in [((0, 0), (2, 0)), ((0, 0), (-1, 0)), ((1, 1), (1, 1))]:
+            with self.subTest(first=first, second=second), self.assertRaises(ValueError):
+                hex_map.add_river(first, second)
+        hex_map.add_river((1, 1), (1, 0))
+        self.assertTrue(hex_map.has_river((1, 0), (1, 1)))
+
+    def test_rivers_do_not_block_movement_but_crossing_costs_extra(self):
+        rewards = []
+        for river in (False, True):
+            env = self.make_env(unit_count=1, city_heals=False)
+            self.place(env, [(0, 0)])
+            if river:
+                env.map.add_river((0, 0), (1, 0))
+            move = env.encode_action(['E'])
+            self.assertIn(move, env.valid_actions())
+            _, reward, _ = env.step(move)
+            self.assertEqual(env.units[0].position, (1, 0))
+            moved = next(e for e in env.events if e['type'] == 'moved')
+            self.assertEqual(moved['cost'], 2 if river else 1)
+            rewards.append(reward)
+        self.assertAlmostEqual(rewards[0] - rewards[1], .01)
+        env.map.grid[(2, 0)].set_terrain('FOREST')
+        env.map.add_river((1, 0), (2, 0))
+        self.assertEqual(env.map.movement_cost((1, 0), (2, 0)), 2)
+
+    def test_city_gains_river_defense_against_melee_attacks_only(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'archer'), city_heals=False)
+        self.place(env, [(3, 4), (5, 4)])
+        dry_melee = attack(env.units[0], env.city, rng=random.Random(9))
+        dry_shot = attack(env.units[1], env.city, ranged=True, rng=random.Random(9))
+        env.map.add_river((3, 4), (4, 4))
+        env.map.add_river((5, 4), (4, 4))
+        river_melee = attack(env.units[0], env.city, rng=random.Random(9))
+        self.assertLess(river_melee[0], dry_melee[0])
+        self.assertGreater(river_melee[1], dry_melee[1])
+        self.assertEqual(attack(env.units[1], env.city, ranged=True, rng=random.Random(9)), dry_shot)
+        # River defense is exactly +5 city strength for that attack.
+        env.map.rivers.clear()
+        env.city.strength += 5
+        self.assertEqual(attack(env.units[0], env.city, rng=random.Random(9)), river_melee)
+
+    def test_river_observation_flags_each_side_once(self):
+        env = self.make_env(river_count=1)
+        base = 7 + 8 * 3 + 64
+        observation = env.get_observation()
+        self.assertEqual(observation.shape, (base + 3 * 64,))
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior:rivers')
+        self.assertEqual(observation[base:].sum(), len(env.map.rivers))
+        env.map.rivers.clear()
+        env.map.add_river((2, 3), (2, 4))
+        flags = env.get_observation()[base:].reshape(8, 8, 3)
+        self.assertEqual(flags[3, 2].tolist(), [0, 0, 1])
+        self.assertEqual(flags.sum(), 1)
+
+    def test_heuristic_attacks_from_the_citys_side_of_a_river(self):
+        env = self.make_env(unit_count=1, city_heals=False)
+        unit = env.units[0]
+        self.place(env, [(3, 4)])
+        unit.hp, env.city.hp = 40, 15
+        dry_death, dry_capture = env.melee_death_probability(unit), env.capture_probability(unit)
+        env.map.add_river((3, 4), (4, 4))
+        # A crossing adds no turns, but it costs movement and strengthens the city's defense.
+        self.assertEqual(env.step_distances()[(3, 4)], 1)
+        self.assertEqual(env.map.movement_cost((3, 4), (4, 4)), 2)
+        self.assertGreater(env.melee_death_probability(unit), dry_death)
+        self.assertLess(env.capture_probability(unit), dry_capture)
+        unit.hp, env.city.hp = 100, 100
+        # With a dry bank one step away, the heuristic moves there instead of attacking or waiting.
+        direction = env.actions[env.guided_action(random.Random(1))][0]
+        dx, dy = constants.movement_delta(direction, 4)
+        self.assertIn((3 + dx, 4 + dy), [(3, 3), (3, 5)])
+        # When every nearby bank is across the river, it attacks anyway.
+        env.map.add_river((3, 3), (4, 4))
+        env.map.add_river((3, 5), (4, 4))
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))], ('E',))
+
+    def test_river_games_are_reproducible_and_playable(self):
+        first = self.make_env(river_count=3, forest_density=.2, mountain_density=.1)
+        second = self.make_env(river_count=3, forest_density=.2, mountain_density=.1)
+        rng1, rng2 = random.Random(4), random.Random(4)
+        for _ in range(60):
+            action1, action2 = first.guided_action(rng1), second.guided_action(rng2)
+            self.assertEqual(action1, action2)
+            next1, reward1, done1 = first.step(action1)
+            next2, reward2, done2 = second.step(action2)
+            np.testing.assert_array_equal(next1, next2)
+            self.assertEqual((reward1, done1, first.events), (reward2, done2, second.events))
+            if done1:
+                break
+        for seed in range(10):
+            env = self.make_env(width=3, height=3, unit_count=2, river_count=10)
+            env.reset(seed=seed)
+            self.assertIn(env.guided_action(), env.valid_actions())
+
+    def test_ancient_walls_give_outer_defense_and_a_ranged_strike(self):
+        self.assertFalse(self.make_env().city.ranged_combat)
+        env = self.make_env(walls='ancient', unit_count=1, city_heals=False)
+        self.assertEqual((env.city.wall_hp, env.city.wall_hp_max), (100, 100))
+        self.assertTrue(env.city.ranged_combat)
+        self.assertEqual(env.city.strength_ranged, 15)
+        self.assertEqual(env.city.strength, 28)
+        observation = env.get_observation()
+        self.assertEqual(observation.shape, (7 + 8 + 64,))
+        self.assertAlmostEqual(observation[3], .1)
+        self.assertAlmostEqual(observation[5], .15)
+        self.place(env, [(6, 4)])
+        with patch('game.attack', return_value=(12, 0)) as mocked:
+            env.step(self.wait(env))
+        mocked.assert_called_once_with(env.city, env.units[0], ranged=True)
+        self.assertEqual(env.units[0].hp, 88)
+        self.place(env, [(7, 4)])
+        with patch('game.attack', return_value=(12, 0)) as mocked:
+            env.step(self.wait(env))
+        mocked.assert_not_called()
+
+    def test_ancient_wall_defaults_can_be_overridden(self):
+        config = GameConfig(walls='ancient', wall_hp=60, ranged_strength=25)
+        self.assertEqual((config.wall_hp, config.ranged_strength), (60, 25))
+        ancient = GameConfig(walls='ancient')
+        self.assertEqual(GameConfig(**asdict(ancient)), ancient)
+        self.assertEqual(GameConfig(wall_hp=40).walls, 'none')
+
+    def test_battering_rams_breach_ancient_walls(self):
+        for unit_types, positions, wall_hp in ((('warrior',), [(3, 4)], 90),
+                                               (('warrior', 'battering_ram'), [(3, 4), (5, 4)], 80)):
+            with self.subTest(unit_types=unit_types):
+                env = self.make_env(unit_count=len(unit_types), unit_types=unit_types,
+                                    walls='ancient', city_heals=False)
+                self.place(env, positions)
+                with patch('game.attack', return_value=(20, 0)):
+                    env.step(env.encode_action(['E'] + ['SPACE'] * (len(unit_types) - 1)))
+                self.assertEqual((env.city.wall_hp, env.city.hp), (wall_hp, 100))
+
+    def terrain_env(self, **kwargs):
+        options = dict(land_types=('grassland', 'plains', 'desert', 'tundra', 'snow'), hills_density=.3,
+                       water_density=.15, mountain_density=.05, forest_density=.25)
+        options.update(kwargs)
+        return self.make_env(**options)
+
+    def test_new_terrain_options_generate_valid_reproducible_maps(self):
+        env = self.terrain_env()
+        self.assertTrue(env.config.extended_terrain)
+        self.assertFalse(self.make_env(land_types=('grassland',)).config.extended_terrain)
+        seen = set()
+        for seed in range(15):
+            env.reset(seed=seed)
+            city = env.map.grid[env.city.position]
+            self.assertEqual((city.spec.elevation, city.feature), ('FLAT', None))
+            self.assertFalse(city.block_path)
+            for unit in env.units:
+                self.assertFalse(env.map.grid[unit.position].block_path)
+                self.assertIn(unit.position, env.map.reachable(env.city.position))
+            for cell in env.map.grid.values():
+                seen.add(cell.terrain_type)
+                if cell.feature:
+                    self.assertIn(cell.spec.land_type, ('GRASSLAND', 'PLAINS', 'TUNDRA'))
+            self.assertIn(env.guided_action(), env.valid_actions())
+        self.assertTrue({'PLAINS', 'DESERT_HILLS', 'COAST', 'SNOW'} <= seen)
+        other = self.terrain_env()
+        for seed in (3, 4):
+            env.reset(seed=seed)
+            other.reset(seed=seed)
+            self.assertEqual([(c.terrain_type, c.feature) for c in env.map.grid.values()],
+                             [(c.terrain_type, c.feature) for c in other.map.grid.values()])
+
+    def test_extended_terrain_observation_reports_combat_properties(self):
+        env = self.terrain_env(unit_count=1)
+        base = 7 + 8
+        observation = env.get_observation()
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior:terrain')
+        self.assertEqual(observation.shape, (base + 3 * 64,))
+        env.map.grid[(0, 0)].set_terrain('PLAINS_HILLS')
+        env.map.grid[(0, 0)].set_feature('FOREST')
+        env.map.grid[(1, 0)].set_terrain('OCEAN')
+        env.map.grid[(2, 0)].set_terrain('DESERT')
+        tiles = env.get_observation()[base:].reshape(8, 8, 3)
+        self.assertEqual(tiles[0, 0].tolist(), [0, 1, 1])
+        self.assertEqual(tiles[0, 1].tolist(), [1, 0, 0])
+        self.assertEqual(tiles[0, 2].tolist(), [0, 0, 0])
+
+    def test_hills_and_forest_protect_units_and_cost_movement(self):
+        env = self.make_env(unit_count=1, city_heals=False, ranged_strength=20)
+        self.place(env, [(3, 4)])
+        damage = []
+        for terrain, feature in (('GRASSLAND', None), ('GRASSLAND_HILLS', None), ('GRASSLAND_HILLS', 'FOREST')):
+            env.map.grid[(3, 4)].set_terrain(terrain)
+            env.map.grid[(3, 4)].set_feature(feature)
+            damage.append(attack(env.city, env.units[0], ranged=True, rng=random.Random(2))[0])
+        self.assertGreater(damage[0], damage[1])
+        self.assertGreater(damage[1], damage[2])
+        env.map.grid[(2, 4)].set_terrain('PLAINS_HILLS')
+        env.map.grid[(2, 3)].set_terrain('TUNDRA_HILLS')
+        env.map.grid[(2, 3)].set_feature('FOREST')
+        self.assertEqual(env.map.movement_cost((3, 4), (2, 4)), 2)
+        self.assertEqual(env.map.movement_cost((2, 4), (2, 3)), 3)
+        env.step(env.encode_action(['W']))
+        self.assertEqual(next(e['cost'] for e in env.events if e['type'] == 'moved'), 2)
+        env.step(env.encode_action(['NE']))
+        self.assertEqual(env.units[0].position, (2, 3))
+        self.assertEqual(next(e['cost'] for e in env.events if e['type'] == 'moved'), 3)
+
+    def test_units_cannot_enter_water(self):
+        env = self.make_env(unit_count=1)
+        self.place(env, [(0, 0)])
+        env.map.grid[(1, 0)].set_terrain('COAST')
+        self.assertNotIn(env.encode_action(['E']), env.valid_actions())
+
+    def test_monument_and_granary_add_yields_and_housing(self):
+        self.assertEqual((BUILDING_SPECS['monument'].cost, BUILDING_SPECS['granary'].cost), (60, 65))
+        self.assertEqual(BUILDING_SPECS['granary'].technology, 'TECH_POTTERY')
+        for buildings, yields, housing in [((), {}, 0), (('monument',), {'culture': 2}, 0),
+                                           (('granary',), {'food': 1}, 2),
+                                           (('granary', 'monument'), {'food': 1, 'culture': 2}, 2)]:
+            with self.subTest(buildings=buildings):
+                env = self.make_env(buildings=buildings)
+                self.assertEqual(env.city.buildings, buildings)
+                self.assertEqual((env.city.building_yields, env.city.building_housing), (yields, housing))
+        with self.assertRaises(ValueError):
+            C_City(0, 0, buildings=('library',))
+
+    def test_buildings_do_not_change_play(self):
+        def trace(buildings):
+            env = self.make_env(forest_density=.2, wall_hp=30, ranged_strength=15, buildings=buildings)
+            rng = random.Random(5)
+            steps = [(env.observation_schema, env.get_observation().tolist())]
+            for _ in range(30):
+                observation, reward, done = env.step(env.guided_action(rng))
+                steps.append((observation.tolist(), reward, done, env.events))
+                if done:
+                    break
+            return steps
+        self.assertEqual(trace(('monument', 'granary')), trace(()))
 
 
 if __name__ == '__main__':

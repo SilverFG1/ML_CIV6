@@ -304,6 +304,111 @@ class RunnerTests(unittest.TestCase):
         evaluations = run_game.compare_policies(agent, args, verbose=False)
         self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
 
+    def test_rivers_resume_evaluate_and_reject_changes(self):
+        args = self.args('--river-count', '2', '--forest-density', '0.1')
+        agent = self.make_agent(args)
+        # The joint learner's raw observation marks the option in its schema; the tactical
+        # learner's egocentric format does not change.
+        raw = game.Game(config=args.config, observation='raw')
+        self.assertTrue(raw.observation_schema.endswith(':rivers'))
+        self.assertTrue(agent.observation_schema.startswith('ml_civ6.tactical.v1:'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        resumed = self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.river_count, 2)
+        self.assertEqual(resumed.observation_size, agent.observation_size)
+        evaluations = run_game.compare_policies(resumed, resume_args, verbose=False)
+        self.assertEqual(set(evaluations), {'learned', 'heuristic', 'random'})
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--river-count', '1'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--river-count', '11'])
+
+    def test_ancient_walls_resume_and_reject_changes(self):
+        args = self.args('--walls', 'ancient', '--unit-count', '2', '--unit-types', 'warrior', 'archer')
+        agent = self.make_agent(args)
+        self.assertEqual((args.config.wall_hp, args.config.ranged_strength), (100, 15))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, args.config)
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--walls', 'none'))
+        custom = self.args('--walls', 'ancient', '--wall-hp', '60', '--fresh')
+        self.make_agent(custom)
+        self.assertEqual((custom.config.wall_hp, custom.config.ranged_strength), (60, 15))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--walls', 'medieval'])
+
+    def test_terrain_options_resume_and_reject_changes(self):
+        args = self.args('--land-types', 'plains', 'desert', '--hills-density', '0.2', '--water-density', '0.1')
+        agent = self.make_agent(args)
+        # The joint learner's raw observation marks the option in its schema; the tactical
+        # learner's egocentric format does not change.
+        raw = game.Game(config=args.config, observation='raw')
+        self.assertTrue(raw.observation_schema.endswith(':terrain'))
+        self.assertTrue(agent.observation_schema.startswith('ml_civ6.tactical.v1:'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, args.config)
+        self.assertEqual(resume_args.config.land_types, ('plains', 'desert'))
+        for flags in [('--land-types', 'plains'), ('--hills-density', '0.3'), ('--water-density', '0')]:
+            with self.assertRaisesRegex(ValueError, 'fresh'):
+                self.make_agent(self.args(*flags))
+        for flags in [('--land-types', 'lava'), ('--hills-density', '2')]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run_game.parse_args(list(flags))
+
+    def test_buildings_resume_and_reject_changes(self):
+        args = self.args('--buildings', 'monument', 'granary')
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.buildings, ('monument', 'granary'))
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--buildings', 'monument'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run_game.parse_args(['--buildings', 'library'])
+
+    def test_economy_resumes_and_rejects_changes(self):
+        args = self.args('--economy', '--city-population', '2', '--build-queue', 'ancient_walls', 'monument')
+        agent = self.make_agent(args)
+        # The joint learner's raw observation marks the option in its schema; the tactical
+        # learner's egocentric format does not change.
+        raw = game.Game(config=args.config, observation='raw')
+        self.assertTrue(raw.observation_schema.endswith(':economy'))
+        self.assertTrue(agent.observation_schema.startswith('ml_civ6.tactical.v1:'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, args.config)
+        self.assertEqual(resume_args.config.build_queue, ('ancient_walls', 'monument'))
+        for flags in [('--city-population', '3'), ('--build-queue', 'monument')]:
+            with self.assertRaisesRegex(ValueError, 'fresh'):
+                self.make_agent(self.args(*flags))
+        with self.assertRaisesRegex(ValueError, 'need the city economy'):
+            self.make_agent(self.args('--city-population', '2', '--fresh'))
+        for flags in [('--build-queue', 'palace'), ('--city-population', '0')]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run_game.parse_args(list(flags))
+
+    def test_checkpoint_without_river_setting_resumes_without_rivers(self):
+        args = self.args()
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        del agent.training_state['config']['river_count']
+        agent.save(args.model_path)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config.river_count, 0)
+
     def test_runner_rejects_corrupt_progress_metadata(self):
         args = self.args()
         agent = self.make_agent(args)

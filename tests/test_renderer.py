@@ -5,6 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+from class_hex import direction_between
 from game import Game, GameConfig
 
 
@@ -52,6 +53,101 @@ class RendererTests(unittest.TestCase):
             env.reset(seed=7)
             self.assertTrue(env.render_frame())
             env.close()
+
+    def test_draws_rivers_along_tile_sides(self):
+        from renderer import RIVER_COLOR, SIDE_CORNERS
+        env = Game(render=True, config=GameConfig(unit_count=1, river_count=2))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        colors = []
+        for edge in env.map.rivers:
+            origin, neighbor = sorted(edge)
+            polygon = renderer._polygon(origin)
+            (x1, y1), (x2, y2) = (polygon[i] for i in SIDE_CORNERS[direction_between(origin, neighbor)])
+            colors.append(tuple(renderer.surface.get_at((int((x1 + x2) / 2), int((y1 + y2) / 2))))[:3])
+        self.assertGreater(colors.count(RIVER_COLOR), len(colors) // 2)
+
+    def test_draws_intact_and_broken_ancient_walls(self):
+        from renderer import RUINED_WALL_COLOR, WALL_COLOR
+        env = Game(render=True, config=GameConfig(unit_count=1, walls='ancient'))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        for wall_hp, color in ((100, WALL_COLOR), (0, RUINED_WALL_COLOR)):
+            env.city.wall_hp = wall_hp
+            self.assertTrue(env.render_frame())
+            renderer = env._renderer
+            corners = [tuple(renderer.surface.get_at((int(x), int(y))))[:3] for x, y in renderer._wall_ring()]
+            self.assertGreater(corners.count(color), 3)
+
+    def test_draws_every_terrain_and_toggles_yields(self):
+        from class_hex import TERRAINS
+        from renderer import LAND_COLORS, MOUNTAIN_COLOR, WATER_COLORS, YIELD_COLORS
+        env = Game(render=True, config=GameConfig(width=20, height=4, unit_count=1, city_position=(19, 3)))
+        env.reset(seed=1)
+        self.addCleanup(env.close)
+        env.units[0].x, env.units[0].y = 18, 3
+        names = list(TERRAINS)
+        for x, name in enumerate(names):
+            env.map.grid[(x, 0)].set_terrain(name)
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        size = renderer.size
+        for x, name in enumerate(names):
+            spec = TERRAINS[name]
+            expected = (WATER_COLORS[name] if spec.water else MOUNTAIN_COLOR
+                        if spec.land_type is None or spec.elevation == 'MOUNTAIN' else LAND_COLORS[spec.land_type])
+            left, top = renderer._position((x, 0))
+            with self.subTest(terrain=name):
+                self.assertEqual(tuple(renderer.surface.get_at((left + size // 2, top + int(size * .88))))[:3], expected)
+        left, top = renderer._position((0, 0))  # Grassland: two food dots.
+        dot = (int(left + size / 2 - 1.25 * max(2, size // 19)), int(top + size * .2))
+        self.assertEqual(tuple(renderer.surface.get_at(dot))[:3], YIELD_COLORS['food'])
+        p = renderer.pygame
+        p.event.post(p.event.Event(p.KEYDOWN, key=p.K_y))
+        self.assertTrue(env.render_frame())
+        self.assertFalse(renderer.show_yields)
+        self.assertEqual(tuple(renderer.surface.get_at(dot))[:3], LAND_COLORS['GRASSLAND'])
+
+    def test_draws_buildings_and_lists_them_in_the_status(self):
+        from renderer import GRANARY_COLOR, MONUMENT_COLOR
+        self.env.render_frame()
+        self.assertNotIn('Monument', self.env._renderer.status_text())
+        env = Game(render=True, config=GameConfig(unit_count=1, walls='ancient', buildings=('monument', 'granary')))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        size = renderer.size
+        self.assertIn('Monument, Granary (+1 food, +2 culture, +2 housing)', renderer.status_text())
+        for name, height, color in (('monument', .1, MONUMENT_COLOR), ('granary', .05, GRANARY_COLOR)):
+            x, base = renderer.building_spot(name)
+            with self.subTest(building=name):
+                self.assertEqual(tuple(renderer.surface.get_at((int(x), int(base - size * height))))[:3], color)
+
+    def test_draws_territory_worked_tiles_and_economy_panel(self):
+        from renderer import CITIZEN_COLOR, TERRITORY_COLOR
+        env = Game(render=True, config=GameConfig(unit_count=1, economy=True, city_population=2))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.units[0].x, env.units[0].y = 0, 0
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        worked = env.economy.worked_tiles()
+        self.assertEqual(len(worked), 2)
+        for position in worked:
+            center = renderer.citizen_marker(position)
+            self.assertEqual(tuple(renderer.surface.get_at((int(center[0]), int(center[1]))))[:3], CITIZEN_COLOR)
+        # The ring's outer edge is outlined; the edge shared with the centre is not.
+        x, y = env.city.position
+        polygon = renderer._polygon((x + 1, y))  # East neighbour: its east side faces outside.
+        cx = sum(px for px, _ in polygon) / 6
+        cy = sum(py for _, py in polygon) / 6
+        (x1, y1), (x2, y2) = ((cx + (px - cx) * .9, cy + (py - cy) * .9) for px, py in (polygon[1], polygon[2]))
+        self.assertEqual(tuple(renderer.surface.get_at((int((x1 + x2) / 2), int((y1 + y2) / 2))))[:3], TERRITORY_COLOR)
+        self.assertGreater(renderer.panel_height, 118)
+        self.assertIn('Pop 2', env.economy.status_text())
 
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))

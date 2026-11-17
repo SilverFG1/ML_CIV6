@@ -65,6 +65,20 @@ class TacticalEnvironmentTests(unittest.TestCase):
         self.assertEqual(damage_at_least(37, 1.0), 0.0)
         self.assertGreater(damage_at_least(36, 1.0), 0.0)
 
+    def test_odds_include_the_river_defense(self):
+        env = self.make_env(unit_count=1, city_heals=False)
+        unit = env.units[0]
+        self.place(env, [(3, 4)])
+        env.map.add_river((3, 4), env.city.position)
+        unit.hp, env.city.hp = 45, 15
+        rng = random.Random(13)
+        blows = [attack(unit, env.city, rng=rng) for _ in range(20000)]
+        deaths = sum(taken >= unit.hp for _, taken in blows) / len(blows)
+        captures = sum(dealt >= env.city.hp and taken < unit.hp for dealt, taken in blows) / len(blows)
+        self.assertAlmostEqual(env.melee_death_probability(unit), deaths, delta=.02)
+        self.assertAlmostEqual(env.capture_probability(unit), captures, delta=.02)
+        self.assertGreater(env.river_defense(unit), 0)
+
     def test_capture_odds_require_breaking_walls_and_surviving(self):
         env = self.make_env(unit_count=1, city_heals=False)
         self.place(env, [(3, 4)])

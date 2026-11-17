@@ -9,17 +9,9 @@ import random
 import numpy as np
 
 import constants
-from class_hex import HexMap, TERRAIN_CODES
-
-
-def hex_coords(position):
-    x, y = position
-    q = x - (y - y % 2) // 2
-    return q, -q - y, y
-
-
-def hex_distance(first, second):
-    return max(abs(a - b) for a, b in zip(hex_coords(first), hex_coords(second)))
+from economy import CityEconomy
+from class_hex import LAND_TYPES, YIELD_TYPES, HexMap, hex_distance, terrain_code
+from class_hex import hex_coords  # noqa: F401  Kept importable from game, where it used to live.
 
 
 @dataclass(frozen=True)
@@ -56,6 +48,57 @@ UNIT_TYPES = tuple(UNIT_SPECS)
 # to the city restores full wall damage for the classes it supports.
 MELEE_WALL_DAMAGE = 0.5
 RAM_SUPPORTED_CLASSES = ('melee', 'anti_cavalry')
+
+# Civ VI river defense: a defender gains this much strength against melee
+# attacks from across a river. Ranged attacks are unaffected.
+RIVER_DEFENSE_BONUS = 5
+MAX_RIVERS = 10
+
+
+@dataclass(frozen=True)
+class WallSpec:
+    """City walls: their outer defense (wall HP) and the ranged strike they give the city."""
+    hp: float = 0
+    ranged_strength: float = 0
+    cost: int = 0
+
+
+# Civ VI Ancient Walls give 100 outer defense and let the city shoot units
+# within two tiles. The strike matches the owner's strongest ranged unit, or 15
+# without one; the city here has no units, so it uses 15. They cost 80 production.
+WALL_SPECS = {
+    'none': WallSpec(),
+    'ancient': WallSpec(hp=100, ranged_strength=15, cost=80),
+}
+WALL_TYPES = tuple(WALL_SPECS)
+
+
+@dataclass(frozen=True)
+class BuildingSpec:
+    """A Civ VI city-centre building: production cost, yields and housing."""
+    civ6_type: str
+    cost: int
+    yields: tuple = ()  # (yield type, amount) pairs
+    housing: int = 0
+    technology: str | None = None
+
+
+# Base-game values from CivFanatics. Some wikis list a later cost of 50 for both.
+# Neither building affects combat; with the city economy on, their yields and
+# housing feed the city's growth, production and borders.
+BUILDING_SPECS = {
+    'monument': BuildingSpec('BUILDING_MONUMENT', cost=60, yields=(('culture', 2),)),
+    'granary': BuildingSpec('BUILDING_GRANARY', cost=65, yields=(('food', 1),), housing=2,
+                            technology='TECH_POTTERY'),
+}
+BUILDING_TYPES = tuple(BUILDING_SPECS)
+
+# What the city can build with the economy on, and its default order.
+BUILD_ITEMS = BUILDING_TYPES + ('ancient_walls',)
+BUILD_COSTS = {**{name: spec.cost for name, spec in BUILDING_SPECS.items()},
+               'ancient_walls': WALL_SPECS['ancient'].cost}
+DEFAULT_BUILD_QUEUE = ('monument', 'granary', 'ancient_walls')
+MAX_CITY_POPULATION = 20
 
 # attack() draws damage as round(roll * exp(diff / 25) * scale) with these ranges.
 DAMAGE_ROLLS = range(24, 37)
@@ -114,15 +157,39 @@ class GameConfig:
     city_position: tuple | None = None
     city_strength: float = 28
     wall_hp: float = 0
+    walls: str = 'none'
+    buildings: tuple = ()
     ranged_strength: float = 0
     city_heals: bool = True
     mountain_density: float = 0
     forest_density: float = 0
+    land_types: tuple = ()
+    hills_density: float = 0
+    water_density: float = 0
+    river_count: int = 0
     unit_strengths: tuple = ()
     unit_types: tuple = ()
     difficulty: str = 'normal'
+    economy: bool = False
+    city_population: int = 1
+    build_queue: tuple = ()
 
     def __post_init__(self):
+        try:
+            object.__setattr__(self, 'buildings', tuple(self.buildings))
+        except TypeError as exc:
+            raise ValueError('buildings must be a sequence of building names') from exc
+        if (any(not isinstance(name, str) or name not in BUILDING_SPECS for name in self.buildings)
+                or len(set(self.buildings)) != len(self.buildings)):
+            raise ValueError(f'buildings must name distinct buildings from {", ".join(BUILDING_TYPES)}')
+        if not isinstance(self.walls, str) or self.walls not in WALL_SPECS:
+            raise ValueError(f'walls must be one of {", ".join(WALL_TYPES)}')
+        # Walls supply their defaults for wall HP and ranged strength left at zero.
+        spec = WALL_SPECS[self.walls]
+        if spec.hp and not self.wall_hp:
+            object.__setattr__(self, 'wall_hp', spec.hp)
+        if spec.ranged_strength and not self.ranged_strength:
+            object.__setattr__(self, 'ranged_strength', spec.ranged_strength)
         for name in ('width', 'height'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 3 <= value <= 32:
@@ -135,12 +202,22 @@ class GameConfig:
                 raise ValueError(f'{name} must be finite and between 0 and 100')
         if not math.isfinite(self.wall_hp) or not 0 <= self.wall_hp <= 1000:
             raise ValueError('wall_hp must be finite and between 0 and 1000')
-        for name in ('mountain_density', 'forest_density'):
+        for name in ('mountain_density', 'forest_density', 'hills_density', 'water_density'):
             value = getattr(self, name)
             if not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f'{name} must be between 0 and 1')
-        if self.mountain_density + self.forest_density > 0.8:
-            raise ValueError('combined terrain density must be at most 0.8')
+        if self.mountain_density + self.water_density + self.forest_density > 0.8:
+            raise ValueError('combined mountain, water and forest density must be at most 0.8')
+        try:
+            object.__setattr__(self, 'land_types', tuple(self.land_types))
+        except TypeError as exc:
+            raise ValueError('land_types must be a sequence of land type names') from exc
+        if (any(not isinstance(name, str) or name not in LAND_TYPES for name in self.land_types)
+                or len(set(self.land_types)) != len(self.land_types)):
+            raise ValueError(f'land_types must name distinct types from {", ".join(LAND_TYPES)}')
+        if (isinstance(self.river_count, bool) or not isinstance(self.river_count, int)
+                or not 0 <= self.river_count <= MAX_RIVERS):
+            raise ValueError(f'river_count must be an integer between 0 and {MAX_RIVERS}')
         if self.unit_strengths and len(self.unit_strengths) != self.unit_count:
             raise ValueError('unit_strengths must contain one strength for every unit')
         if any(not math.isfinite(s) or not 0 < s <= 100 for s in self.unit_strengths):
@@ -152,6 +229,20 @@ class GameConfig:
             raise ValueError('unit_types must include at least one unit that can attack')
         if self.difficulty not in ('easy', 'normal', 'hard', 'curriculum'):
             raise ValueError('Unknown difficulty')
+        if not isinstance(self.economy, bool):
+            raise ValueError('economy must be true or false')
+        if (isinstance(self.city_population, bool) or not isinstance(self.city_population, int)
+                or not 1 <= self.city_population <= MAX_CITY_POPULATION):
+            raise ValueError(f'city_population must be an integer between 1 and {MAX_CITY_POPULATION}')
+        try:
+            object.__setattr__(self, 'build_queue', tuple(self.build_queue))
+        except TypeError as exc:
+            raise ValueError('build_queue must be a sequence of build items') from exc
+        if (any(not isinstance(name, str) or name not in BUILD_ITEMS for name in self.build_queue)
+                or len(set(self.build_queue)) != len(self.build_queue)):
+            raise ValueError(f'build_queue must name distinct items from {", ".join(BUILD_ITEMS)}')
+        if not self.economy and (self.city_population != 1 or self.build_queue):
+            raise ValueError('city_population and build_queue need the city economy')
         if self.city_position is not None:
             if len(self.city_position) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
                                                  for v in self.city_position):
@@ -159,6 +250,11 @@ class GameConfig:
             x, y = self.city_position
             if not (0 <= x < self.width and 0 <= y < self.height):
                 raise ValueError('city_position must lie inside the map')
+
+    @property
+    def extended_terrain(self):
+        """Whether maps can hold terrain beyond the original grassland, forest and mountains."""
+        return bool(self.hills_density or self.water_density or set(self.land_types) - {'grassland'})
 
 
 class C_Sprite:
@@ -227,13 +323,30 @@ class C_Unit(C_Sprite):
 class C_City(C_Sprite):
     def __init__(self, x, y, sprite=None, name_instance='City', hp=100,
                  hp_max=100, wall_hp=0, strength=28, strength_ranged=0,
-                 ranged_combat=False, heal=True, env=None):
+                 ranged_combat=False, heal=True, env=None, buildings=(), walls='none'):
         super().__init__(x, y, sprite, name_instance, hp, hp_max, strength, env)
+        if any(name not in BUILDING_SPECS for name in buildings):
+            raise ValueError(f'buildings must be among {", ".join(BUILDING_TYPES)}')
+        self.buildings = tuple(buildings)
+        self.walls = walls
         self.wall_hp = float(wall_hp)
         self.wall_hp_max = float(wall_hp)
         self.strength_ranged = float(strength_ranged)
         self.ranged_combat = ranged_combat
         self.heal = heal
+
+    @property
+    def building_yields(self):
+        """Yields added by the city's buildings, e.g. {'food': 1, 'culture': 2}."""
+        totals = {}
+        for name in self.buildings:
+            for kind, amount in BUILDING_SPECS[name].yields:
+                totals[kind] = totals.get(kind, 0) + amount
+        return {kind: totals[kind] for kind in YIELD_TYPES if totals.get(kind)}
+
+    @property
+    def building_housing(self):
+        return sum(BUILDING_SPECS[name].housing for name in self.buildings)
 
     def take_turn(self):
         if self.env is not None and self.alive:
@@ -278,11 +391,14 @@ def attack(aggressor, target, ranged=False, rng=None):
     defense = target.strength
     if isinstance(target, C_Unit) and target.env is not None:
         defense += target.env.map.grid[target.position].defense_bonus
-    strength_diff = offense - defense
+    river_defense = 0
+    if not ranged and aggressor.env is not None and aggressor.env.map.has_river(aggressor.position, target.position):
+        river_defense = RIVER_DEFENSE_BONUS
+    strength_diff = offense - defense - river_defense
     damage_out = round(rng.randint(24, 36) * math.exp(strength_diff / 25) * rng.uniform(.75, 1))
     if ranged:
         return damage_out, 0
-    retaliation_diff = target.strength - aggressor.strength
+    retaliation_diff = target.strength + river_defense - aggressor.strength
     if aggressor.env is not None:
         retaliation_diff -= aggressor.env.map.grid[aggressor.position].defense_bonus
     damage_taken = round(rng.randint(24, 36) * math.exp(retaliation_diff / 25) * rng.uniform(.75, 1))
@@ -311,15 +427,22 @@ class Game:
         self.action_count = len(self.actions)
         self._action_index = {a: i for i, a in enumerate(self.actions)}
         if observation == 'tactical':
-            # Egocentric features do not depend on the map size.
+            # Egocentric features do not depend on the map size, and terrain, rivers and
+            # the economy reach them only through the odds and features they change.
             self.observation_schema = 'ml_civ6.tactical.v1:' + ','.join(self.unit_types)
         else:
+            # Raw features for terrain, rivers and the economy are appended only when
+            # they are on, so scenarios without them keep their observation format.
             self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
-                                       + ','.join(self.unit_types))
+                                       + ','.join(self.unit_types)
+                                       + (':terrain' if self.config.extended_terrain else '')
+                                       + (':rivers' if self.config.river_count else '')
+                                       + (':economy' if self.config.economy else ''))
         self._renderer = None
         self.quit = False
         self.units = []
         self.city = None
+        self.economy = None
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
         self.turn_number = 0
@@ -336,12 +459,14 @@ class Game:
         c = self.config
         city_pos = tuple(c.city_position or (c.width // 2, c.height // 2))
         self.map = HexMap(c.height, c.width)
-        # Keep enough connected grassland for starting units and a possible siege.
+        # Keep enough connected open land for starting units and a possible siege.
+        blocked_density = c.mountain_density + c.water_density
         for _ in range(100):
             for cell in self.map.grid.values():
                 draw = self.rng.random()
                 terrain = ('MOUNTAIN' if draw < c.mountain_density else
-                           'FOREST' if draw < c.mountain_density + c.forest_density else 'GRASSLAND')
+                           'COAST' if draw < blocked_density else
+                           'FOREST' if draw < blocked_density + c.forest_density else 'GRASSLAND')
                 cell.set_terrain(terrain)
             self.map.grid[city_pos].set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
@@ -352,6 +477,13 @@ class Game:
             for cell in self.map.grid.values():
                 cell.set_terrain('GRASSLAND')
             component = self.map.reachable(city_pos)
+        if c.extended_terrain:
+            # None of these steps block movement, so the start area stays connected.
+            self.map.assign_land_types(c.land_types or LAND_TYPES[:1], self.rng)
+            self.map.raise_hills(c.hills_density, self.rng, keep_flat={city_pos})
+            self.map.classify_water()
+        # Rivers never block movement, so they cannot disconnect the start area.
+        self.map.generate_rivers(c.river_count, self.rng)
         start_positions = self.rng.sample(sorted(component - {city_pos}), c.unit_count)
         specs = [UNIT_SPECS[kind] for kind in self.unit_types]
         strengths = c.unit_strengths or tuple(spec.strength for spec in specs)
@@ -361,7 +493,10 @@ class Game:
                       for i, pos in enumerate(start_positions)]
         self.city = C_City(*city_pos, name_instance='Ottertopia', strength=c.city_strength,
                            wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
-                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self)
+                           ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
+                           buildings=c.buildings, walls=c.walls)
+        self.economy = (CityEconomy(self, c.city_population, c.build_queue or DEFAULT_BUILD_QUEUE, BUILD_COSTS)
+                        if c.economy else None)
         self.turn_number = 0
         self.events = []
         self.last_info = {'outcome': 'ongoing', 'events': []}
@@ -459,10 +594,11 @@ class Game:
                 unit._event('unit_healed', amount=healed)
         else:
             distance_before = hex_distance(unit.position, self.city.position)
+            origin = unit.position
             unit.x, unit.y = destination
             unit.status = 'alive'
             unit._event('moved', progress=distance_before - hex_distance(destination, self.city.position),
-                        cost=cell.movement_cost)
+                        cost=self.map.movement_cost(origin, destination))
 
     def ram_in_position(self):
         return any(u.alive and u.support and hex_distance(u.position, self.city.position) == 1
@@ -490,6 +626,26 @@ class Game:
                     self.city.hp += healed
                     self.city.status = 'healed'
                     self.city._event('city_healed', amount=healed)
+        if self.economy is not None:
+            self.economy.turn()
+
+    def is_built(self, item):
+        """Whether the city already has a build item; any walls count as walls."""
+        if item == 'ancient_walls':
+            return self.city.wall_hp_max > 0
+        return item in self.city.buildings
+
+    def complete_build(self, item):
+        """Add a finished building to the city; walls arrive at full health with their ranged strike."""
+        city = self.city
+        if item == 'ancient_walls':
+            spec = WALL_SPECS['ancient']
+            city.walls = 'ancient'
+            city.wall_hp = city.wall_hp_max = float(spec.hp)
+            if not city.ranged_combat:
+                city.strength_ranged, city.ranged_combat = float(spec.ranged_strength), True
+        else:
+            city.buildings += (item,)
 
     def shoot(self, unit):
         if not unit.alive or not self.city.alive:
@@ -579,8 +735,20 @@ class Game:
             values.extend([unit.x / (c.width - 1), unit.y / (c.height - 1),
                            unit.hp / unit.hp_max, float(unit.alive), unit.strength / 100,
                            float(unit.y % 2), unit.strength_ranged / 100, unit.attack_range / 2])
-        values.extend(TERRAIN_CODES[self.map.grid[(x, y)].terrain_type] / 2
-                      for y in range(c.height) for x in range(c.width))
+        cells = [self.map.grid[(x, y)] for y in range(c.height) for x in range(c.width)]
+        if c.extended_terrain:
+            # Combat-relevant properties: impassable, extra movement cost, defense bonus.
+            for cell in cells:
+                blocked = cell.block_path
+                values.extend([float(blocked), 0.0 if blocked else (cell.movement_cost - 1) / 2,
+                               0.0 if blocked else cell.defense_bonus / 6])
+        else:
+            values.extend(terrain_code(cell) / 2 for cell in cells)
+        if c.river_count:
+            values.extend(float(flag) for y in range(c.height) for x in range(c.width)
+                          for flag in self.map.river_flags((x, y)))
+        if self.economy is not None:
+            values.extend(self.economy.observation(BUILD_ITEMS))
         return np.asarray(values, dtype=float)
 
     def _terrain_routes(self):
@@ -634,10 +802,15 @@ class Game:
                     pending.append(neighbor)
         return routes
 
+    def river_defense(self, unit):
+        """The city's extra strength against a melee attack by unit from across a river."""
+        return RIVER_DEFENSE_BONUS if self.map.has_river(unit.position, self.city.position) else 0
+
     def melee_death_probability(self, unit):
         """Chance that the city's retaliation kills unit if it attacks in melee now."""
         bonus = self.map.grid[unit.position].defense_bonus
-        return damage_at_least(unit.hp, math.exp((self.city.strength - unit.strength - bonus) / 25))
+        strength = self.city.strength + self.river_defense(unit)
+        return damage_at_least(unit.hp, math.exp((strength - unit.strength - bonus) / 25))
 
     def capture_probability(self, unit):
         """Chance that a melee attack by unit now captures the city.
@@ -652,7 +825,7 @@ class Game:
         needed = city.hp
         if city.wall_hp > 0:
             needed += city.wall_hp / self.melee_wall_multiplier(unit)
-        hit = damage_at_least(needed, math.exp((unit.strength - city.strength) / 25))
+        hit = damage_at_least(needed, math.exp((unit.strength - city.strength - self.river_defense(unit)) / 25))
         return hit * (1 - self.melee_death_probability(unit))
 
     def tactical_observation(self):
@@ -756,6 +929,8 @@ class Game:
         capture = self.capture_probability(unit)
         wounded = unit.hp < unit.hp_max
         in_range = unit.ranged and hex_distance(unit.position, city.position) <= unit.attack_range
+        # Across a river from the city, a free tile on the city's side may be one step away.
+        dry_bank = not unit.support and self.river_defense(unit) > 0 and self._dry_bank_nearby(unit)
         scores = {}
         for command in self.unit_directions[index]:
             if command == 'SHOOT':
@@ -786,6 +961,9 @@ class Game:
                     scores[command] = 1.0
                 else:
                     scores[command] = -.5
+                if dry_bank:
+                    # Prefer to attack from a bank that the river does not separate from the city.
+                    scores[command] += 2.0
                 continue
             after = steps.get(destination, math.inf)
             if staging and distance == 3 and after == 2:
@@ -793,8 +971,23 @@ class Game:
             elif unit.ranged and unit.attack_range >= 2 and distance == 2 and after == 1:
                 scores[command] = 1.5
             else:
-                scores[command] = after + .01 * (cell.movement_cost - 1)
+                scores[command] = after + .01 * (self.map.movement_cost(unit.position, destination) - 1)
+                if dry_bank and after == 1 and not self.map.has_river(destination, city.position):
+                    # Cross to the city's side of the river rather than wait or attack across it.
+                    scores[command] -= .75
         return scores
+
+    def _dry_bank_nearby(self, unit):
+        """Whether unit can step to a free tile beside the city that no river separates from it."""
+        city = self.city
+        occupied = {other.position for other in self.units if other.alive and other is not unit}
+        for neighbor in self.map.grid[unit.position].get_neighbors(self.map.grid):
+            position = neighbor.index
+            if (not neighbor.block_path and position != city.position and position not in occupied
+                    and hex_distance(position, city.position) == 1
+                    and not self.map.has_river(position, city.position)):
+                return True
+        return False
 
     def get_current_state(self):
         return {obj.name_instance: {'health': obj.hp, 'position': [obj.x, obj.y],

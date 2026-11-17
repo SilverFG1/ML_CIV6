@@ -8,6 +8,7 @@ import random
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
@@ -251,7 +252,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_cli_rejects_invalid_ranges(self):
         for options in (("--episodes", "-1"), ("--max-steps", "0"), ("--guided-exploration", "1.1"),
-                        ("--learning-rate", "0"), ("--curriculum-episodes", "-1")):
+                        ("--learning-rate", "0"), ("--curriculum-episodes", "-1"), ("--demonstrations", "1.5")):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 run_game.parse_args(list(options))
 
@@ -311,11 +312,20 @@ class RunnerTests(unittest.TestCase):
         original = json.loads(args.model_path.read_text(encoding='utf-8'))
         for name, value in [('seed', 'bad'), ('max_steps', 0), ('episodes_completed', 999),
                             ('metrics', {}), ('no_guidance', 'false'),
-                            ('best_validation_score', [2, 1])]:
+                            ('best_validation_score', [2, 1]), ('demonstrations', 2)]:
             payload = json.loads(json.dumps(original))
             payload['training_state'][name] = value
             args.model_path.write_text(json.dumps(payload), encoding='utf-8')
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'Checkpoint'):
+                self.make_agent(self.args())
+        steps = original['training_state']['metrics'][0]['steps']
+        # A demonstration is played entirely by the heuristic.
+        for changes in ({'demonstration': 'yes'},
+                        {'demonstration': True, 'guidance_actions': 0, 'random_actions': steps, 'policy_actions': 0}):
+            payload = json.loads(json.dumps(original))
+            payload['training_state']['metrics'][0].update(changes)
+            args.model_path.write_text(json.dumps(payload), encoding='utf-8')
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'Checkpoint'):
                 self.make_agent(self.args())
 
     def test_curriculum_preset_and_single_episode_target(self):
@@ -382,6 +392,134 @@ class RunnerTests(unittest.TestCase):
         agent = self.make_agent(steady)
         run_game.train_agent(agent, steady)
         self.assertAlmostEqual(agent.learning_rate, 0.1 * 0.5 ** 3)
+
+    def test_demonstrations_are_drawn_from_each_episode_seed_at_the_configured_share(self):
+        args = self.args("--demonstrations", "0.4")
+        self.make_agent(args)
+        chosen = [run_game.is_demonstration(args, episode) for episode in range(1000)]
+        self.assertTrue(350 <= sum(chosen) <= 450)  # 400 expected
+        # A draw depends only on the episode, not on the draws before it.
+        self.assertEqual(chosen[150:], [run_game.is_demonstration(args, episode) for episode in range(150, 1000)])
+        other_seed = self.args("--seed", "8", "--demonstrations", "0.4")
+        self.make_agent(other_seed)
+        self.assertNotEqual(chosen, [run_game.is_demonstration(other_seed, episode) for episode in range(1000)])
+        for share, expected in (("0", False), ("1", True)):
+            extreme = self.args("--demonstrations", share)
+            self.make_agent(extreme)
+            self.assertEqual({run_game.is_demonstration(extreme, episode) for episode in range(100)}, {expected})
+
+    def test_demonstrations_are_heuristic_episodes_that_train_the_learner(self):
+        args = self.args("--no-save", "--episodes", "3")
+        agent = self.make_agent(args)
+        with patch.object(run_game, "is_demonstration", side_effect=lambda _, episode: episode != 1), \
+                patch.object(agent, "choose_action", wraps=agent.choose_action) as choose, \
+                patch.object(agent, "learn", wraps=agent.learn) as learn:
+            rewards, _ = run_game.train_agent(agent, args)
+        rows = agent.training_state["metrics"]
+        self.assertEqual([row["demonstration"] for row in rows], [True, False, True])
+        for row in (rows[0], rows[2]):
+            self.assertEqual((row["guidance_actions"], row["random_actions"], row["policy_actions"]),
+                             (row["steps"], 0, 0))
+        # Every move trains the learner, but it chooses moves only in its own episode.
+        self.assertEqual(learn.call_count, sum(row["steps"] for row in rows))
+        self.assertEqual(choose.call_count, rows[1]["steps"])
+        self.assertEqual(rewards, [rows[1]["reward"]])
+        self.assertEqual(agent.episodes_trained, 3)
+        summary = run_game.compare_policies(agent, args, policies=["learned"], verbose=False)["learned"]
+        self.assertEqual(sum(row["guidance_actions"] for row in summary["episodes_detail"]), 0)
+
+    def test_demonstrations_pause_while_they_score_below_the_learners_own_episodes(self):
+        ahead = run_game.demonstrations_ahead
+        evidence = run_game.DEMONSTRATION_EVIDENCE
+        self.assertTrue(ahead({True: deque(), False: deque([5.0] * evidence)}))
+        self.assertTrue(ahead({True: deque([2.0, 0.0] * evidence), False: deque([0.5] * evidence)}))
+        self.assertFalse(ahead({True: deque([-26.0] * evidence), False: deque([-4.0] * evidence)}))
+        # Too few demonstrations to judge: an unlucky start does not stop them.
+        self.assertTrue(ahead({True: deque([-26.0] * (evidence - 1)), False: deque([-4.0] * evidence)}))
+        args = self.args("--no-save", "--episodes", "4", "--seed", "23", "--demonstrations", "0.5")
+        agent = self.make_agent(args)
+        self.assertEqual([run_game.is_demonstration(args, episode) for episode in range(4)],
+                         [True, False, True, True])
+        play = run_game.run_episode
+
+        def demonstrations_score_worse(*arguments, **options):
+            result = play(*arguments, **options)
+            result.reward = -50.0 if options["policy"] == "heuristic" else 0.0
+            return result
+
+        with patch.object(run_game, "run_episode", side_effect=demonstrations_score_worse), \
+                patch.object(run_game, "DEMONSTRATION_EVIDENCE", 1):
+            run_game.train_agent(agent, args)
+        # Episodes 2 and 3 drew demonstrations, but the first one scored below the learner's episode.
+        self.assertEqual([row["demonstration"] for row in agent.training_state["metrics"]],
+                         [True, False, False, False])
+
+    def test_split_resume_with_demonstrations_matches_uninterrupted_training(self):
+        options = ("--seed", "23", "--demonstrations", "0.5")
+        # With the gate judging from one episode of each, the resumed half must rebuild
+        # its comparison from the recorded history to pause the same demonstrations.
+        with patch.object(run_game, "DEMONSTRATION_EVIDENCE", 1):
+            full_args = self.args("--episodes", "4", "--no-save", *options)
+            full = self.make_agent(full_args)
+            run_game.train_agent(full, full_args)
+            self.assertEqual([run_game.is_demonstration(full_args, episode) for episode in range(4)],
+                             [True, False, True, True])
+            # The first demonstration scored below the learner's first episode, so later ones pause.
+            self.assertEqual([row["demonstration"] for row in full.training_state["metrics"]],
+                             [True, False, False, False])
+            split_args = self.args("--checkpoint-every", "1", *options)
+            run_game.train_agent(self.make_agent(split_args), split_args)
+            resume_args = self.args("--no-save")
+            resumed = self.make_agent(resume_args)
+            self.assertEqual(resume_args.demonstrations, 0.5)
+            run_game.train_agent(resumed, resume_args)
+        self.assert_agents_equal(full, resumed)
+
+    def test_demonstration_settings_restore_and_older_checkpoints_continue_without(self):
+        args = self.args("--demonstrations", "0.2")
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        restored_args = self.args()
+        self.make_agent(restored_args)
+        self.assertEqual(restored_args.demonstrations, 0.2)
+        with self.assertRaisesRegex(ValueError, "fresh"):
+            self.make_agent(self.args("--demonstrations", "0.3"))
+        # Checkpoints saved before demonstrations existed have no share or history field for them.
+        payload = json.loads(args.model_path.read_text(encoding="utf-8"))
+        del payload["training_state"]["demonstrations"]
+        for row in payload["training_state"]["metrics"]:
+            del row["demonstration"]
+        args.model_path.write_text(json.dumps(payload), encoding="utf-8")
+        older_args = self.args()
+        older = self.make_agent(older_args)
+        self.assertEqual(older_args.demonstrations, 0.0)
+        run_game.train_agent(older, older_args)
+        self.assertEqual([row["demonstration"] for row in older.training_state["metrics"]], [False] * 4)
+
+    def test_demonstrations_need_guidance_and_are_off_for_the_joint_learner(self):
+        tactical = self.args()
+        self.make_agent(tactical)
+        self.assertEqual(tactical.demonstrations, run_game.DEMONSTRATION_DEFAULTS["tactical"])
+        self.assertGreater(tactical.demonstrations, 0)
+        unguided = self.args("--no-guidance")
+        self.make_agent(unguided)
+        self.assertEqual(unguided.demonstrations, 0.0)
+        with self.assertRaisesRegex(ValueError, "no-guidance"):
+            self.make_agent(self.args("--no-guidance", "--demonstrations", "0.3"))
+        joint = self.args("--agent", "joint")
+        self.make_agent(joint)
+        self.assertEqual(joint.demonstrations, 0.0)
+
+    def test_learning_curves_leave_demonstrations_out_of_performance_panels(self):
+        rows = [dict(episode=index + 1, reward=float(index), outcome="win", steps=5, q_table_size=index,
+                     demonstration=index % 2 == 0) for index in range(6)]
+        svg = ET.fromstring(run_game._curve_svg(rows))
+        lines = svg.findall(".//{http://www.w3.org/2000/svg}polyline")
+        self.assertEqual([len(line.get("points").split()) for line in lines], [3, 3, 3, 6])
+        self.assertIn("without demonstrations", ET.tostring(svg, encoding="unicode"))
+        only_demonstrations = ET.fromstring(run_game._curve_svg(rows[:1]))
+        self.assertEqual(len(only_demonstrations.findall(".//{http://www.w3.org/2000/svg}polyline")), 1)
 
     def test_tactical_learner_wins_held_out_games_without_guidance(self):
         """Regression check that learning works: a short schedule on a small map."""

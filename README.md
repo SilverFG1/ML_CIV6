@@ -2,7 +2,7 @@
 
 A small Civ-inspired hex-grid combat environment and tabular Q-learning experiment, originally inspired by [this Civilization VI machine-learning video](https://www.youtube.com/watch?v=kjA9LxLx9IQ). Units move, heal, fight, and attempt to capture a defended city. The simulation supports configurable terrain, city walls, ranged units, and difficulty presets. It implements a limited combat scenario rather than the full Civilization VI ruleset.
 
-The default learner is a tactical squad Q-learner. After 1,000 training episodes it captures the city in almost every evaluation game on seeds it never trained on, including hard and walled sieges; see [How the AI works](#how-the-ai-works).
+The default learner is a tactical squad Q-learner. After 1,000 training episodes it captures the city in almost every evaluation game on seeds it never trained on, including hard and walled sieges. Part of its training watches the rule-based heuristic play, which teaches it assaults it would not find on its own; see [How the AI works](#how-the-ai-works).
 
 An optional [real Civilization VI integration](docs/REAL_CIV6.md) now provides structured observations, saved snapshots, a basic tactical controller, and individual unit commands through FireTuner. Start with `python run_civ6.py doctor`. Orders are previewed until `--execute` is supplied. This first milestone controls a local player's units; full-game strategy and training the learner against the real game remain future work.
 
@@ -44,7 +44,7 @@ Continue the same model for another 500 training episodes:
 python run_game.py --episodes 500 --model-path runs/baseline/model.json --metrics-dir runs/resumed
 ```
 
-`--episodes` is the number of additional training episodes. An existing model loads automatically and restores its learner, scenario, learning settings, progress, seeds, and policy random-generator state. Compatible learning options can be explicitly overridden; learner, scenario, seed, precision, and validation-set changes require `--fresh`. Resumption starts at an episode boundary. `--no-save` disables checkpoint writes while retaining metrics output. Joint Q-table models saved before the tactical learner still resume with their original learner; train a tactical model with `--fresh`. Models older than the joint learner's current observation format require `--fresh`.
+`--episodes` is the number of additional training episodes. An existing model loads automatically and restores its learner, scenario, learning settings, progress, seeds, and policy random-generator state. Compatible learning options can be explicitly overridden; learner, scenario, seed, precision, demonstration-share, and validation-set changes require `--fresh`. Resumption starts at an episode boundary. `--no-save` disables checkpoint writes while retaining metrics output. Models saved before demonstrations existed resume without them. Joint Q-table models saved before the tactical learner still resume with their original learner; train a tactical model with `--fresh`. Models older than the joint learner's current observation format require `--fresh`.
 
 Evaluate a saved model without further training:
 
@@ -52,7 +52,7 @@ Evaluate a saved model without further training:
 python run_game.py --episodes 0 --eval-episodes 100 --model-path runs/baseline/model.json --metrics-dir runs/evaluation
 ```
 
-By default, evaluation reports **learned**, **heuristic**, and **random** policies separately. Each sees the same scenario seeds, and each policy has an independent random stream. Learned evaluation uses the Q-table with guidance disabled, so its score measures the learner. Training can still use heuristic guidance; use `--no-guidance` to disable it. `--eval-policies learned heuristic` selects baselines to run, while `--eval-guidance` adds a separately labelled guided-policy result. `--eval-episodes 0` skips evaluation.
+By default, evaluation reports **learned**, **heuristic**, and **random** policies separately. Each sees the same scenario seeds, and each policy has an independent random stream. Learned evaluation uses the Q-table with guidance disabled, so its score measures the learner. Training can still use the heuristic, both to guide some exploratory moves and to play [demonstration episodes](#how-the-ai-works) that the learner learns from; `--demonstrations 0` turns off demonstrations, and `--no-guidance` turns off both. `--eval-policies learned heuristic` selects baselines to run, while `--eval-guidance` adds a separately labelled guided-policy result. `--eval-episodes 0` skips evaluation.
 
 Use `--save-best --validation-episodes 20` to also select a model using a fixed validation seed set. Validation uses `--validation-seed` (default 200007), independently of the final evaluation seed set (`--eval-seed`, default 100007). Keep final evaluation seeds reserved when comparing training settings.
 
@@ -122,36 +122,38 @@ Evaluation compares three policies: the **learned** squad policy, a rule-based *
 
 `--shaping`, `--learning-rate-decay`, and `--learning-rate-min` adjust these (a decay of 1 disables annealing), and `--agent joint` trains the original joint-action Q-table for comparison. Hard sieges typically need 500–1,000 training episodes; small scenarios learn in a few hundred.
 
-**The heuristic** uses the same combat odds. Units close in by the fewest turns, archers and slingers shoot when in range, and a melee attack is made only when the retaliation cannot kill the attacker while the city is encircled (a small risk is accepted while the city can still heal), unless a capture is nearly certain. Otherwise units heal in place, hold next to the city until enough of them stop it from healing, and wait outside a ranged city's reach until the squad closes up. It also serves as the guide for heuristic-guided exploration during training.
+**Demonstrations.** By default, 30% of training episodes are demonstrations: the heuristic described below plays them from start to finish, and the learner updates from every move with its usual Q-learning step. Q-learning is off-policy, so the learner learns the value of play it only watches, including coordinated assaults that its own exploration rarely completes. Demonstrations pause while the last 100 of them scored less on average than the learner's own last 100 episodes (judged once there are at least 20 of each), so a heuristic that plays worse than the learner stops teaching it. The share does not decay: in experiments, once demonstrations stopped, the learner's own exploratory play pulled the values they had taught back down within a few hundred episodes. Whether an episode is a demonstration is drawn from a random stream derived from its seed, so the draw uses none of the learner's or the game's randomness, and a resumed run makes the same choices. `--demonstrations` sets the share; `--demonstrations 0` trains exactly as before demonstrations existed, and `--no-guidance` turns them off together with guided exploration. The joint learner trains without demonstrations unless asked. The learned policy's evaluation never uses the heuristic.
 
-**Results.** Win rates over 100 held-out evaluation games (seeds 100007–100106) after 1,000 training episodes with default settings. "Learned" is the mean over four training seeds, with the worst seed's rate in parentheses when below 100%. "Original heuristic" is the rule-based policy this project shipped before; losses are shown where any occurred.
+**The heuristic** uses the same combat odds. Units close in by the fewest turns, archers and slingers shoot when in range, and a melee attack is made only when the retaliation cannot kill the attacker while the city is encircled (a small risk is accepted while the city can still heal), unless a capture is nearly certain. Otherwise units heal in place, hold next to the city until enough of them stop it from healing, and wait outside a ranged city's reach until the squad closes up. During training it also guides a share of exploratory moves and plays the demonstrations.
 
-| Scenario | Settings | Learned | Heuristic | Original heuristic | Random |
-| --- | --- | --- | --- | --- | --- |
-| default | 8×8, three warriors, normal city | 100% | 100% | 93%, 7% lost | 0% |
-| hard | `--difficulty hard` | 98.5% (94%) | 100% | 0%, 100% lost | 0% |
-| curriculum | `--difficulty curriculum` | 96.3% (87%) | 100% | 0%, 100% lost | 0% |
-| walled siege | warrior, spearman, battering ram; `--wall-hp 50` | 100% | 99%, 1% lost | 58%, 22% lost | 0% |
-| mixed terrain | warrior, archer, warrior; walls 50; forest 0.2, mountains 0.1 | 100% | 100% | 87% | 0% |
-| hard terrain | hard; forest 0.2, mountains 0.1 | 99.8% (99%) | 93% | 0%, 100% lost | 0% |
-| chariot and ram | heavy chariot, battering ram; walls 30 | 100% | 99%, 1% lost | 99%, 1% lost | 0% |
-| slingers | warrior, slinger, slinger | 100% | 100% | 90% | 0% |
-| four units | four warriors, 10×10 | 100% | 100% | 100% | 0% |
-| easy small | easy, 7×7, two warriors, light terrain | 100% | 100% | 100% | 3% |
-| ranged city | `--ranged-strength 25` | 0%, none lost | 0%, 100% lost | 6%, 94% lost | 0%, 94% lost |
-| ranged city, archers | ranged 25; warrior, archer, archer | 0%, none lost | 67%, 33% lost | 26%, 74% lost | 0%, 96% lost |
+**Results.** Win rates over 100 held-out evaluation games (seeds 100007–100106) after 1,000 training episodes with default settings. "Learned" is the mean over training seeds 1–4, with the worst seed's rate in parentheses when it is lower. "Without demonstrations" is the same learner trained with `--demonstrations 0`, which reproduces the previous version exactly. "Original heuristic" is the rule-based policy this project shipped before; losses are shown where any occurred.
 
-The learned policy lost no evaluation games in any scenario. The original joint Q-table won none of its evaluation games in the default, hard, walled-siege and mixed-terrain scenarios, which were the ones measured; it is still available as `--agent joint`. A default model file is now about 0.5 MB instead of about 67 MB.
+| Scenario | Settings | Learned | Without demonstrations | Heuristic | Original heuristic | Random |
+| --- | --- | --- | --- | --- | --- | --- |
+| default | 8×8, three warriors, normal city | 100% | 100% | 100% | 93%, 7% lost | 0% |
+| hard | `--difficulty hard` | 100% | 98.5% (94%) | 100% | 0%, 100% lost | 0% |
+| curriculum | `--difficulty curriculum` | 98% (97%) | 96.3% (87%) | 100% | 0%, 100% lost | 0% |
+| walled siege | warrior, spearman, battering ram; `--wall-hp 50` | 100% | 100% | 99%, 1% lost | 58%, 22% lost | 0% |
+| mixed terrain | warrior, archer, warrior; walls 50; forest 0.2, mountains 0.1 | 100% | 100% | 100% | 87% | 0% |
+| hard terrain | hard; forest 0.2, mountains 0.1 | 99.5% (99%) | 99.8% (99%) | 93% | 0%, 100% lost | 0% |
+| chariot and ram | heavy chariot, battering ram; walls 30 | 99%, 1% lost | 100% | 99%, 1% lost | 99%, 1% lost | 0% |
+| slingers | warrior, slinger, slinger | 100% | 100% | 100% | 90% | 0% |
+| four units | four warriors, 10×10 | 100% | 100% | 100% | 100% | 0% |
+| easy small | easy, 7×7, two warriors, light terrain | 100% | 100% | 100% | 100% | 3% |
+| ranged city | `--ranged-strength 25` | 0%, none lost | 0%, none lost | 0%, 100% lost | 6%, 94% lost | 0%, 94% lost |
+| ranged city, archers | ranged 25; warrior, archer, archer | 40.8% (37%), 1.5% lost | 0%, none lost | 67%, 33% lost | 26%, 74% lost | 0%, 96% lost |
 
-Against a city with a ranged attack, the learner declines the fight and waits out the turn limit. With three warriors that is the better choice under the game's rewards (average reward −4.0 against −26.1 for the heuristic's assault). With archers the heuristic's assault is worth more (−1.2 against −4.6), so the learner misses a winnable fight there; a coordinated assault under fire is not yet discovered by its exploration.
+Outcomes vary between training seeds, so the hard, curriculum, and both ranged-city scenarios were also trained on seeds 5–8. Over all eight seeds, demonstrations raise hard sieges from 95.9% (worst seed 87%) to 99.6% (97%) and the curriculum from 94.9% (85%) to 96.1% (81%). The one cost is in the chariot-and-ram scenario: every model now loses the single evaluation game that the heuristic also loses, and over 1,000 further games one model lost 0.8% of them against none without demonstrations. With the city on its last hit point, it attacks at the same small risk of dying to the retaliation that the heuristic accepts, where the learner on its own heals one more turn first. Without demonstrations the learned policy lost no evaluation games in any scenario. The original joint Q-table won none of its evaluation games in the default, hard, walled-siege and mixed-terrain scenarios, which were the ones measured; it is still available as `--agent joint`. A default model file is now about 0.5 MB instead of about 67 MB.
+
+Against a city with a ranged attack and three warriors, the learner still declines the fight and waits out the turn limit. That is the better choice under the game's rewards (average reward −4.0 against −26.1 for the heuristic's assault, which loses every game). Demonstrations stop there within the first 275 episodes, once the learner's own episodes outscore the heuristic's, and no evaluation game was lost on any of the eight seeds. With archers, the heuristic's assault is worth more (−1.2 against −4.8 for waiting), but the learner never finds it on its own: near a city that shoots, random exploration is punished, so it learns to stay out of range before it ever completes an assault. Watching complete assaults changes that. Over eight training seeds it now wins 40.4% of evaluation games (worst seed 37%) and loses 2.4%, and its average reward rises from −4.8 to −3.2. It still trails the heuristic (67% won, 33% lost). When an assault stalls, it pulls back wounded and waits out the clock (those games average −11.9). Its units coordinate only through their own features, which cannot tell an archer shooting from two hexes away from one far off, and it picks up some of the heuristic's habits, such as healing in place next to a city that is shooting.
 
 ## Metrics and playback
 
 Each run writes to `--metrics-dir` (default `training_metrics`):
 
-- `training.csv`: episode-level training metrics, including reward, win/termination outcome, length, Q-table size (table rows for the tactical learner), and guidance usage.
+- `training.csv`: episode-level training metrics, including reward, win/termination outcome, length, Q-table size (table rows for the tactical learner), guidance usage, and whether the heuristic played the episode as a demonstration.
 - `metrics.json`: scenario and learning settings, seeds, training history, and evaluation summaries for comparing runs.
-- `learning_curve.svg`: training curves that open in a browser without extra plotting packages.
+- `learning_curve.svg`: training curves that open in a browser without extra plotting packages. The reward, win-rate, and length panels show only the learner's own episodes, not demonstrations; the training log's average reward and win count leave demonstrations out too.
 
 Use separate output directories for experiments. Checkpoints save atomically; periodic saves preserve recoverable progress during long runs. `--checkpoint-every N` controls their interval.
 
@@ -171,4 +173,4 @@ Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** m
 python -m unittest discover -s tests -v
 ```
 
-The tests cover simulation rules, independent environments, terminal rewards, legal actions, Q-learning updates, checkpoint validation/resumption, and runner behavior. `tests/test_tactical.py` checks the combat odds against simulated attacks, the tactical encoding, the heuristic's rules, and the tactical learner's arithmetic and checkpoints. A short training regression checks that the learner wins held-out games without guidance. GitHub Actions runs the suite on Python 3.12 with headless dependencies and executes a short CLI training/evaluation run. [UPGRADE_STATUS.md](UPGRADE_STATUS.md) tracks the upgrade areas and their integration evidence.
+The tests cover simulation rules, independent environments, terminal rewards, legal actions, Q-learning updates, checkpoint validation/resumption, and runner behavior. `tests/test_tactical.py` checks the combat odds against simulated attacks, the tactical encoding, the heuristic's rules, and the tactical learner's arithmetic and checkpoints. A short training regression checks that the learner wins held-out games without guidance. Runner tests check that demonstrations are played entirely by the heuristic and train the learner through its normal update, that they pause while they score below the learner's own episodes, that a run with demonstrations split by a checkpoint matches an uninterrupted one, and that older checkpoints resume without them. GitHub Actions runs the suite on Python 3.12 with headless dependencies and executes a short CLI training/evaluation run. [UPGRADE_STATUS.md](UPGRADE_STATUS.md) tracks the upgrade areas and their integration evidence.

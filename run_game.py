@@ -1,6 +1,7 @@
 """Reproducible training, checkpointing, and policy comparisons for ML_CIV6."""
 
 import argparse
+import collections
 import csv
 import html
 import json
@@ -22,8 +23,18 @@ LEARNING_DEFAULTS = {
                   epsilon_min=0.05, state_precision=100, initial_q=-100.0),
 }
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
+# Share of training episodes that the heuristic plays from start to finish while
+# the learner updates from every move, by learner. The joint learner keeps its
+# original training. Demonstrations pause while the last DEMONSTRATION_WINDOW of
+# them scored less on average than the learner's own last DEMONSTRATION_WINDOW
+# episodes, so a heuristic that plays worse than the learner stops teaching it.
+# The comparison needs DEMONSTRATION_EVIDENCE of each, so one unlucky early
+# demonstration cannot stop them.
+DEMONSTRATION_DEFAULTS = {"tactical": 0.3, "joint": 0.0}
+DEMONSTRATION_WINDOW = 100
+DEMONSTRATION_EVIDENCE = 20
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
-                 "random_actions", "policy_actions", "q_table_size", "city_strength")
+                 "random_actions", "policy_actions", "q_table_size", "city_strength", "demonstration")
 
 
 def parse_args(argv=None):
@@ -63,7 +74,12 @@ def parse_args(argv=None):
                         help="tactical learner learning-rate floor (default: 0.01)")
     parser.add_argument("--guided-exploration", type=float,
                         help="guided fraction of epsilon exploration (default: 0.35)")
-    parser.add_argument("--no-guidance", action="store_true", help="train without heuristic fallback")
+    parser.add_argument("--demonstrations", type=float,
+                        help="share of training episodes that the heuristic plays from start to finish while "
+                             "the learner learns from its moves, paused while they score below the learner's "
+                             "own recent episodes (default: 0.3 for the tactical learner, 0 for the joint learner)")
+    parser.add_argument("--no-guidance", action="store_true",
+                        help="train without heuristic fallback or demonstrations")
     parser.add_argument("--log-every", type=int, default=50)
     for flag, kind in (("width", int), ("height", int), ("city-strength", float), ("wall-hp", float),
                        ("ranged-strength", float), ("mountain-density", float), ("forest-density", float)):
@@ -87,7 +103,8 @@ def parse_args(argv=None):
     if args.curriculum_episodes is not None and args.curriculum_episodes < 0:
         parser.error("--curriculum-episodes must be non-negative")
     for name in ("epsilon", "epsilon_decay", "epsilon_min", "guided_exploration", "discount_factor",
-                 "mountain_density", "forest_density", "learning_rate_decay", "learning_rate_min"):
+                 "mountain_density", "forest_density", "learning_rate_decay", "learning_rate_min",
+                 "demonstrations"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 1:
             parser.error(f"--{name.replace('_', '-')} must lie between 0 and 1")
@@ -157,17 +174,23 @@ def _validate_training_state(agent):
             raise ValueError(f'Checkpoint {name} is invalid')
     if state['episodes_completed'] != agent.episodes_trained or state['checkpoint_episode'] != agent.episodes_trained:
         raise ValueError('Checkpoint episode counters disagree')
-    rate = state['guided_exploration']
-    if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 <= rate <= 1:
-        raise ValueError('Checkpoint guided exploration must lie between 0 and 1')
+    for name in ('guided_exploration', 'demonstrations'):
+        # Checkpoints from before demonstrations existed have no share.
+        rate = state.get(name, 0)
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 <= rate <= 1:
+            raise ValueError(f'Checkpoint {name.replace("_", " ")} must lie between 0 and 1')
     if not isinstance(state['no_guidance'], bool):
         raise ValueError('Checkpoint no_guidance must be a boolean')
     rows = state['metrics']
     if not isinstance(rows, list) or len(rows) != agent.episodes_trained:
         raise ValueError('Checkpoint training history does not match episode count')
     for index, row in enumerate(rows):
-        if not isinstance(row, dict) or set(row) != set(METRIC_FIELDS):
+        # Rows recorded before demonstrations existed lack that field.
+        if not isinstance(row, dict) or set(row) not in (set(METRIC_FIELDS), set(METRIC_FIELDS) - {'demonstration'}):
             raise ValueError('Checkpoint contains an invalid training history row')
+        demonstration = row.get('demonstration', False)
+        if not isinstance(demonstration, bool):
+            raise ValueError('Checkpoint history demonstration must be a boolean')
         for name in ('reward', 'epsilon', 'city_strength'):
             if isinstance(row[name], bool) or not isinstance(row[name], (int, float)):
                 raise ValueError(f'Checkpoint history {name} must be numeric')
@@ -181,6 +204,8 @@ def _validate_training_state(agent):
             raise ValueError('Checkpoint history contains invalid counts')
         if row['guidance_actions'] + row['random_actions'] + row['policy_actions'] != row['steps']:
             raise ValueError('Checkpoint history action counts disagree')
+        if demonstration and row['guidance_actions'] != row['steps']:
+            raise ValueError('Checkpoint history demonstrations must be played entirely by the heuristic')
         if row['outcome'] not in ('win', 'loss', 'timeout', 'quit') or not 0 <= row['epsilon'] <= 1:
             raise ValueError('Checkpoint history contains invalid outcomes or exploration rates')
     best = state.get('best_validation_score')
@@ -200,6 +225,9 @@ def build_agent(args, rng):
     agent = load_agent(args.model_path, rng=rng) if loaded else None
     if loaded and agent.observation_schema is not None:
         _validate_training_state(agent)
+        # Episodes recorded before demonstrations existed were all the learner's own.
+        for row in agent.training_state.get("metrics", []):
+            row.setdefault("demonstration", False)
     saved = agent.training_state if loaded else {}
     kind = agent.agent_kind if loaded else args.agent or "tactical"
     if args.agent is not None and args.agent != kind:
@@ -223,6 +251,11 @@ def build_agent(args, rng):
         args.no_guidance = True
     elif saved and args.no_guidance != saved.get("no_guidance", False):
         raise ValueError("--no-guidance differs from the checkpoint; use --fresh")
+    # A checkpoint saved before demonstrations existed continues without them.
+    _restore_setting(args, saved, "demonstrations",
+                     0.0 if saved or args.no_guidance else DEMONSTRATION_DEFAULTS[kind])
+    if args.no_guidance and args.demonstrations:
+        raise ValueError("--demonstrations are played by the heuristic; they cannot be combined with --no-guidance")
     try:
         config = config_from_args(args, saved.get("config"))
     except (TypeError, KeyError) as error:
@@ -266,6 +299,35 @@ def episode_config(args, absolute_episode):
     progress = 1.0 if args.curriculum_episodes == 1 else min(1.0, absolute_episode / (args.curriculum_episodes - 1))
     start_strength = min(18.0, args.config.city_strength)
     return replace(args.config, city_strength=start_strength + (args.config.city_strength - start_strength) * progress)
+
+
+def is_demonstration(args, absolute_episode):
+    """Whether the heuristic plays this training episode while the learner learns from it.
+
+    Q-learning is off-policy, so complete demonstrations show the learner
+    coordinated plays that its own exploration rarely finds. The share does
+    not decay: once demonstrations stop, the learner's own exploratory play
+    drags the values they taught back down. The draw uses a random stream
+    derived from the episode's seed, so it consumes none of the agent's or
+    environment's randomness, and a resumed run makes the same choices
+    without saving anything more. train_agent also pauses demonstrations
+    while demonstrations_ahead() is false.
+    """
+    return (args.demonstrations > 0
+            and random.Random(f"demonstration:{args.seed + absolute_episode}").random() < args.demonstrations)
+
+
+def demonstrations_ahead(recent):
+    """Whether recent demonstrations scored more on average than the learner's own recent episodes.
+
+    recent maps True to the rewards of recent demonstrations and False to those
+    of the learner's own episodes. Until there are DEMONSTRATION_EVIDENCE of
+    each to compare, demonstrations go ahead.
+    """
+    shown, own = recent[True], recent[False]
+    if min(len(shown), len(own)) < DEMONSTRATION_EVIDENCE:
+        return True
+    return sum(shown) / len(shown) > sum(own) / len(own)
 
 
 @dataclass
@@ -391,6 +453,7 @@ def _checkpoint_state(agent, args, rows, best_score=None):
     state = dict(agent.training_state)
     state.update(config=asdict(args.config), seed=args.seed, max_steps=args.max_steps,
                  curriculum_episodes=args.curriculum_episodes, guided_exploration=args.guided_exploration,
+                 demonstrations=args.demonstrations,
                  validation_episodes=args.validation_episodes, validation_seed=args.validation_seed,
                  no_guidance=args.no_guidance, episodes_completed=agent.episodes_trained,
                  checkpoint_episode=agent.episodes_trained, metrics=rows)
@@ -418,13 +481,24 @@ def _save_checkpoint(agent, args, rows):
 
 
 def train_agent(agent, args):
+    """Train for args.episodes more episodes; return the learner's own rewards and wins.
+
+    Demonstration episodes train the learner too, but they are the heuristic's
+    play, so the returned rewards and wins and the log leave them out.
+    """
     rows = list(agent.training_state.get("metrics", []))
     rewards = []
-    wins = 0
+    wins = demonstrations = 0
+    # The recorded history rebuilds these, so a resumed run gates demonstrations identically.
+    recent = {True: collections.deque(maxlen=DEMONSTRATION_WINDOW),
+              False: collections.deque(maxlen=DEMONSTRATION_WINDOW)}
+    for row in rows:
+        recent[bool(row.get("demonstration"))].append(row["reward"])
     start_episode = agent.episodes_trained
     for offset in range(args.episodes):
         episode = start_episode + offset
         config = episode_config(args, episode)
+        demonstration = is_demonstration(args, episode) and demonstrations_ahead(recent)
         env = game.Game(config=config, seed=args.seed + episode, ml_ai=True, render=args.render_training,
                         observation=agent.observation_mode)
         try:
@@ -432,22 +506,29 @@ def train_agent(agent, args):
                                  seed=args.seed + episode, render_delay_ms=args.render_delay_ms,
                                  guided_exploration_rate=args.guided_exploration,
                                  use_guidance=not args.no_guidance,
+                                 policy="heuristic" if demonstration else "learned",
                                  anneal=curriculum_complete(args, episode))
         finally:
             env.close()
-        rewards.append(result.reward)
-        wins += int(result.won)
+        recent[demonstration].append(result.reward)
+        if demonstration:
+            demonstrations += 1
+        else:
+            rewards.append(result.reward)
+            wins += int(result.won)
         rows.append(dict(episode=episode + 1, seed=args.seed + episode, reward=result.reward,
                          outcome=result.outcome, steps=result.steps, epsilon=agent.epsilon,
                          guidance_actions=result.guidance_actions, random_actions=result.random_actions,
                          policy_actions=result.policy_actions, q_table_size=len(agent.q_table),
-                         city_strength=config.city_strength))
+                         city_strength=config.city_strength, demonstration=demonstration))
         _checkpoint_state(agent, args, rows)
         if args.log_every and (offset == 0 or (episode + 1) % args.log_every == 0):
             window = rewards[-args.log_every:]
-            print(f"episode {episode + 1} | avg reward {sum(window) / len(window):.2f} | "
-                  f"wins {wins}/{len(rewards)} | epsilon {agent.epsilon:.3f} | "
-                  f"guided {result.guidance_actions}/{result.steps} | Q states {len(agent.q_table)}")
+            average = sum(window) / len(window) if window else 0.0
+            played = "demonstration" if demonstration else f"guided {result.guidance_actions}/{result.steps}"
+            print(f"episode {episode + 1} | avg reward {average:.2f} | wins {wins}/{len(rewards)} | "
+                  f"demonstrations {demonstrations} | epsilon {agent.epsilon:.3f} | "
+                  f"{played} | Q states {len(agent.q_table)}")
         if args.checkpoint_every and (episode + 1) % args.checkpoint_every == 0:
             if not args.no_save:
                 _save_checkpoint(agent, args, rows)
@@ -470,19 +551,25 @@ def _curve_svg(rows):
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" '
              'aria-label="Training learning curves"><rect width="100%" height="100%" fill="white"/>',
              '<style>text{font:14px sans-serif;fill:#222}.axis{stroke:#bbb;stroke-width:1}</style>']
+    # Demonstrations show the heuristic's play, so only table growth includes them.
+    own = [row for row in rows if not row.get("demonstration")]
     for index, (field, label, color) in enumerate(panels):
         origin_x = (index % 2) * width / 2 + padding
         origin_y = (index // 2) * height / 2 + padding
         plot_w, plot_h = width / 2 - padding - 30, height / 2 - padding - 55
+        if field != "q_table_size" and len(own) < len(rows):
+            label += " without demonstrations"
         parts.append(f'<text x="{origin_x}" y="{origin_y - 25}">{html.escape(label)}</text>')
         parts.append(f'<path class="axis" fill="none" d="M{origin_x},{origin_y}v{plot_h}h{plot_w}"/>')
-        if not rows:
-            parts.append(f'<text x="{origin_x + 15}" y="{origin_y + 35}">No training episodes</text>')
+        series = rows if field == "q_table_size" else own
+        if not series:
+            message = "Only demonstrations so far" if rows else "No training episodes"
+            parts.append(f'<text x="{origin_x + 15}" y="{origin_y + 35}">{message}</text>')
             continue
         values = []
-        for position, row in enumerate(rows):
+        for position, row in enumerate(series):
             if field == "win_rate":
-                window = rows[max(0, position - 49):position + 1]
+                window = series[max(0, position - 49):position + 1]
                 value = sum(item["outcome"] == "win" for item in window) / len(window)
             else:
                 value = float(row[field])
@@ -490,15 +577,16 @@ def _curve_svg(rows):
         low, high = (0.0, 1.0) if field == "win_rate" else (min(values), max(values))
         if low == high:
             low, high = low - 0.5, high + 0.5
-        points = " ".join(f"{origin_x + plot_w * position / max(1, len(values) - 1):.2f},"
+        first, last = series[0]["episode"], series[-1]["episode"]
+        points = " ".join(f"{origin_x + plot_w * (row['episode'] - first) / max(1, last - first):.2f},"
                           f"{origin_y + plot_h * (1 - (value - low) / (high - low)):.2f}"
-                          for position, value in enumerate(values))
+                          for row, value in zip(series, values))
         parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2"/>')
         for value, y in ((high, origin_y), (low, origin_y + plot_h)):
             parts.append(f'<text x="{origin_x - 8}" y="{y + 4}" text-anchor="end">{value:.3g}</text>')
-        parts.append(f'<text x="{origin_x}" y="{origin_y + plot_h + 24}">{rows[0]["episode"]}</text>')
+        parts.append(f'<text x="{origin_x}" y="{origin_y + plot_h + 24}">{first}</text>')
         parts.append(f'<text x="{origin_x + plot_w}" y="{origin_y + plot_h + 24}" '
-                     f'text-anchor="end">{rows[-1]["episode"]}</text>')
+                     f'text-anchor="end">{last}</text>')
         parts.append(f'<text x="{origin_x + plot_w / 2}" y="{origin_y + plot_h + 42}" '
                      'text-anchor="middle">Episode</text>')
     return "\n".join(parts + ["</svg>"])
@@ -537,7 +625,7 @@ def main(argv=None):
         settings.update({name: getattr(args, name) for name in
                          ('seed', 'max_steps', 'eval_seed', 'eval_episodes', 'eval_policies',
                           'eval_guidance', 'validation_seed', 'validation_episodes',
-                          'curriculum_episodes', 'guided_exploration', 'no_guidance')})
+                          'curriculum_episodes', 'guided_exploration', 'demonstrations', 'no_guidance')})
         write_metrics(args.metrics_dir, rows, evaluations=evaluations, config=args.config, settings=settings)
         print(f"metrics written to {args.metrics_dir}")
     except ValueError as error:

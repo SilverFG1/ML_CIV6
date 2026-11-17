@@ -14,9 +14,10 @@ from unittest.mock import patch
 
 import numpy as np
 
+import empire
 import game
 import run_game
-from learning_ai import QLearningAgent, TacticalQAgent, load_agent
+from learning_ai import EmpireQAgent, QLearningAgent, TacticalQAgent, load_agent
 
 
 class ShortEpisode:
@@ -638,6 +639,115 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(sum(row["guidance_actions"] for row in summaries["learned"]["episodes_detail"]), 0)
         self.assertGreaterEqual(summaries["learned"]["win_rate"], 0.9)
         self.assertEqual(summaries["random"]["win_rate"], 0.0)
+
+
+class EmpireRunnerTests(unittest.TestCase):
+    """--mode empire trains, resumes, evaluates and validates like the siege runner."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
+        self.root = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def args(self, *extra):
+        return run_game.parse_args([
+            "--model-path", str(self.root / "model.json"), "--metrics-dir", str(self.root / "metrics"),
+            "--episodes", "2", "--eval-episodes", "1", "--log-every", "0", *extra,
+        ])
+
+    def empire_args(self, *extra):
+        return self.args("--mode", "empire", "--turn-limit", "12", "--width", "10", "--height", "9", *extra)
+
+    def test_new_empire_models_use_the_empire_learner_and_its_settings(self):
+        args = self.empire_args("--difficulty", "hard", "--map-type", "islands")
+        agent = run_game.build_agent(args, random.Random(1))
+        self.assertIsInstance(agent, EmpireQAgent)
+        self.assertEqual((args.mode, args.agent, args.max_steps, args.demonstrations), ("empire", "empire", 12, 0.3))
+        self.assertEqual((args.config.rival_bonus, args.config.map_type, args.config.difficulty), (1.25, "islands",
+                                                                                                    "hard"))
+        self.assertEqual(agent.discount_factor, 0.97)
+        self.assertEqual(agent.observation_schema, empire.OBSERVATION_SCHEMA)
+
+    def test_flags_from_the_other_mode_and_mismatched_learners_are_rejected(self):
+        for extra, message in [(("--unit-count", "2"), "unit-count"), (("--economy",), "economy"),
+                               (("--agent", "tactical"), "empire learner"), (("--shaping", "1"), "shaping"),
+                               (("--state-precision", "5"), "joint")]:
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, message):
+                run_game.build_agent(self.empire_args("--fresh", *extra), random.Random(1))
+        for extra in [("--rivals", "0"), ("--speed", "quick"), ("--mode", "siege", "--agent", "empire")]:
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                run_game.build_agent(self.args("--fresh", *extra), random.Random(1))
+        implied = self.args("--fresh", "--agent", "empire")
+        run_game.build_agent(implied, random.Random(1))
+        self.assertEqual(implied.mode, "empire")
+
+    def test_empire_training_resumes_exactly_and_rejects_scenario_changes(self):
+        full_args = self.empire_args("--episodes", "4", "--seed", "5", "--no-save")
+        full = run_game.build_agent(full_args, random.Random(9))
+        run_game.train_agent(full, full_args)
+        split_args = self.empire_args("--seed", "5", "--checkpoint-every", "1")
+        split = run_game.build_agent(split_args, random.Random(9))
+        run_game.train_agent(split, split_args)
+        run_game.compare_policies(split, split_args, verbose=False)
+        split.save(split_args.model_path)
+        resume_args = self.args("--no-save")
+        resumed = run_game.build_agent(resume_args, random.Random(3))
+        self.assertEqual((resume_args.mode, resume_args.config, resume_args.max_steps),
+                         ("empire", split_args.config, 12))
+        run_game.train_agent(resumed, resume_args)
+        self.assertEqual(full.rng.getstate(), resumed.rng.getstate())
+        self.assertEqual(full.training_state["metrics"], resumed.training_state["metrics"])
+        self.assertEqual(set(full.q_table), set(resumed.q_table))
+        for key in full.q_table:
+            np.testing.assert_array_equal(full.q_table[key], resumed.q_table[key])
+        for extra in [("--map-type", "islands"), ("--rivals", "0"), ("--mode", "siege"), ("--speed", "standard")]:
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "fresh"):
+                run_game.build_agent(self.args(*extra), random.Random(1))
+
+    def test_empire_demonstrations_are_played_by_the_heuristic(self):
+        args = self.empire_args("--no-save", "--episodes", "2")
+        agent = run_game.build_agent(args, random.Random(1))
+        with patch.object(run_game, "is_demonstration", side_effect=lambda _, episode: episode == 0):
+            run_game.train_agent(agent, args)
+        demonstration, own = agent.training_state["metrics"]
+        self.assertTrue(demonstration["demonstration"])
+        self.assertEqual(demonstration["guidance_actions"], demonstration["steps"])
+        self.assertFalse(own["demonstration"])
+        self.assertEqual(own["city_strength"], 1.0)  # The column records the rival's bonus in empire mode.
+
+    def test_empire_evaluation_reports_score_cities_and_research(self):
+        args = self.empire_args("--no-save", "--episodes", "0", "--eval-episodes", "2")
+        agent = run_game.build_agent(args, random.Random(1))
+        summaries = run_game.compare_policies(agent, args, verbose=False)
+        self.assertEqual(set(summaries), {"learned", "heuristic", "random"})
+        for summary in summaries.values():
+            for name in ("average_score", "average_rival_score", "average_cities", "average_technologies"):
+                self.assertIn(name, summary)
+            self.assertEqual(summary["episodes"], 2)
+        self.assertGreater(summaries["heuristic"]["average_cities"], 0)
+        run_game.write_metrics(args.metrics_dir, [], evaluations=summaries, config=args.config)
+        payload = json.loads((args.metrics_dir / "metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["config"]["map_type"], "continents")
+
+    def test_empire_curriculum_ramps_the_rival_bonus(self):
+        args = self.empire_args("--no-save", "--difficulty", "curriculum", "--curriculum-episodes", "3")
+        run_game.build_agent(args, random.Random(1))
+        self.assertEqual([run_game.episode_config(args, episode).rival_bonus for episode in range(4)],
+                         [0.5, 0.875, 1.25, 1.25])
+        self.assertTrue(run_game.curriculum_complete(args, 2))
+
+    def test_cli_trains_and_evaluates_an_empire(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            run_game.main(["--mode", "empire", "--turn-limit", "10", "--width", "10", "--height", "9",
+                           "--episodes", "1", "--eval-episodes", "1", "--model-path", str(self.root / "cli.json"),
+                           "--metrics-dir", str(self.root / "cli"), "--log-every", "1"])
+        text = output.getvalue()
+        self.assertIn("learned: wins", text)
+        self.assertIn("score", text)
+        self.assertIsInstance(load_agent(self.root / "cli.json"), EmpireQAgent)
 
 
 if __name__ == "__main__":

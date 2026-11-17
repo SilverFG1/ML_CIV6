@@ -9,8 +9,9 @@ import random
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+import empire
 import game
-from learning_ai import AGENT_TYPES, QLearningAgent, TacticalQAgent, load_agent
+from learning_ai import AGENT_TYPES, EmpireQAgent, QLearningAgent, TacticalQAgent, load_agent
 
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
@@ -22,7 +23,16 @@ LEARNING_DEFAULTS = {
                      learning_rate_min=0.01),
     "joint": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
                   epsilon_min=0.05, state_precision=100, initial_q=-100.0),
+    "empire": dict(learning_rate=0.1, discount_factor=0.97, epsilon=1.0, epsilon_decay=0.995,
+                   epsilon_min=0.05, initial_q=0.0, learning_rate_decay=0.998, learning_rate_min=0.01),
 }
+MODES = ("siege", "empire")
+# Scenario flags that only one mode understands.
+SIEGE_SETTINGS = ("unit_count", "unit_types", "unit_strengths", "city_strength", "wall_hp", "walls", "buildings",
+                  "ranged_strength", "city_population", "build_queue", "city_position")
+EMPIRE_SETTINGS = ("rivals", "map_type", "turn_limit", "resource_density", "rival_bonus", "speed")
+# The empire curriculum ramps the rival's bonus up from this level.
+EMPIRE_CURRICULUM_START = 0.5
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 # Share of training episodes that the heuristic plays from start to finish while
 # the learner updates from every move, by learner. The joint learner keeps its
@@ -31,7 +41,7 @@ DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 # episodes, so a heuristic that plays worse than the learner stops teaching it.
 # The comparison needs DEMONSTRATION_EVIDENCE of each, so one unlucky early
 # demonstration cannot stop them.
-DEMONSTRATION_DEFAULTS = {"tactical": 0.3, "joint": 0.0}
+DEMONSTRATION_DEFAULTS = {"tactical": 0.3, "joint": 0.0, "empire": 0.3}
 DEMONSTRATION_WINDOW = 100
 DEMONSTRATION_EVIDENCE = 20
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
@@ -60,8 +70,12 @@ def parse_args(argv=None):
     parser.add_argument("--render-training", action="store_true")
     parser.add_argument("--render-delay-ms", type=int, default=0)
     parser.add_argument("--seed", type=int, help="training seed (default: 7, or checkpoint value)")
+    parser.add_argument("--mode", choices=MODES,
+                        help="siege: a squad besieges a city (default); empire: found cities, grow, research and "
+                             "fight a rival civilization (a checkpoint keeps its own)")
     parser.add_argument("--agent", choices=tuple(AGENT_TYPES),
-                        help="learner for a new model (default: tactical; a checkpoint keeps its own)")
+                        help="learner for a new model (default: tactical for sieges, empire for empires; "
+                             "a checkpoint keeps its own)")
     for flag, kind in (("learning-rate", float), ("discount-factor", float), ("epsilon", float),
                        ("epsilon-decay", float), ("epsilon-min", float), ("state-precision", int),
                        ("initial-q", float)):
@@ -108,12 +122,26 @@ def parse_args(argv=None):
     parser.add_argument("--unit-types", choices=game.UNIT_TYPES, nargs="+")
     parser.add_argument("--difficulty", choices=tuple(DIFFICULTY_STRENGTHS))
     parser.add_argument("--curriculum-episodes", type=int,
-                        help="ramp city strength from 18 to selected difficulty over N absolute episodes")
+                        help="ramp city strength from 18 (siege) or the rival's bonus from "
+                             f"{EMPIRE_CURRICULUM_START} (empire) to the selected difficulty over N absolute episodes")
+    empire_group = parser.add_argument_group("empire mode")
+    empire_group.add_argument("--rivals", type=int, choices=(0, 1), help="rival civilizations (default: 1)")
+    empire_group.add_argument("--map-type", choices=empire.MAP_TYPES,
+                              help="continents: one landmass; islands: one island each (default: continents)")
+    empire_group.add_argument("--turn-limit", type=int,
+                              help="turns before the higher score wins (10-500, default: 100)")
+    empire_group.add_argument("--speed", choices=tuple(empire.SPEEDS),
+                              help="Civ VI game speed scaling production, research, growth and border costs "
+                                   "(default: online, half of standard)")
+    empire_group.add_argument("--resource-density", type=float,
+                              help="share of tiles with a resource (0-0.5, default: 0.15)")
+    empire_group.add_argument("--rival-bonus", type=float,
+                              help="rival's production, science and gold multiplier (default: set by --difficulty)")
     args = parser.parse_args(argv)
     for name in ("episodes", "eval_episodes", "checkpoint_every", "log_every", "render_delay_ms"):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be non-negative")
-    for name in ("max_steps", "state_precision", "width", "height", "validation_episodes"):
+    for name in ("max_steps", "state_precision", "width", "height", "validation_episodes", "turn_limit"):
         value = getattr(args, name)
         if value is not None and value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -121,7 +149,7 @@ def parse_args(argv=None):
         parser.error("--curriculum-episodes must be non-negative")
     for name in ("epsilon", "epsilon_decay", "epsilon_min", "guided_exploration", "discount_factor",
                  "mountain_density", "forest_density", "hills_density", "water_density",
-                 "learning_rate_decay", "learning_rate_min", "demonstrations"):
+                 "learning_rate_decay", "learning_rate_min", "demonstrations", "resource_density"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 1:
             parser.error(f"--{name.replace('_', '-')} must lie between 0 and 1")
@@ -169,6 +197,43 @@ def config_from_args(args, saved=None):
     return game.GameConfig(**values)
 
 
+def empire_config_from_args(args, saved=None):
+    """The empire counterpart of config_from_args."""
+    saved = saved or {}
+    values = asdict(empire.EmpireConfig())
+    values.update(saved)
+    explicit = {}
+    for name in ("width", "height", "rivals", "map_type", "turn_limit", "land_types", "hills_density",
+                 "forest_density", "mountain_density", "water_density", "river_count", "resource_density",
+                 "rival_bonus", "speed", "difficulty"):
+        value = getattr(args, name)
+        if value is not None:
+            explicit[name] = tuple(value) if name == "land_types" else value
+    if args.difficulty is not None and args.rival_bonus is None:
+        explicit["rival_bonus"] = empire.DIFFICULTY_BONUS[args.difficulty]
+    for name, value in explicit.items():
+        old = values.get(name)
+        if name == "land_types" and old is not None:
+            old = tuple(old)
+        if saved and old != value:
+            raise ValueError(f"--{name.replace('_', '-')} differs from the checkpoint; use --fresh for a new scenario")
+        values[name] = value
+    values["land_types"] = tuple(values["land_types"])
+    return empire.EmpireConfig(**values)
+
+
+def make_env(config, seed=None, render=False, observation="tactical"):
+    """The siege Game or the EmpireGame, chosen by the scenario's configuration."""
+    if isinstance(config, empire.EmpireConfig):
+        return empire.EmpireGame(config=config, seed=seed, render=render)
+    return game.Game(config=config, seed=seed, ml_ai=True, render=render, observation=observation)
+
+
+def difficulty_level(config):
+    """What the training log records as an episode's difficulty: the city's strength, or the rival's bonus."""
+    return config.rival_bonus if isinstance(config, empire.EmpireConfig) else config.city_strength
+
+
 def _restore_setting(args, saved, name, default):
     previous = saved.get(name, default)
     value = getattr(args, name)
@@ -186,6 +251,8 @@ def _validate_training_state(agent):
                 'no_guidance', 'episodes_completed', 'checkpoint_episode', 'metrics')
     if any(name not in state for name in required):
         raise ValueError('Checkpoint is missing training progress; use --fresh')
+    if state.get('mode', 'siege') not in MODES:
+        raise ValueError('Checkpoint mode is invalid')
     if not isinstance(state['config'], dict):
         raise ValueError('Checkpoint config must be an object')
     for name, minimum in [('seed', None), ('max_steps', 1), ('curriculum_episodes', 0),
@@ -242,8 +309,10 @@ def _validate_training_state(agent):
 def build_agent(args, rng):
     """Load or create the learner and settle the run's scenario and settings.
 
-    A checkpoint keeps its learner; a new model uses --agent (default tactical).
-    Sets args.config, args.agent, and args.observation for later environments.
+    A checkpoint keeps its mode and learner; a new model uses --mode (default
+    siege) and --agent (default tactical for sieges, empire for empires). Sets
+    args.mode, args.config, args.agent, and args.observation for later
+    environments.
     """
     loaded = args.model_path.exists() and not args.fresh
     agent = load_agent(args.model_path, rng=rng) if loaded else None
@@ -253,19 +322,40 @@ def build_agent(args, rng):
         for row in agent.training_state.get("metrics", []):
             row.setdefault("demonstration", False)
     saved = agent.training_state if loaded else {}
-    kind = agent.agent_kind if loaded else args.agent or "tactical"
+    if loaded:
+        mode = saved.get("mode", "empire" if agent.agent_kind == "empire" else "siege")
+    else:
+        mode = args.mode or ("empire" if args.agent == "empire" else "siege")
+    if args.mode is not None and args.mode != mode:
+        raise ValueError(f"--mode {args.mode} differs from the checkpoint's {mode} mode; use --fresh")
+    args.mode = mode
+    kind = agent.agent_kind if loaded else args.agent or ("empire" if mode == "empire" else "tactical")
     if args.agent is not None and args.agent != kind:
         raise ValueError(f"--agent {args.agent} differs from the checkpoint's {kind} learner; use --fresh")
-    if kind == "tactical" and args.state_precision is not None:
+    if (mode == "empire") != (kind == "empire"):
+        raise ValueError("the empire learner plays only --mode empire, and --mode empire needs the empire learner")
+    wrong = [name for name in (SIEGE_SETTINGS if mode == "empire" else EMPIRE_SETTINGS)
+             if getattr(args, name) is not None]
+    if mode == "empire" and (args.economy or args.no_city_healing):
+        wrong.append("economy" if args.economy else "no_city_healing")
+    if wrong:
+        raise ValueError(f"--{wrong[0].replace('_', '-')} does not apply to --mode {mode}")
+    if kind != "joint" and args.state_precision is not None:
         raise ValueError("--state-precision applies only to the joint learner; use --fresh --agent joint")
-    tactical_only = [flag for flag in ("shaping", "learning_rate_decay", "learning_rate_min")
-                     if getattr(args, flag) is not None]
-    if kind == "joint" and tactical_only:
-        raise ValueError(f"--{tactical_only[0].replace('_', '-')} applies only to the tactical learner")
+    if kind != "tactical" and args.shaping is not None:
+        raise ValueError("--shaping applies only to the tactical learner")
+    annealing = [flag for flag in ("learning_rate_decay", "learning_rate_min") if getattr(args, flag) is not None]
+    if kind == "joint" and annealing:
+        raise ValueError(f"--{annealing[0].replace('_', '-')} applies only to the tactical and empire learners")
     args.agent = kind
     args.observation = AGENT_TYPES[kind].observation_mode
+    try:
+        config = (empire_config_from_args(args, saved.get("config")) if mode == "empire"
+                  else config_from_args(args, saved.get("config")))
+    except (TypeError, KeyError) as error:
+        raise ValueError(f'Invalid checkpoint scenario: {error}') from error
     _restore_setting(args, saved, "seed", 7)
-    _restore_setting(args, saved, "max_steps", 80)
+    _restore_setting(args, saved, "max_steps", config.turn_limit if mode == "empire" else 80)
     difficulty = args.difficulty or saved.get('config', {}).get('difficulty', 'normal')
     _restore_setting(args, saved, "curriculum_episodes", 1000 if difficulty == 'curriculum' else 0)
     _restore_setting(args, saved, "guided_exploration", 0.35)
@@ -280,14 +370,15 @@ def build_agent(args, rng):
                      0.0 if saved or args.no_guidance else DEMONSTRATION_DEFAULTS[kind])
     if args.no_guidance and args.demonstrations:
         raise ValueError("--demonstrations are played by the heuristic; they cannot be combined with --no-guidance")
+    env = make_env(config, seed=args.seed, observation=args.observation)
     try:
-        config = config_from_args(args, saved.get("config"))
-    except (TypeError, KeyError) as error:
-        raise ValueError(f'Invalid checkpoint scenario: {error}') from error
-    env = game.Game(config=config, seed=args.seed, ml_ai=True, render=False, observation=args.observation)
-    try:
-        schema, size, action_count = env.observation_schema, len(env.reset(seed=args.seed)), env.action_count
-        command_counts = [len(directions) for directions in env.unit_directions]
+        observation = env.reset(seed=args.seed)
+        schema = env.observation_schema
+        if mode == "empire":
+            size = action_count = command_counts = None
+        else:
+            size, action_count = len(observation), env.action_count
+            command_counts = [len(directions) for directions in env.unit_directions]
     finally:
         env.close()
     if loaded:
@@ -296,8 +387,9 @@ def build_agent(args, rng):
         if args.state_precision is not None and args.state_precision != agent.state_precision:
             raise ValueError("State precision cannot change on resume; use --fresh")
         adjustable = ("learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min", "initial_q")
-        tactical = ("shaping", "learning_rate_decay", "learning_rate_min")
-        for name in adjustable + (tactical if kind == "tactical" else ()):
+        extra = {"tactical": ("shaping", "learning_rate_decay", "learning_rate_min"),
+                 "empire": ("learning_rate_decay", "learning_rate_min")}.get(kind, ())
+        for name in adjustable + extra:
             if getattr(args, name) is not None:
                 setattr(agent, name, getattr(args, name))
     else:
@@ -306,6 +398,8 @@ def build_agent(args, rng):
                    for name, default in LEARNING_DEFAULTS[kind].items()}
         if kind == "tactical":
             agent = TacticalQAgent(command_counts, rng=rng, observation_schema=schema, **options)
+        elif kind == "empire":
+            agent = EmpireQAgent(rng=rng, observation_schema=schema, **options)
         else:
             agent = QLearningAgent(action_count, rng=rng, observation_schema=schema, observation_size=size, **options)
     args.config = config
@@ -321,6 +415,9 @@ def episode_config(args, absolute_episode):
     if not args.curriculum_episodes:
         return args.config
     progress = 1.0 if args.curriculum_episodes == 1 else min(1.0, absolute_episode / (args.curriculum_episodes - 1))
+    if isinstance(args.config, empire.EmpireConfig):
+        start = min(EMPIRE_CURRICULUM_START, args.config.rival_bonus)
+        return replace(args.config, rival_bonus=start + (args.config.rival_bonus - start) * progress)
     start_strength = min(18.0, args.config.city_strength)
     return replace(args.config, city_strength=start_strength + (args.config.city_strength - start_strength) * progress)
 
@@ -385,7 +482,9 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
         if policy == "heuristic":
             action, source = env.guided_action(policy_rng), "guided"
         elif policy == "random":
-            action, source = policy_rng.choice(valid), "random"
+            # The empire game picks one random legal option per decision.
+            action = env.random_action(policy_rng) if hasattr(env, "random_action") else policy_rng.choice(valid)
+            source = "random"
         else:
             fallback = env.guided_action(policy_rng) if use_guidance else None
             action = agent.choose_action(state, explore=train, valid_actions=valid,
@@ -430,8 +529,7 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
     original_size = agent.observation_size
     try:
         for policy in policies:
-            env = game.Game(config=config, seed=seed, ml_ai=True, render=render,
-                            observation=agent.observation_mode)
+            env = make_env(config, seed=seed, render=render, observation=agent.observation_mode)
             rows = []
             try:
                 for index in range(count):
@@ -440,7 +538,8 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                     result = run_episode(env, agent, index, args.max_steps, train=False,
                                          seed=seed + index, rng=local_rng, policy=policy,
                                          use_guidance=policy == "guided", render_delay_ms=args.render_delay_ms)
-                    rows.append({"seed": seed + index, **asdict(result)})
+                    rows.append({"seed": seed + index, **asdict(result),
+                                 **(env.summary() if hasattr(env, "summary") else {})})
                     if verbose:
                         print(f"{policy} eval {index + 1}/{count} | reward {result.reward:.2f} | "
                               f"{result.outcome} | steps {result.steps}")
@@ -460,10 +559,16 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 "average_steps": sum(row["steps"] for row in rows) / completed if completed else 0.0,
                 "episodes_detail": rows,
             }
+            if hasattr(env, "summary") and completed:
+                # Empire games also report the averages of their end-of-game summaries.
+                for name in env.summary():
+                    summaries[policy][f"average_{name}"] = sum(row[name] for row in rows) / completed
             if verbose:
                 summary = summaries[policy]
+                extra = "".join(f", {name[8:].replace('_', ' ')} {value:.1f}" for name, value in summary.items()
+                                if name.startswith("average_") and name not in ("average_reward", "average_steps"))
                 print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}, "
-                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}")
+                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}{extra}")
             if summaries[policy]["quits"]:
                 break
     finally:
@@ -475,7 +580,7 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
 
 def _checkpoint_state(agent, args, rows, best_score=None):
     state = dict(agent.training_state)
-    state.update(config=asdict(args.config), seed=args.seed, max_steps=args.max_steps,
+    state.update(mode=args.mode, config=asdict(args.config), seed=args.seed, max_steps=args.max_steps,
                  curriculum_episodes=args.curriculum_episodes, guided_exploration=args.guided_exploration,
                  demonstrations=args.demonstrations,
                  validation_episodes=args.validation_episodes, validation_seed=args.validation_seed,
@@ -523,8 +628,8 @@ def train_agent(agent, args):
         episode = start_episode + offset
         config = episode_config(args, episode)
         demonstration = is_demonstration(args, episode) and demonstrations_ahead(recent)
-        env = game.Game(config=config, seed=args.seed + episode, ml_ai=True, render=args.render_training,
-                        observation=agent.observation_mode)
+        env = make_env(config, seed=args.seed + episode, render=args.render_training,
+                       observation=agent.observation_mode)
         try:
             result = run_episode(env, agent, episode, args.max_steps, train=True,
                                  seed=args.seed + episode, render_delay_ms=args.render_delay_ms,
@@ -544,7 +649,7 @@ def train_agent(agent, args):
                          outcome=result.outcome, steps=result.steps, epsilon=agent.epsilon,
                          guidance_actions=result.guidance_actions, random_actions=result.random_actions,
                          policy_actions=result.policy_actions, q_table_size=len(agent.q_table),
-                         city_strength=config.city_strength, demonstration=demonstration))
+                         city_strength=difficulty_level(config), demonstration=demonstration))
         _checkpoint_state(agent, args, rows)
         if args.log_every and (offset == 0 or (episode + 1) % args.log_every == 0):
             window = rewards[-args.log_every:]
@@ -647,7 +752,7 @@ def main(argv=None):
                      'episodes_trained', 'observation_schema')
                     if hasattr(agent, name)}
         settings.update({name: getattr(args, name) for name in
-                         ('seed', 'max_steps', 'eval_seed', 'eval_episodes', 'eval_policies',
+                         ('mode', 'seed', 'max_steps', 'eval_seed', 'eval_episodes', 'eval_policies',
                           'eval_guidance', 'validation_seed', 'validation_episodes',
                           'curriculum_episodes', 'guided_exploration', 'demonstrations', 'no_guidance')})
         write_metrics(args.metrics_dir, rows, evaluations=evaluations, config=args.config, settings=settings)

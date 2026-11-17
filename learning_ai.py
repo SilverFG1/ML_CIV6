@@ -2,6 +2,8 @@
 
 TacticalQAgent is the squad learner trained by run_game.py. QLearningAgent is
 the original joint-action Q-table over raw observations, kept as a baseline.
+EmpireQAgent plays the empire game (empire.py), where every city, unit and the
+research queue decide each turn.
 """
 
 import collections
@@ -15,12 +17,14 @@ from pathlib import Path
 
 import numpy as np
 
+from empire import DECISION_KINDS
 from game import (COMMANDS, TACTICAL_FEATURE_LIMITS, TACTICAL_FEATURES, TACTICAL_FIRST_TACTIC,
                   TACTICAL_HEADER, TACTICAL_UNIT_WIDTH, TACTICS)
 
 
 CHECKPOINT_VERSION = 2
 TACTICAL_CHECKPOINT_VERSION = 3
+EMPIRE_CHECKPOINT_VERSION = 1
 # Longest loop of consecutive transitions the tactical learner recognizes.
 LOOP_LIMIT = 4
 # A unit's value for a tactic is the sum of one table entry per group: the full
@@ -33,6 +37,26 @@ TILE_GROUPS = (
     ("unit_type", "distance", "risk", "city_health", "walls", "ram_ready", "city_ranged", "city_heals"),
     ("unit_type", "distance", "health", "city_ranged", "city_heals"),
 )
+
+# Tile groups of the empire learner, by decision kind. Each kind's first group
+# is every feature; the others are coarser subsets that share what is learned
+# between situations that differ only in the features they leave out.
+EMPIRE_TILE_GROUPS = {
+    "research": (("stage", "technologies"), ("technologies", "cities", "coastal", "separated"),
+                 ("technologies", "threat", "balance")),
+    "city": (("idle", "stage", "population", "housing", "sites", "settlers", "cities"),
+             ("idle", "threat", "defenders", "walls", "capital", "army"),
+             ("idle", "production", "builders", "food", "amenities", "population"),
+             ("idle", "stage", "coastal", "cities", "army")),
+    "settler": (("here", "best", "distance"), ("stage", "cities", "threat", "escort")),
+    "builder": (("here", "targets", "distance"), ("stage", "charges", "threat")),
+    "land": (("unit_type", "health", "contact", "odds"),
+             ("unit_type", "threat", "post", "territory", "escort"),
+             ("stage", "unit_type", "enemy_city", "balance", "health")),
+    "naval": (("unit_type", "health", "contact", "odds"), ("stage", "threat", "enemy_city", "balance")),
+    "trader": (),
+}
+EMPIRE_TILE_GROUPS = {kind: (DECISION_KINDS[kind].features,) + groups for kind, groups in EMPIRE_TILE_GROUPS.items()}
 
 
 def _integer(value, name, minimum=0):
@@ -823,7 +847,389 @@ class TacticalQAgent:
         return agent
 
 
-AGENT_TYPES = {"tactical": TacticalQAgent, "joint": QLearningAgent}
+class EmpireQAgent:
+    """Tabular Q-learning for a whole civilization in the empire game.
+
+    An observation is a tuple of empire.Decision records: one for the research
+    queue, each city and each unit, with integer features and the legal option
+    indices. An action is one option per decision. Every decision estimates
+    the civilization's discounted return, as independent learners sharing one
+    target would: the turn's reward plus the discounted mean, over the next
+    turn's decisions, of each decision's best legal value. A decision's own
+    entity is left out of that mean when it decides again next turn, so a unit
+    that holds still cannot bootstrap from its own unchanged estimate and keep
+    an overestimate alive. A sum of per-entity values, as in the tactical
+    learner's value decomposition, does not suit a set of entities that
+    changes size: it would credit training any unit with one more term and
+    blame a builder for spending its last charge or a settler for founding a
+    city.
+
+    A decision's value for option o is V(f) + A(f, o): a situation value V that
+    every visit updates and an advantage A that only choosing o updates, each a
+    sum of tile-coded table rows over EMPIRE_TILE_GROUPS[kind]. The value level
+    therefore follows the situation even for options seldom taken, and options
+    are ranked by advantage alone. A new row starts V at its share of the
+    target that created it and every advantage at -untried_penalty (shared over
+    the groups), so the learner keeps to options it has evidence for, such as
+    the heuristic's in demonstrations, until its own exploration shows another
+    option is better.
+
+    Exploration is per decision: each explores with probability epsilon, using
+    the heuristic's option for a guided share of those, so a turn mixes
+    exploratory and greedy choices instead of randomizing a whole empire at
+    once. A decision whose situation has never been learned at all follows the
+    heuristic when one is supplied. Each update moves V and the chosen
+    advantage learning_rate of the way to their targets, and the learning rate
+    anneals as in TacticalQAgent.
+    """
+
+    agent_kind = "empire"
+    observation_mode = "empire"
+
+    def __init__(
+        self,
+        learning_rate=0.1,
+        discount_factor=0.97,
+        epsilon=1.0,
+        epsilon_decay=0.995,
+        epsilon_min=0.05,
+        initial_q=0.0,
+        learning_rate_decay=0.998,
+        learning_rate_min=0.01,
+        untried_penalty=0.5,
+        rng=None,
+        observation_schema=None,
+    ):
+        self.learning_rate = _finite(learning_rate, "learning_rate", 0.0, 1.0)
+        self.discount_factor = _finite(discount_factor, "discount_factor", 0.0, 1.0)
+        self.epsilon = _finite(epsilon, "epsilon", 0.0, 1.0)
+        self.epsilon_decay = _finite(epsilon_decay, "epsilon_decay", 0.0, 1.0)
+        self.epsilon_min = _finite(epsilon_min, "epsilon_min", 0.0, 1.0)
+        self.initial_q = _finite(initial_q, "initial_q")
+        self.learning_rate_decay = _finite(learning_rate_decay, "learning_rate_decay", 0.0, 1.0)
+        self.learning_rate_min = _finite(learning_rate_min, "learning_rate_min", 0.0, 1.0)
+        self.untried_penalty = _finite(untried_penalty, "untried_penalty", 0.0, 100.0)
+        self.rng = rng if rng is not None else random.Random()
+        if not isinstance(self.rng, random.Random):
+            raise ValueError("rng must be a random.Random instance")
+        self.observation_schema = observation_schema
+        self.observation_size = None
+        self.action_count = None
+        # Each row holds the situation value V followed by one advantage per option.
+        self.q_table = {}
+        self.last_action_source = None
+        self.episodes_trained = 0
+        self.training_state = {}
+        self._groups = {kind: tuple(frozenset(DECISION_KINDS[kind].features.index(name) for name in group)
+                                    for group in groups) for kind, groups in EMPIRE_TILE_GROUPS.items()}
+        self._validate_configuration()
+
+    def _validate_configuration(self):
+        for name in ("learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min",
+                     "learning_rate_decay", "learning_rate_min"):
+            _finite(getattr(self, name), name, 0.0, 1.0)
+        _finite(self.initial_q, "initial_q")
+        _finite(self.untried_penalty, "untried_penalty", 0.0, 100.0)
+        _integer(self.episodes_trained, "episodes_trained")
+        if self.observation_schema is not None and (
+            not isinstance(self.observation_schema, str) or not self.observation_schema.strip()
+        ):
+            raise ValueError("observation_schema must be a nonempty string or None")
+        if not isinstance(self.training_state, dict):
+            raise ValueError("training_state must be a dictionary")
+
+    def _parse(self, observation, valid_actions=None):
+        """Validate decisions and return (kind, features, legal options) for each."""
+        return [(kind, features, legal) for kind, _, features, legal in self._decode(observation, valid_actions)]
+
+    def _decode(self, observation, valid_actions=None):
+        """Validate decisions and return (kind, entity, features, legal options) for each."""
+        if isinstance(observation, (str, bytes)):
+            raise ValueError("observation must be a sequence of decisions")
+        try:
+            decisions = list(observation)
+        except TypeError as exc:
+            raise ValueError("observation must be a sequence of decisions") from exc
+        if valid_actions is not None:
+            valid_actions = list(valid_actions)
+            if len(valid_actions) != len(decisions):
+                raise ValueError("valid_actions must hold one option list per decision")
+        parsed = []
+        for index, decision in enumerate(decisions):
+            try:
+                kind, entity, features, valid = decision
+            except (TypeError, ValueError) as exc:
+                raise ValueError("each decision must hold a kind, entity, features and valid options") from exc
+            spec = DECISION_KINDS.get(kind) if isinstance(kind, str) else None
+            if spec is None:
+                raise ValueError(f"unknown decision kind {kind!r}")
+            features = tuple(features)
+            if len(features) != len(spec.features) or any(
+                    isinstance(value, bool) or not isinstance(value, numbers.Integral) or not 0 <= value <= limit
+                    for value, limit in zip(features, spec.limits)):
+                raise ValueError(f"{kind} decision features are out of range")
+            legal = valid if valid_actions is None else valid_actions[index]
+            legal = tuple(sorted({self._option(kind, option) for option in legal}))
+            if not legal:
+                raise ValueError(f"{kind} decision has no legal option")
+            parsed.append((kind, entity, tuple(int(value) for value in features), legal))
+        return parsed
+
+    @staticmethod
+    def _option(kind, option):
+        option = _integer(option, f"{kind} option")
+        if option >= len(DECISION_KINDS[kind].options):
+            raise ValueError(f"{kind} option {option} is out of range")
+        return option
+
+    def _tile_keys(self, kind, features):
+        return [(kind, group, *(value if index in members else -1 for index, value in enumerate(features)))
+                for group, members in enumerate(self._groups[kind])]
+
+    def _parts(self, kind, features):
+        """The situation value and the advantage of every option, summed over tile groups.
+
+        Rows not yet in the table count as the initial value with untried advantages.
+        """
+        groups = len(self._groups[kind])
+        value, advantages = 0.0, np.zeros(len(DECISION_KINDS[kind].options))
+        for key in self._tile_keys(kind, features):
+            row = self.q_table.get(key)
+            if row is None:
+                value += self.initial_q / groups
+                advantages -= self.untried_penalty / groups
+            else:
+                value += row[0]
+                advantages += row[1:]
+        return value, advantages
+
+    def _values(self, kind, features):
+        value, advantages = self._parts(kind, features)
+        return value + advantages
+
+    def _unseen(self, kind, features):
+        return not any(key in self.q_table for key in self._tile_keys(kind, features))
+
+    def _best(self, kind, features, legal):
+        values = self._values(kind, features)
+        best = max(values[option] for option in legal)
+        return [option for option in legal if values[option] == best], best
+
+    def choose_action(
+        self,
+        observation,
+        explore=True,
+        fallback_action=None,
+        guided_exploration_rate=0.0,
+        valid_actions=None,
+    ):
+        """Choose one legal option per decision by exploration, guidance or greedy value."""
+        self._validate_configuration()
+        if not isinstance(explore, (bool, np.bool_)):
+            raise ValueError("explore must be a boolean")
+        guided_rate = _finite(guided_exploration_rate, "guided_exploration_rate", 0.0, 1.0)
+        parsed = self._parse(observation, valid_actions)
+        if fallback_action is not None:
+            fallback_action = list(fallback_action)
+            if len(fallback_action) != len(parsed):
+                raise ValueError("fallback_action must hold one option per decision")
+        sources = set()
+        action = []
+        for index, (kind, features, legal) in enumerate(parsed):
+            fallback = None
+            if fallback_action is not None and fallback_action[index] in legal:
+                fallback = fallback_action[index]
+            if explore and self.rng.random() < self.epsilon:
+                if fallback is not None and self.rng.random() < guided_rate:
+                    sources.add("guided")
+                    action.append(fallback)
+                else:
+                    sources.add("random")
+                    action.append(int(self.rng.choice(legal)))
+            elif fallback is not None and self._unseen(kind, features):
+                sources.add("guided")
+                action.append(fallback)
+            else:
+                best, _ = self._best(kind, features, legal)
+                action.append(int(self.rng.choice(best)))
+        self.last_action_source = "random" if "random" in sources else "guided" if sources else "policy"
+        return tuple(action)
+
+    def value(self, observation):
+        """The mean, over decisions, of each decision's best legal value (zero without decisions)."""
+        parsed = self._parse(observation)
+        if not parsed:
+            return 0.0
+        return float(sum(self._best(kind, features, legal)[1] for kind, features, legal in parsed) / len(parsed))
+
+    def learn(self, observation, action, reward, next_observation, done, next_valid_actions=None):
+        """Move every decision's value for its chosen option toward the shared one-step target.
+
+        The target bootstraps from the next turn's decisions unless the game
+        ended. A turn cut off by a turn limit bootstraps too.
+        """
+        self._validate_configuration()
+        reward = _finite(reward, "reward")
+        if not isinstance(done, (bool, np.bool_)):
+            raise ValueError("done must be a boolean")
+        decisions = self._decode(observation)
+        if isinstance(action, (str, bytes)) or len(action) != len(decisions):
+            raise ValueError("action must hold one option per decision")
+        following = self._decode(next_observation, None if done or next_valid_actions is None else next_valid_actions)
+        chosen = []
+        for (kind, entity, features, legal), option in zip(decisions, action):
+            option = self._option(kind, option)
+            if option not in legal:
+                raise ValueError(f"option {option} is not legal for the {kind} decision")
+            chosen.append((kind, entity, features, option))
+        successors, total = {}, 0.0
+        if not done:
+            for kind, entity, features, legal in following:
+                best = self._best(kind, features, legal)[1]
+                successors[(kind, entity)] = best
+                total += best
+        rate = self.learning_rate
+        for kind, entity, features, option in chosen:
+            target = reward
+            if successors:
+                own = successors.get((kind, entity))
+                if own is not None and len(successors) > 1:
+                    target += self.discount_factor * (total - own) / (len(successors) - 1)
+                else:
+                    target += self.discount_factor * total / len(successors)
+            if not math.isfinite(target):
+                raise ValueError("Q-learning update produced a nonfinite value")
+            keys = self._tile_keys(kind, features)
+            groups = len(keys)
+            fresh = [key for key in keys if key not in self.q_table]
+            if fresh:
+                # New rows bring the situation value to the target and mark every option untried.
+                known = sum(self.q_table[key][0] for key in keys if key in self.q_table)
+                for key in fresh:
+                    row = np.full(1 + len(DECISION_KINDS[kind].options), -self.untried_penalty / groups)
+                    row[0] = (target - known) / len(fresh)
+                    self.q_table[key] = row
+            value, advantages = self._parts(kind, features)
+            value_step = rate * (target - value) / groups
+            advantage_step = rate * (target - value - advantages[option]) / groups
+            for key in keys:
+                row = self.q_table[key]
+                row[0] += value_step
+                row[1 + option] += advantage_step
+
+    def finish_episode(self, anneal=True):
+        """Record completed training, decay exploration and, with anneal, the learning rate."""
+        self._validate_configuration()
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        if anneal:
+            self.learning_rate = max(min(self.learning_rate, self.learning_rate_min),
+                                     self.learning_rate * self.learning_rate_decay)
+        self.episodes_trained += 1
+
+    def _validate_key(self, key):
+        if not isinstance(key, tuple) or len(key) < 2 or key[0] not in DECISION_KINDS:
+            raise ValueError("Q-table states must start with a decision kind")
+        kind, group, features = key[0], key[1], key[2:]
+        spec = DECISION_KINDS[kind]
+        if isinstance(group, bool) or not isinstance(group, int) or not 0 <= group < len(self._groups[kind]):
+            raise ValueError("Q-table state has an unknown tile group")
+        if len(features) != len(spec.features):
+            raise ValueError("Q-table state has the wrong number of features")
+        for index, (value, limit) in enumerate(zip(features, spec.limits)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("Q-table state features must be integers")
+            if index in self._groups[kind][group]:
+                if not 0 <= value <= limit:
+                    raise ValueError("Q-table state feature is out of range")
+            elif value != -1:
+                raise ValueError("Q-table state sets a feature outside its tile group")
+
+    @staticmethod
+    def encoding():
+        """The decision kinds and tile groups a checkpoint must match."""
+        return {kind: {"features": list(spec.features), "limits": list(spec.limits), "options": list(spec.options),
+                       "tile_groups": [list(group) for group in EMPIRE_TILE_GROUPS[kind]]}
+                for kind, spec in DECISION_KINDS.items()}
+
+    def _checkpoint_payload(self):
+        self._validate_configuration()
+        _validate_metadata(self.training_state)
+        entries = []
+        for key, values in self.q_table.items():
+            self._validate_key(key)
+            checked = np.asarray(values, dtype=float)
+            if checked.shape != (1 + len(DECISION_KINDS[key[0]].options),) or not np.all(np.isfinite(checked)):
+                raise ValueError("Q-table rows must hold a finite value and one finite advantage per option")
+            entries.append({"state": list(key), "values": checked.tolist()})
+        return {
+            "format_version": EMPIRE_CHECKPOINT_VERSION,
+            "agent": self.agent_kind,
+            "encoding": self.encoding(),
+            "learning_rate": self.learning_rate,
+            "discount_factor": self.discount_factor,
+            "epsilon": self.epsilon,
+            "epsilon_decay": self.epsilon_decay,
+            "epsilon_min": self.epsilon_min,
+            "initial_q": self.initial_q,
+            "learning_rate_decay": self.learning_rate_decay,
+            "learning_rate_min": self.learning_rate_min,
+            "untried_penalty": self.untried_penalty,
+            "episodes_trained": self.episodes_trained,
+            "observation_schema": self.observation_schema,
+            "training_state": self.training_state,
+            "rng_state": self.rng.getstate(),
+            "q_table": entries,
+        }
+
+    def save(self, path):
+        """Atomically replace a versioned JSON checkpoint, including RNG state."""
+        _save_payload(self._checkpoint_payload(), path)
+
+    @classmethod
+    def load(cls, path, rng=None):
+        """Load and validate an empire checkpoint."""
+        return _restore(cls, _read_checkpoint(path), rng)
+
+    @classmethod
+    def _load_payload(cls, payload, rng):
+        if not isinstance(payload, dict):
+            raise ValueError("root must be a JSON object")
+        version = payload.get("format_version")
+        if isinstance(version, bool) or version != EMPIRE_CHECKPOINT_VERSION or payload.get("agent") != cls.agent_kind:
+            raise ValueError("not an empire agent checkpoint")
+        required = ("encoding", "learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min",
+                    "initial_q", "learning_rate_decay", "learning_rate_min", "untried_penalty", "episodes_trained",
+                    "observation_schema", "training_state", "rng_state", "q_table")
+        missing = [name for name in required if name not in payload]
+        if missing:
+            raise ValueError(f"missing required fields: {', '.join(missing)}")
+        if payload["encoding"] != cls.encoding():
+            raise ValueError("checkpoint uses a different empire encoding; retrain with --fresh")
+        agent = cls(
+            learning_rate=payload["learning_rate"], discount_factor=payload["discount_factor"],
+            epsilon=payload["epsilon"], epsilon_decay=payload["epsilon_decay"], epsilon_min=payload["epsilon_min"],
+            initial_q=payload["initial_q"], learning_rate_decay=payload["learning_rate_decay"],
+            learning_rate_min=payload["learning_rate_min"], untried_penalty=payload["untried_penalty"], rng=rng,
+            observation_schema=payload["observation_schema"],
+        )
+        agent.episodes_trained = _integer(payload["episodes_trained"], "episodes_trained")
+        agent.training_state = payload["training_state"]
+        rows = payload["q_table"]
+        if not isinstance(rows, list):
+            raise ValueError("q_table must be a list")
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("state"), list):
+                raise ValueError("each Q-table row must contain a state list and values list")
+            key = tuple(row["state"])
+            if key in agent.q_table:
+                raise ValueError("duplicate Q-table state")
+            agent.q_table[key] = np.asarray(row["values"], dtype=float)
+        agent._checkpoint_payload()
+        _restore_rng(agent, payload["rng_state"])
+        return agent
+
+
+AGENT_TYPES = {"tactical": TacticalQAgent, "joint": QLearningAgent, "empire": EmpireQAgent}
 
 
 def load_agent(path, rng=None):

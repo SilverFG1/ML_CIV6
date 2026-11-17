@@ -4,7 +4,7 @@ import math
 import time
 
 import constants
-from class_hex import direction_between
+from class_hex import direction_between, neighbor_positions
 
 # Warriors share the plain unit sprite; other types get a short coloured label.
 UNIT_LABELS = {
@@ -48,7 +48,7 @@ class Renderer:
         self.margin = 24
         width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
         # Text panel under the map; the economy adds a line or two.
-        self.panel_height = 118 + (44 if env.config.economy else 0)
+        self.panel_height = self._panel_height()
         height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + self.panel_height
         self.surface = pygame.display.set_mode((width, height))
         pygame.display.set_caption('ML_CIV6 — training and evaluation')
@@ -64,6 +64,9 @@ class Renderer:
         for name, path in [('unit', 'data/Otter_Warrior.png'), ('city', 'data/Ottertopia.png')]:
             loaded = pygame.image.load(constants.resource_path(path)).convert_alpha()
             self.images[name] = pygame.transform.smoothscale(loaded, (self.size, self.size))
+
+    def _panel_height(self):
+        return 118 + (44 if self.env.config.economy else 0)
 
     def _position(self, position):
         x, y = position
@@ -338,3 +341,136 @@ class Renderer:
         self._open = False
         self.pygame.display.quit()
         self.pygame.font.quit()
+
+
+PLAYER_COLORS = ((70, 150, 235), (225, 80, 70))
+ROAD_COLOR = (150, 112, 70)
+RESOURCE_COLORS = {'bonus': (240, 240, 240), 'strategic': (235, 120, 110), 'luxury': (205, 150, 245)}
+IMPROVEMENT_LABELS = {'farm': 'F', 'mine': 'M', 'quarry': 'Q', 'pasture': 'P', 'plantation': 'Pl',
+                      'fishing_boats': 'B'}
+EMPIRE_UNIT_LABELS = {'warrior': 'WAR', 'slinger': 'SLG', 'archer': 'ARC', 'spearman': 'SPR',
+                      'heavy_chariot': 'CHR', 'horseman': 'HRS', 'swordsman': 'SWD', 'battering_ram': 'RAM',
+                      'galley': 'GAL', 'quadrireme': 'QDR', 'settler': 'SET', 'builder': 'BLD', 'trader': 'TRD'}
+
+
+class EmpireRenderer(Renderer):
+    """Draws an EmpireGame: territories, roads, resources, improvements, cities, units and ships."""
+
+    def _panel_height(self):
+        return 140
+
+    def draw(self):
+        p, env = self.pygame, self.env
+        self.surface.fill(constants.COLOR_DEFAULT_BG)
+        for cell in env.map.grid.values():
+            self._draw_tile(cell)
+        self._draw_rivers()
+        self._draw_roads()
+        self._draw_borders()
+        for position in sorted(env.map.grid):
+            self._draw_tile_details(position)
+        for city in env.cities:
+            self._draw_city(city)
+        for unit in sorted(env.units, key=lambda u: not u.spec.military):
+            self._draw_unit(unit)
+        y = self.surface.get_height() - self.panel_height + 9
+        outcome = env.last_info['outcome'].upper()
+        y += 22 * self._wrapped_text(f'Turn {env.turn_number}/{env.config.turn_limit}   {outcome}', (self.margin, y))
+        for player in env.players:
+            y += 22 * self._wrapped_text(env.status_text(player.index), (self.margin, y))
+        controls = (f'Space: pause   Right: one turn   +/-: speed   Y: yields   Esc: quit   '
+                    f'Delay {self.delay_ms or 0}ms')
+        lines = self._wrapped_text(controls, (self.margin, y + 5))
+        if self.paused:
+            self._text('PAUSED', (self.margin, y + 9 + 22 * lines), (255, 220, 100))
+        p.display.flip()
+
+    def _center(self, position):
+        x, y = self._position(position)
+        return x + self.size / 2, y + self.size / 2
+
+    def _draw_roads(self):
+        width = max(2, self.size // 16)
+        roads = self.env.roads | set(self.env.city_at)
+        for position in sorted(roads):
+            for neighbor in neighbor_positions(position):
+                if neighbor in roads and neighbor > position:
+                    self.pygame.draw.line(self.surface, ROAD_COLOR, self._center(position), self._center(neighbor),
+                                          width)
+
+    def _draw_borders(self):
+        """Outline each civilization's territory in its colour."""
+        width = max(2, self.size // 20)
+        owners = {position: city.owner for position, city in self.env.tile_owner.items()}
+        for position, owner in owners.items():
+            polygon = self._polygon(position)
+            cx = sum(x for x, _ in polygon) / 6
+            cy = sum(y for _, y in polygon) / 6
+            inset = [(cx + (x - cx) * .9, cy + (y - cy) * .9) for x, y in polygon]
+            x, y = position
+            for direction, (first, second) in SIDE_CORNERS.items():
+                dx, dy = constants.movement_delta(direction, y)
+                if owners.get((x + dx, y + dy)) != owner:
+                    self.pygame.draw.line(self.surface, PLAYER_COLORS[owner], inset[first], inset[second], width)
+
+    def _draw_tile_details(self, position):
+        env = self.env
+        x, y = self._position(position)
+        if self.show_yields:
+            dots = [YIELD_COLORS[name] for name, amount in env.tile_yields(position).items()
+                    for _ in range(int(amount))]
+            radius = max(2, self.size // 19)
+            step = 2.5 * radius
+            left = x + self.size / 2 - step * (len(dots) - 1) / 2
+            for index, color in enumerate(dots):
+                center = (left + index * step, y + self.size * .2)
+                self.pygame.draw.circle(self.surface, color, center, radius)
+                self.pygame.draw.circle(self.surface, (30, 30, 30), center, radius, 1)
+        resource = env.resources.get(position)
+        if resource is not None:
+            kind = __import__('empire_rules').RESOURCES[resource].kind
+            self._text(resource[:3].upper(), (x + self.size * .12, y + self.size * .62), RESOURCE_COLORS[kind],
+                       small=True)
+        improvement = env.improvements.get(position)
+        if improvement is not None:
+            self._text(IMPROVEMENT_LABELS[improvement], (x + self.size * .62, y + self.size * .62),
+                       (255, 230, 150), small=True)
+
+    def _draw_city(self, city):
+        x, y = self._position(city.position)
+        self.surface.blit(self.images['city'], (x, y - self.size // 6))
+        color = PLAYER_COLORS[city.owner]
+        self.pygame.draw.polygon(self.surface, color, self._polygon(city.position), max(2, self.size // 18))
+        if city.wall_hp_max > 0:
+            ring = self._polygon(city.position)
+            cx, cy = self._center(city.position)
+            ring = [(cx + (px - cx) * .8, cy + (py - cy) * .8) for px, py in ring]
+            wall = WALL_COLOR if city.wall_hp > 0 else RUINED_WALL_COLOR
+            self.pygame.draw.polygon(self.surface, wall, ring, max(2, self.size // 16))
+        label = self.small_font.render(f'{city.name} {city.population}', True, color)
+        backing = label.get_rect(topleft=(x + 2, y + 2)).inflate(4, 2)
+        self.pygame.draw.rect(self.surface, (20, 24, 28), backing)
+        self.surface.blit(label, (x + 2, y + 2))
+        self._text(f'{city.hp:.0f}', (x + 2, y + self.size * .7), small=True)
+
+    def _draw_unit(self, unit):
+        p, s = self.pygame, self.size
+        x, y = self._position(unit.position)
+        color = PLAYER_COLORS[unit.owner]
+        military = unit.spec.military
+        cx, cy = x + s * (.5 if military else .3), y + s * (.5 if military else .78)
+        radius = max(5, s // (5 if military else 8))
+        if unit.spec.domain == 'sea':
+            hull = [(cx - radius, cy - radius / 3), (cx + radius, cy - radius / 3), (cx + radius / 2, cy + radius / 2),
+                    (cx - radius / 2, cy + radius / 2)]
+            p.draw.polygon(self.surface, color, hull)
+            p.draw.polygon(self.surface, (20, 20, 20), hull, 1)
+        else:
+            p.draw.circle(self.surface, color, (cx, cy), radius)
+            p.draw.circle(self.surface, (20, 20, 20), (cx, cy), radius, 1)
+            if self.env.embarked(unit):
+                p.draw.circle(self.surface, (240, 240, 240), (cx, cy), radius + 2, 1)
+        label = EMPIRE_UNIT_LABELS[unit.kind]
+        self._text(label, (cx - radius, cy - radius - 2), (250, 250, 250), small=True)
+        if military and unit.hp < 100:
+            self._text(f'{unit.hp:.0f}', (cx - radius, cy + radius - 4), (255, 210, 120), small=True)

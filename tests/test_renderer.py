@@ -175,5 +175,55 @@ class RendererTests(unittest.TestCase):
         self.assertIn('ranged_attack', [e['type'] for e in self.env.events])
 
 
+@unittest.skipUnless(importlib.util.find_spec('pygame'), 'optional pygame not installed')
+class EmpireRendererTests(unittest.TestCase):
+    def setUp(self):
+        self.environment = patch.dict(os.environ, {
+            'SDL_VIDEODRIVER': 'dummy', 'SDL_AUDIODRIVER': 'dummy', 'PYGAME_HIDE_SUPPORT_PROMPT': '1',
+        })
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def test_draws_borders_roads_units_ships_and_both_players_status(self):
+        import random
+        from empire import EmpireConfig, EmpireGame
+        from renderer import PLAYER_COLORS, ROAD_COLOR, EmpireRenderer
+        env = EmpireGame(EmpireConfig(map_type='islands', turn_limit=40), seed=3, render=True)
+        env.reset(seed=3)
+        self.addCleanup(env.close)
+        rng = random.Random(3)
+        for _ in range(25):
+            env.step(env.guided_action(rng))
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        self.assertIsInstance(renderer, EmpireRenderer)
+        surface = renderer.surface
+        city = env.player_cities(0)[0]
+        polygon = renderer._polygon(city.position)
+        (x1, y1), (x2, y2) = polygon[3], polygon[4]  # The city's lower-left side carries its owner's outline.
+        self.assertEqual(tuple(surface.get_at((round((x1 + x2) / 2), round((y1 + y2) / 2))))[:3], PLAYER_COLORS[0])
+        # A road between two non-city tiles is drawn through the middle of their shared side.
+        occupied = set(env.city_at) | {u.position for u in env.units}
+        first, second = next((p, q) for p in sorted(env.map.grid) for q in env._neighbors(p)
+                             if env._land(p) and env._land(q) and not {p, q} & occupied
+                             and p not in env.resources and q not in env.resources)
+        env.roads |= {first, second}
+        renderer.draw()
+        (x1, y1), (x2, y2) = renderer._center(first), renderer._center(second)
+        self.assertEqual(tuple(surface.get_at((int((x1 + x2) / 2), int((y1 + y2) / 2))))[:3], ROAD_COLOR)
+        galley = env._add_unit(1, 'galley', next(p for p in sorted(env.map.grid)
+                                                if env.map.grid[p].terrain_type == 'COAST'
+                                                and p not in env.military_at))
+        renderer.draw()
+        cx, cy = renderer._position(galley.position)
+        self.assertEqual(tuple(surface.get_at((int(cx + renderer.size * .5), int(cy + renderer.size * .5))))[:3],
+                         PLAYER_COLORS[1])
+        p = renderer.pygame
+        p.event.post(p.event.Event(p.KEYDOWN, key=p.K_ESCAPE))
+        self.assertFalse(env.render_frame())
+        self.assertTrue(env.quit)
+        self.assertIn('Weasels', env.status_text(1))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -372,6 +372,17 @@ class RunnerTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.args("--learning-rate-decay", "1.5")
 
+    def test_learning_rate_anneals_only_once_the_curriculum_is_complete(self):
+        args = self.args("--no-save", "--episodes", "4", "--curriculum-episodes", "3", "--learning-rate-decay", "0.5")
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        # Episodes 0 and 1 still ramp the city's strength; episodes 2 and 3 use the final one.
+        self.assertAlmostEqual(agent.learning_rate, 0.1 * 0.5 ** 2)
+        steady = self.args("--fresh", "--no-save", "--episodes", "3", "--learning-rate-decay", "0.5")
+        agent = self.make_agent(steady)
+        run_game.train_agent(agent, steady)
+        self.assertAlmostEqual(agent.learning_rate, 0.1 * 0.5 ** 3)
+
     def test_tactical_learner_wins_held_out_games_without_guidance(self):
         """Regression check that learning works: a short schedule on a small map."""
         args = self.args("--fresh", "--no-save", "--width", "6", "--height", "6", "--unit-count", "2",

@@ -16,7 +16,7 @@ DEFAULT_MODEL_PATH = Path("q_learning_model.json")
 # Defaults for a new model of each learner; checkpoints restore their own values.
 LEARNING_DEFAULTS = {
     "tactical": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
-                     epsilon_min=0.05, initial_q=0.0, shaping=0.5, learning_rate_decay=1.0,
+                     epsilon_min=0.05, initial_q=0.0, shaping=0.5, learning_rate_decay=0.998,
                      learning_rate_min=0.01),
     "joint": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
                   epsilon_min=0.05, state_precision=100, initial_q=-100.0),
@@ -57,7 +57,8 @@ def parse_args(argv=None):
     parser.add_argument("--shaping", type=float,
                         help="tactical learner health-potential shaping weight (default: 0.5)")
     parser.add_argument("--learning-rate-decay", type=float,
-                        help="tactical learner per-episode learning-rate decay (default: 1, no decay)")
+                        help="tactical learner per-episode learning-rate decay once any curriculum "
+                             "is complete (default: 0.998)")
     parser.add_argument("--learning-rate-min", type=float,
                         help="tactical learner learning-rate floor (default: 0.01)")
     parser.add_argument("--guided-exploration", type=float,
@@ -254,6 +255,11 @@ def build_agent(args, rng):
     return agent
 
 
+def curriculum_complete(args, absolute_episode):
+    """Whether this episode already uses the final scenario, so learning can settle."""
+    return not args.curriculum_episodes or absolute_episode >= args.curriculum_episodes - 1
+
+
 def episode_config(args, absolute_episode):
     if not args.curriculum_episodes:
         return args.config
@@ -281,7 +287,7 @@ class EpisodeResult:
 
 def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
                 guided_exploration_rate=0.0, use_guidance=False, seed=None,
-                policy="learned", rng=None):
+                policy="learned", rng=None, anneal=True):
     state = env.reset(seed=seed)
     total_reward = 0.0
     outcome = "timeout"
@@ -319,7 +325,7 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
         if done:
             break
     if train:
-        agent.finish_episode()
+        agent.finish_episode(anneal=anneal)
     return EpisodeResult(total_reward, outcome, steps_taken, counts["guided"], counts["random"], counts["policy"])
 
 
@@ -425,7 +431,8 @@ def train_agent(agent, args):
             result = run_episode(env, agent, episode, args.max_steps, train=True,
                                  seed=args.seed + episode, render_delay_ms=args.render_delay_ms,
                                  guided_exploration_rate=args.guided_exploration,
-                                 use_guidance=not args.no_guidance)
+                                 use_guidance=not args.no_guidance,
+                                 anneal=curriculum_complete(args, episode))
         finally:
             env.close()
         rewards.append(result.reward)

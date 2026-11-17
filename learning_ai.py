@@ -275,8 +275,12 @@ class QLearningAgent:
             raise ValueError("Q-learning update produced a nonfinite value")
         q_values[action] = updated_value
 
-    def finish_episode(self):
-        """Record completed training and decay exploration."""
+    def finish_episode(self, anneal=True):
+        """Record completed training and decay exploration.
+
+        anneal is accepted for a common interface; this learner keeps a
+        constant learning rate.
+        """
         self._validate_configuration()
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
         self.episodes_trained += 1
@@ -419,10 +423,11 @@ class TacticalQAgent:
     the reward with the potential ``shaping * total health fraction`` of living
     units (zero at terminal states): healing is credited and damage charged
     when they happen, and potential-based shaping leaves the optimal policy
-    unchanged. An optional learning_rate_decay below one shrinks the learning
-    rate after each episode toward learning_rate_min (a rate already below the
-    floor is left alone); it is off by default because a curriculum still
-    needs to learn when the hardest scenarios arrive late.
+    unchanged. After each annealed episode the learning rate shrinks by
+    learning_rate_decay toward learning_rate_min (a rate already below the
+    floor is left alone), so the greedy policy settles. The runner anneals
+    only once a curriculum has reached its final scenario, since a changing
+    task still needs full-sized updates.
 
     The interface matches QLearningAgent. A joint action index decodes to one
     command per unit in itertools.product order, with each unit's commands a
@@ -443,7 +448,7 @@ class TacticalQAgent:
         epsilon_min=0.05,
         initial_q=0.0,
         shaping=0.5,
-        learning_rate_decay=1.0,
+        learning_rate_decay=0.998,
         learning_rate_min=0.01,
         rng=None,
         observation_schema=None,
@@ -700,14 +705,15 @@ class TacticalQAgent:
             return shaped_reward + self.discount_factor * cycle / (1 - self.discount_factor ** length)
         return None
 
-    def finish_episode(self):
-        """Record completed training and decay exploration."""
+    def finish_episode(self, anneal=True):
+        """Record completed training, decay exploration and, with anneal, the learning rate."""
         self._decision = None
         self._trace = []
         self._validate_configuration()
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        self.learning_rate = max(min(self.learning_rate, self.learning_rate_min),
-                                 self.learning_rate * self.learning_rate_decay)
+        if anneal:
+            self.learning_rate = max(min(self.learning_rate, self.learning_rate_min),
+                                     self.learning_rate * self.learning_rate_decay)
         self.episodes_trained += 1
 
     def _checkpoint_payload(self):

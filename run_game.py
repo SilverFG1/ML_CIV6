@@ -16,7 +16,7 @@ DEFAULT_MODEL_PATH = Path("q_learning_model.json")
 # Defaults for a new model of each learner; checkpoints restore their own values.
 LEARNING_DEFAULTS = {
     "tactical": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
-                     epsilon_min=0.05, initial_q=0.0, shaping=0.5, learning_rate_decay=0.998,
+                     epsilon_min=0.05, initial_q=0.0, shaping=0.5, learning_rate_decay=1.0,
                      learning_rate_min=0.01),
     "joint": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
                   epsilon_min=0.05, state_precision=100, initial_q=-100.0),
@@ -57,7 +57,7 @@ def parse_args(argv=None):
     parser.add_argument("--shaping", type=float,
                         help="tactical learner health-potential shaping weight (default: 0.5)")
     parser.add_argument("--learning-rate-decay", type=float,
-                        help="tactical learner per-episode learning-rate decay (default: 0.998)")
+                        help="tactical learner per-episode learning-rate decay (default: 1, no decay)")
     parser.add_argument("--learning-rate-min", type=float,
                         help="tactical learner learning-rate floor (default: 0.01)")
     parser.add_argument("--guided-exploration", type=float,

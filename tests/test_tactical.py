@@ -237,6 +237,13 @@ class TacticalAgentTests(unittest.TestCase):
         self.assertAlmostEqual(values[T['ATTACK']], .5 * .925)
         self.assertEqual(len(agent.q_table), len(agent._groups))
 
+    def test_units_sharing_entries_do_not_overshoot_the_target(self):
+        agent = self.make_agent(counts=(7, 7), learning_rate=1, shaping=0)
+        state = unit_block()
+        agent.learn(state + state, 0, 2.0, unit_block(health=.5) * 2, True, next_valid_actions=[])
+        unit_value = agent._unit_values(np.asarray(state[FIRST_FEATURE:TACTICAL_FIRST_TACTIC], dtype=int))
+        self.assertAlmostEqual(2 * unit_value[T['ATTACK']], 2.0)
+
     def test_terminal_update_drops_bootstrap_and_potential(self):
         agent = self.make_agent(learning_rate=1, discount_factor=.9, shaping=.5)
         before = unit_block(health=.6)

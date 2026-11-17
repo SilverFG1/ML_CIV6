@@ -4,6 +4,7 @@ TacticalQAgent is the squad learner trained by run_game.py. QLearningAgent is
 the original joint-action Q-table over raw observations, kept as a baseline.
 """
 
+import collections
 import json
 import math
 import numbers
@@ -619,10 +620,10 @@ class TacticalQAgent:
         """Move the taken joint action's value toward a shaped one-step target.
 
         A non-terminal next state, including one cut off by a turn limit,
-        bootstraps from its best legal joint action, except that a transition
-        that leaves the observation unchanged is valued as repeating forever.
-        The TD error is split evenly across the tile entries of every living
-        unit's chosen tactic.
+        bootstraps from its best legal joint action, except that a closed loop
+        is valued as repeating forever (see _record). The joint value moves
+        learning_rate of the way to the target, spread over the tile entries
+        of every living unit's chosen tactic.
         """
         self._validate_configuration()
         action = self._action(action)
@@ -634,14 +635,14 @@ class TacticalQAgent:
         allowed = self._valid_actions(next_valid_actions, allow_empty=bool(done))
         alive, _, features, tactics = parsed
         commands = self._commands[action]
-        updates = []
+        updates = collections.Counter()
         current = 0.0
         for unit in np.flatnonzero(alive):
             tactic = int(tactics[unit, commands[unit]])
             if tactic < 0:
                 raise ValueError("action uses a command the observation marks unavailable")
             current += self._unit_values(features[unit])[tactic]
-            updates.extend((key, tactic) for key in self._tile_keys(features[unit]))
+            updates.update((key, tactic) for key in self._tile_keys(features[unit]))
         next_potential = 0.0 if done else self._potential(next_parsed)
         target = reward + self.discount_factor * next_potential - self._potential(parsed)
         loop = None if done else self._record(observation, action, target, next_observation)
@@ -649,14 +650,20 @@ class TacticalQAgent:
             target = loop
         elif not done:
             target += self.discount_factor * float(np.max(self._joint_values(next_parsed, allowed)))
-        step = self.learning_rate * (target - current) / len(self._groups)
+        if not updates:
+            return
+        # A normalized step moves the joint value exactly learning_rate of the way
+        # to the target. Units in the same situation share entries, so an entry
+        # counted c times has gradient c; an unnormalized step would grow with
+        # the square of the squad size and diverge for larger squads.
+        step = self.learning_rate * (target - current) / sum(count * count for count in updates.values())
         if not math.isfinite(step):
             raise ValueError("Q-learning update produced a nonfinite value")
-        for key, tactic in updates:
+        for (key, tactic), count in updates.items():
             row = self.q_table.get(key)
             if row is None:
                 row = self.q_table[key] = np.full(len(TACTICS), self.initial_q / len(self._groups))
-            row[tactic] += step
+            row[tactic] += step * count
 
     def _record(self, observation, action, shaped_reward, next_observation):
         """Track this episode's transitions and value a loop that just closed.

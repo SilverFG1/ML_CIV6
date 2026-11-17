@@ -1,7 +1,7 @@
 """A small Civ-like combat environment with isolated state and seeded randomness."""
 
+import collections
 from dataclasses import dataclass
-import heapq
 import itertools
 import math
 import random
@@ -56,6 +56,54 @@ UNIT_TYPES = tuple(UNIT_SPECS)
 # to the city restores full wall damage for the classes it supports.
 MELEE_WALL_DAMAGE = 0.5
 RAM_SUPPORTED_CLASSES = ('melee', 'anti_cavalry')
+
+# attack() draws damage as round(roll * exp(diff / 25) * scale) with these ranges.
+DAMAGE_ROLLS = range(24, 37)
+DAMAGE_SCALE = (.75, 1.0)
+
+# Tactical observations describe each unit relative to the city, so what is
+# learned on one map or seed transfers to others. Every per-unit command maps
+# to one of TACTICS in the current position; -1 marks an unavailable command.
+# Holding position is HEAL for a wounded unit and WAIT at full health, since
+# only the first restores health.
+COMMANDS = constants.DIRECTIONS + ('SHOOT',)
+TACTICS = ('ATTACK', 'SHOOT', 'HEAL', 'WAIT', 'ADVANCE', 'SIDESTEP', 'RETREAT')
+TACTICAL_FEATURES = ('unit_type', 'distance', 'health', 'risk', 'city_health', 'walls',
+                     'allies_adjacent', 'allies_away', 'ram_ready', 'city_ranged', 'city_heals')
+# Inclusive upper bound of each feature, in TACTICAL_FEATURES order.
+TACTICAL_FEATURE_LIMITS = (len(UNIT_SPECS) - 1, 6, 3, 3, 4, 2, 3, 3, 1, 1, 1)
+# Per-unit block: exact state fractions, the integer features, then one tactic
+# per command. The fractions are not learned from directly; they make two
+# observations equal only when nothing changed.
+TACTICAL_HEADER = ('alive', 'health_fraction', 'city_health_fraction', 'wall_fraction')
+TACTICAL_FIRST_TACTIC = len(TACTICAL_HEADER) + len(TACTICAL_FEATURES)
+TACTICAL_UNIT_WIDTH = TACTICAL_FIRST_TACTIC + len(COMMANDS)
+OBSERVATION_MODES = ('raw', 'tactical')
+TACTIC_INDEX = {name: index for index, name in enumerate(TACTICS)}
+
+
+def damage_at_least(threshold, multiplier):
+    """Exact probability that attack() deals at least threshold damage.
+
+    Damage is round(roll * multiplier * scale) for an integer roll and a
+    uniform scale, so the event is roll * multiplier * scale >= ceil(threshold) - 0.5.
+    """
+    needed = math.ceil(threshold) - .5
+    if needed <= 0:
+        return 1.0
+    low, high = DAMAGE_SCALE
+    total = 0.0
+    for roll in DAMAGE_ROLLS:
+        cutoff = needed / (roll * multiplier)
+        total += min(1.0, max(0.0, (high - cutoff) / (high - low)))
+    return total / len(DAMAGE_ROLLS)
+
+
+def risk_level(probability):
+    """Bucket a death probability: impossible, unlikely, plausible, likely."""
+    if probability <= 0:
+        return 0
+    return 1 if probability < .15 else 2 if probability < .5 else 3
 
 
 @dataclass(frozen=True)
@@ -242,9 +290,19 @@ def attack(aggressor, target, ranged=False, rng=None):
 
 
 class Game:
-    def __init__(self, human=False, ml_ai=False, render=False, config=None, seed=None):
+    """The siege environment.
+
+    reset() and step() return the observation for the configured mode: 'raw'
+    is get_observation()'s absolute state vector, and 'tactical' is
+    tactical_observation()'s egocentric per-unit encoding.
+    """
+
+    def __init__(self, human=False, ml_ai=False, render=False, config=None, seed=None, observation='raw'):
+        if observation not in OBSERVATION_MODES:
+            raise ValueError(f'observation must be one of {", ".join(OBSERVATION_MODES)}')
         self.config = config or GameConfig()
         self.human, self.ml_ai, self.render = human, ml_ai, render
+        self.observation_mode = observation
         self.rng = random.Random(seed)
         self.unit_types = tuple(self.config.unit_types or ('warrior',) * self.config.unit_count)
         self.unit_directions = [constants.DIRECTIONS + (('SHOOT',) if UNIT_SPECS[kind].ranged else ())
@@ -252,8 +310,12 @@ class Game:
         self.actions = tuple(itertools.product(*self.unit_directions))
         self.action_count = len(self.actions)
         self._action_index = {a: i for i, a in enumerate(self.actions)}
-        self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
-                                   + ','.join(self.unit_types))
+        if observation == 'tactical':
+            # Egocentric features do not depend on the map size.
+            self.observation_schema = 'ml_civ6.tactical.v1:' + ','.join(self.unit_types)
+        else:
+            self.observation_schema = (f'ml_civ6.v2:{self.config.width}x{self.config.height}:'
+                                       + ','.join(self.unit_types))
         self._renderer = None
         self.quit = False
         self.units = []
@@ -305,8 +367,8 @@ class Game:
         self.last_info = {'outcome': 'ongoing', 'events': []}
         self._done = self.quit = False
         self._valid_cache_key = None
-        self._path_costs = None
-        return self.get_observation()
+        self._step_cache = None
+        return self.observe()
 
     def game_initialize(self, ep_number=0, seed=None):
         self.episode_number = ep_number
@@ -481,7 +543,7 @@ class Game:
         if isinstance(action, bool) or not isinstance(action, (int, np.integer)) or not 0 <= action < self.action_count:
             raise ValueError(f'action must be an integer in [0, {self.action_count})')
         if self._done:
-            return self.get_observation(), 0.0, True
+            return self.observe(), 0.0, True
         self.events = []
         self.turn_number += 1
         if self._outcome() == 'ongoing':
@@ -499,7 +561,11 @@ class Game:
         self.last_info = {'outcome': outcome, 'events': [event.copy() for event in self.events],
                           'turn': self.turn_number}
         reward = self.get_rewards()
-        return self.get_observation(), reward, self._done
+        return self.observe(), reward, self._done
+
+    def observe(self):
+        """Return the observation for this environment's configured mode."""
+        return self.tactical_observation() if self.observation_mode == 'tactical' else self.get_observation()
 
     def get_observation(self):
         if self.city is None:
@@ -517,53 +583,218 @@ class Game:
                       for y in range(c.height) for x in range(c.width))
         return np.asarray(values, dtype=float)
 
-    def _distances(self):
+    def _terrain_routes(self):
+        """Cache terrain-only distances and passable neighbors for this map."""
         key = (self.city.position, tuple(cell.terrain_type for cell in self.map.grid.values()))
-        if self._path_costs is not None and self._path_costs[0] == key:
-            return self._path_costs[1]
-        costs = {self.city.position: 0}
-        pending = [(0, self.city.position)]
-        while pending:
-            cost, pos = heapq.heappop(pending)
-            if cost != costs[pos]:
+        if self._step_cache is None or self._step_cache[0] != key:
+            grid = self.map.grid
+            adjacency = {position: [neighbor.index for neighbor in cell.get_neighbors(grid)
+                                    if not neighbor.block_path]
+                         for position, cell in grid.items() if not cell.block_path}
+            steps = {self.city.position: 0}
+            pending = collections.deque([self.city.position])
+            while pending:
+                position = pending.popleft()
+                for neighbor in adjacency[position]:
+                    if neighbor not in steps:
+                        steps[neighbor] = steps[position] + 1
+                        pending.append(neighbor)
+            self._step_cache = key, steps, adjacency
+        return self._step_cache[1], self._step_cache[2]
+
+    def step_distances(self):
+        """Fewest turns from each reachable tile to the city.
+
+        Every unit moves one hex per turn, so forests add no turns; they carry
+        only a small reward penalty and a defense bonus.
+        """
+        return self._terrain_routes()[0]
+
+    def route_distances(self, unit):
+        """Fewest turns to the city for unit, routing around the squad's other living units.
+
+        Covers unit's tile and its neighbors; tiles that other units occupy are
+        absent. When allies fill the city's ring in front of a unit, the move
+        toward a free approach is the one that shortens its route.
+        """
+        steps, adjacency = self._terrain_routes()
+        blocked = {other.position for other in self.units if other.alive and other is not unit}
+        if not blocked:
+            return steps
+        targets = {unit.position, *adjacency.get(unit.position, ())} - blocked
+        routes = {self.city.position: 0}
+        targets.discard(self.city.position)
+        pending = collections.deque([self.city.position])
+        while pending and targets:
+            position = pending.popleft()
+            for neighbor in adjacency[position]:
+                if neighbor not in routes and neighbor not in blocked:
+                    routes[neighbor] = routes[position] + 1
+                    targets.discard(neighbor)
+                    pending.append(neighbor)
+        return routes
+
+    def melee_death_probability(self, unit):
+        """Chance that the city's retaliation kills unit if it attacks in melee now."""
+        bonus = self.map.grid[unit.position].defense_bonus
+        return damage_at_least(unit.hp, math.exp((self.city.strength - unit.strength - bonus) / 25))
+
+    def capture_probability(self, unit):
+        """Chance that a melee attack by unit now captures the city.
+
+        The blow must break any walls and then deal the city's remaining
+        health, and the attacker must survive the retaliation, which resolves
+        first.
+        """
+        city = self.city
+        if not unit.alive or unit.support or not city.alive:
+            return 0.0
+        needed = city.hp
+        if city.wall_hp > 0:
+            needed += city.wall_hp / self.melee_wall_multiplier(unit)
+        hit = damage_at_least(needed, math.exp((unit.strength - city.strength) / 25))
+        return hit * (1 - self.melee_death_probability(unit))
+
+    def tactical_observation(self):
+        """Encode each unit's situation relative to the city.
+
+        Every unit contributes TACTICAL_UNIT_WIDTH values: the TACTICAL_HEADER
+        flag and fractions, the integer TACTICAL_FEATURES, and the TACTICS index
+        that each of COMMANDS would perform from the current position (-1 when
+        the command is unavailable). Moves are classified by the fewest turns to
+        the city along a route around the other living units, so the encoding
+        does not depend on absolute coordinates, the map size or the seed.
+        Whether a move is legal this turn is left to valid_actions(). A dead
+        unit's block is zero with every command unavailable.
+        """
+        if self.city is None:
+            raise RuntimeError('Call reset before tactical_observation')
+        city = self.city
+        adjacent = [u.alive and hex_distance(u.position, city.position) == 1 for u in self.units]
+        attackers = [u.alive and not u.support for u in self.units]
+        city_health = min(4, max(0, math.ceil(5 * city.hp / city.hp_max) - 1))
+        walls = 0 if city.wall_hp <= 0 else 1 if city.wall_hp <= city.wall_hp_max / 2 else 2
+        shared = (int(self.ram_in_position()), int(city.ranged_combat), int(city.heal))
+        first_feature, first_tactic = len(TACTICAL_HEADER), TACTICAL_FIRST_TACTIC
+        header = (city.hp / city.hp_max, city.wall_hp / city.wall_hp_max if city.wall_hp_max else 0.0)
+        values = np.zeros(len(self.units) * TACTICAL_UNIT_WIDTH)
+        for index, unit in enumerate(self.units):
+            block = values[index * TACTICAL_UNIT_WIDTH:(index + 1) * TACTICAL_UNIT_WIDTH]
+            block[first_tactic:] = -1
+            if not unit.alive:
                 continue
-            for neighbor in self.map.grid[pos].get_neighbors(self.map.grid):
-                if neighbor.block_path:
-                    continue
-                new_cost = cost + self.map.grid[pos].movement_cost
-                if new_cost < costs.get(neighbor.index, float('inf')):
-                    costs[neighbor.index] = new_cost
-                    heapq.heappush(pending, (new_cost, neighbor.index))
-        self._path_costs = key, costs
-        return costs
+            steps = self.route_distances(unit)
+            distance = steps.get(unit.position, math.inf)
+            health = 3 if unit.hp >= unit.hp_max else min(2, int(3 * unit.hp / unit.hp_max))
+            risk = 0 if unit.support else risk_level(self.melee_death_probability(unit))
+            others = [other for other in range(len(self.units)) if other != index]
+            block[:first_feature] = (1, unit.hp / unit.hp_max, *header)
+            block[first_feature:first_tactic] = (
+                UNIT_TYPES.index(unit.unit_type), min(distance, TACTICAL_FEATURE_LIMITS[1]), health, risk,
+                city_health, walls, sum(adjacent[other] for other in others),
+                sum(attackers[other] and not adjacent[other] for other in others), *shared)
+            for command_index, command in enumerate(COMMANDS):
+                block[first_tactic + command_index] = self._command_tactic(unit, command, distance, steps)
+        return values
+
+    def _command_tactic(self, unit, command, distance, steps):
+        city = self.city
+        if command == 'SHOOT':
+            usable = unit.ranged and city.alive and hex_distance(unit.position, city.position) <= unit.attack_range
+            return TACTIC_INDEX['SHOOT'] if usable else -1
+        if command == 'SPACE':
+            return TACTIC_INDEX['HEAL' if unit.hp < unit.hp_max else 'WAIT']
+        dx, dy = constants.movement_delta(command, unit.y)
+        destination = unit.x + dx, unit.y + dy
+        cell = self.map.grid.get(destination)
+        if cell is None or cell.block_path:
+            return -1
+        if destination == city.position:
+            return -1 if unit.support else TACTIC_INDEX['ATTACK']
+        after = steps.get(destination, math.inf)
+        return TACTIC_INDEX['ADVANCE' if after < distance else 'SIDESTEP' if after == distance else 'RETREAT']
 
     def guided_action(self, rng=None):
+        """Choose a joint action with a risk-aware siege heuristic.
+
+        Units close in by the fewest turns, and archers and slingers shoot when
+        in range. Melee attacks are made only when the city's retaliation
+        cannot kill the attacker while the city is encircled (a small risk is
+        accepted while it can still heal), unless a capture is nearly certain.
+        Otherwise units heal in place, hold next to the city until enough of
+        them surround it to stop its healing, and wait just outside a ranged
+        city's reach until the squad has closed up. Ties use rng.
+        """
         rng = rng or self.rng
-        costs = self._distances()
-        scores = []
+        city = self.city
+        steps = self.step_distances()
+        alive = [u for u in self.units if u.alive]
+        needed = min(3, self.config.unit_count)
+        encircled = sum(hex_distance(u.position, city.position) == 1 for u in alive) >= needed
+        # Attack freely once the city cannot heal, or when too few units survive to stop it.
+        ready = not city.heal or encircled or len(alive) < needed
+        # While the city cannot heal, waiting is nearly free: accept no chance of death.
+        tolerance = 0.0 if not city.heal or encircled else .1
+        staging = city.ranged_combat and any(steps.get(u.position, math.inf) > 3 for u in alive if not u.support)
+        scores = [self._command_scores(index, steps, ready, tolerance, staging) if unit.alive else {}
+                  for index, unit in enumerate(self.units)]
+        best, choices = math.inf, []
         for action in self.valid_actions():
-            score = 0
-            for unit, direction in zip(self.units, self.actions[action]):
-                if not unit.alive:
-                    continue
-                if direction == 'SHOOT':
-                    score += costs.get(unit.position, 10000) - 2
-                    if self.city.hp <= 1 and self.city.wall_hp == 0:
-                        score += 5
-                    continue
-                dx, dy = constants.movement_delta(direction, unit.y)
-                destination = unit.x + dx, unit.y + dy
-                score += costs.get(destination, 10000)
-                if direction == 'SPACE':
-                    if unit.hp < .35 * unit.hp_max:
-                        score -= 2
-                    elif unit.support and hex_distance(unit.position, self.city.position) == 1:
-                        score -= 1
-                    else:
-                        score += .3
-            scores.append((score, action))
-        best = min(score for score, _ in scores)
-        return rng.choice([action for score, action in scores if score == best])
+            score = sum(scores[index][command] for index, command in enumerate(self.actions[action])
+                        if self.units[index].alive)
+            if score < best - 1e-9:
+                best, choices = score, [action]
+            elif score <= best + 1e-9:
+                choices.append(action)
+        return rng.choice(choices)
+
+    def _command_scores(self, index, steps, ready, tolerance, staging):
+        """Cost of each usable command for one unit; lower is better."""
+        unit, city = self.units[index], self.city
+        distance = steps.get(unit.position, math.inf)
+        death = 0.0 if unit.support else self.melee_death_probability(unit)
+        capture = self.capture_probability(unit)
+        wounded = unit.hp < unit.hp_max
+        in_range = unit.ranged and hex_distance(unit.position, city.position) <= unit.attack_range
+        scores = {}
+        for command in self.unit_directions[index]:
+            if command == 'SHOOT':
+                if in_range:
+                    # Ranged fire cannot take the last hit point once the walls are down.
+                    scores[command] = 5.0 if city.hp <= 1 and city.wall_hp <= 0 else -1.0
+                continue
+            if command == 'SPACE':
+                if distance == 1:
+                    holding = wounded or unit.support or not ready or death > tolerance
+                    scores[command] = 0.0 if holding else .5
+                else:
+                    # A wounded unit near the city recovers before engaging.
+                    recovering = wounded and death > tolerance and distance <= 2
+                    scores[command] = distance + (0.0 if recovering else .4)
+                continue
+            dx, dy = constants.movement_delta(command, unit.y)
+            destination = unit.x + dx, unit.y + dy
+            cell = self.map.grid.get(destination)
+            if cell is None or cell.block_path or (unit.support and destination == city.position):
+                continue
+            if destination == city.position:
+                if capture >= .9 or (capture >= .5 and death <= tolerance):
+                    scores[command] = -3.0
+                elif death > tolerance:
+                    scores[command] = 2.0 + 10 * death
+                elif in_range or not ready:
+                    scores[command] = 1.0
+                else:
+                    scores[command] = -.5
+                continue
+            after = steps.get(destination, math.inf)
+            if staging and distance == 3 and after == 2:
+                scores[command] = 3.5
+            elif unit.ranged and unit.attack_range >= 2 and distance == 2 and after == 1:
+                scores[command] = 1.5
+            else:
+                scores[command] = after + .01 * (cell.movement_cost - 1)
+        return scores
 
     def get_current_state(self):
         return {obj.name_instance: {'health': obj.hp, 'position': [obj.x, obj.y],

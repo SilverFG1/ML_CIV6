@@ -15,7 +15,7 @@ import numpy as np
 
 import game
 import run_game
-from learning_ai import QLearningAgent
+from learning_ai import QLearningAgent, TacticalQAgent, load_agent
 
 
 class ShortEpisode:
@@ -90,7 +90,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.guidance_actions, 2)
         self.assertEqual(result.guidance_actions + result.random_actions + result.policy_actions, result.steps)
 
-    def test_learning_masks_next_state_and_ends_timeout_trajectory(self):
+    def test_learning_masks_next_state_and_bootstraps_timeout(self):
         agent = QLearningAgent(3, rng=random.Random(7))
         with patch.object(agent, "learn", wraps=agent.learn) as learn:
             result = run_game.run_episode(ShortEpisode(terminal=False), agent, 0, 2, train=True)
@@ -98,8 +98,16 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(result.won)
         self.assertEqual(learn.call_args_list[0].kwargs["next_valid_actions"], [2])
         self.assertFalse(learn.call_args_list[0].args[4])
-        self.assertEqual(learn.call_args_list[1].kwargs["next_valid_actions"], [])
-        self.assertTrue(learn.call_args_list[1].args[4])
+        # The turn limit is not a game state: the cut-off transition still bootstraps.
+        self.assertEqual(learn.call_args_list[1].kwargs["next_valid_actions"], [2])
+        self.assertFalse(learn.call_args_list[1].args[4])
+
+    def test_true_terminal_transition_does_not_bootstrap(self):
+        agent = QLearningAgent(3, rng=random.Random(7))
+        with patch.object(agent, "learn", wraps=agent.learn) as learn:
+            run_game.run_episode(ShortEpisode("win"), agent, 0, 2, train=True)
+        self.assertEqual(learn.call_args_list[-1].kwargs["next_valid_actions"], [])
+        self.assertTrue(learn.call_args_list[-1].args[4])
 
     def test_default_learned_evaluation_uses_no_guidance(self):
         args = self.args("--no-save")
@@ -190,7 +198,9 @@ class RunnerTests(unittest.TestCase):
             self.make_agent(self.args())
         fresh = self.make_agent(self.args("--fresh"))
         self.assertIsNotNone(fresh.observation_schema)
-        self.assertEqual(fresh.state_precision, 100)
+        self.assertEqual(fresh.agent_kind, "tactical")
+        joint = self.make_agent(self.args("--fresh", "--agent", "joint"))
+        self.assertEqual(joint.state_precision, 100)
 
     def test_periodic_saves_track_absolute_episode_and_no_save_is_respected(self):
         args = self.args("--episodes", "3", "--checkpoint-every", "2")
@@ -198,7 +208,7 @@ class RunnerTests(unittest.TestCase):
         with patch.object(agent, "save", wraps=agent.save) as save:
             run_game.train_agent(agent, args)
         self.assertEqual(save.call_count, 1)
-        saved = QLearningAgent.load(args.model_path)
+        saved = load_agent(args.model_path)
         self.assertEqual(saved.training_state["checkpoint_episode"], 2)
         self.assertEqual(saved.episodes_trained, 2)
         other = self.args("--fresh", "--no-save", "--checkpoint-every", "1")
@@ -317,6 +327,63 @@ class RunnerTests(unittest.TestCase):
         single = self.args('--difficulty', 'hard', '--curriculum-episodes', '1')
         self.make_agent(single)
         self.assertEqual(run_game.episode_config(single, 0).city_strength, 38)
+
+
+    def test_new_models_use_the_tactical_learner_and_checkpoints_keep_theirs(self):
+        args = self.args()
+        agent = self.make_agent(args)
+        self.assertIsInstance(agent, TacticalQAgent)
+        self.assertEqual((args.agent, args.observation), ("tactical", "tactical"))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resumed_args = self.args()
+        self.assertIsInstance(self.make_agent(resumed_args), TacticalQAgent)
+        self.assertEqual(resumed_args.agent, "tactical")
+        with self.assertRaisesRegex(ValueError, "fresh"):
+            self.make_agent(self.args("--agent", "joint"))
+        with self.assertRaisesRegex(ValueError, "joint learner"):
+            self.make_agent(self.args("--state-precision", "8"))
+
+    def test_joint_learner_remains_available_as_a_baseline(self):
+        args = self.args("--agent", "joint")
+        agent = self.make_agent(args)
+        self.assertIsInstance(agent, QLearningAgent)
+        self.assertEqual(args.observation, "raw")
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        resumed_args = self.args()
+        resumed = self.make_agent(resumed_args)
+        self.assertIsInstance(resumed, QLearningAgent)
+        self.assertEqual(set(run_game.compare_policies(resumed, resumed_args, verbose=False)),
+                         {"learned", "heuristic", "random"})
+        with self.assertRaisesRegex(ValueError, "tactical learner"):
+            self.make_agent(self.args("--shaping", "1"))
+
+    def test_tactical_settings_restore_and_accept_overrides(self):
+        args = self.args("--shaping", "0.25", "--learning-rate-decay", "0.99", "--learning-rate-min", "0.02")
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        restored = self.make_agent(self.args())
+        self.assertEqual((restored.shaping, restored.learning_rate_decay, restored.learning_rate_min),
+                         (0.25, 0.99, 0.02))
+        self.assertAlmostEqual(restored.learning_rate, 0.1 * 0.99 ** 2)
+        self.assertEqual(self.make_agent(self.args("--shaping", "0.75")).shaping, 0.75)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args("--learning-rate-decay", "1.5")
+
+    def test_tactical_learner_wins_held_out_games_without_guidance(self):
+        """Regression check that learning works: a short schedule on a small map."""
+        args = self.args("--fresh", "--no-save", "--width", "6", "--height", "6", "--unit-count", "2",
+                         "--episodes", "200", "--epsilon-decay", "0.98", "--max-steps", "30", "--seed", "3",
+                         "--eval-episodes", "20", "--eval-policies", "learned", "random")
+        agent = self.make_agent(args)
+        with contextlib.redirect_stdout(io.StringIO()):
+            run_game.train_agent(agent, args)
+        summaries = run_game.compare_policies(agent, args, verbose=False)
+        self.assertEqual(sum(row["guidance_actions"] for row in summaries["learned"]["episodes_detail"]), 0)
+        self.assertGreaterEqual(summaries["learned"]["win_rate"], 0.9)
+        self.assertEqual(summaries["random"]["win_rate"], 0.0)
 
 
 if __name__ == "__main__":

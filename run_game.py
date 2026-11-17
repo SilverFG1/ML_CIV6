@@ -9,10 +9,18 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import game
-from learning_ai import QLearningAgent
+from learning_ai import AGENT_TYPES, QLearningAgent, TacticalQAgent, load_agent
 
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
+# Defaults for a new model of each learner; checkpoints restore their own values.
+LEARNING_DEFAULTS = {
+    "tactical": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
+                     epsilon_min=0.05, initial_q=0.0, shaping=0.5, learning_rate_decay=0.998,
+                     learning_rate_min=0.01),
+    "joint": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
+                  epsilon_min=0.05, state_precision=100, initial_q=-100.0),
+}
 DIFFICULTY_STRENGTHS = {"easy": 18, "normal": 28, "hard": 38, "curriculum": 38}
 METRIC_FIELDS = ("episode", "seed", "reward", "outcome", "steps", "epsilon", "guidance_actions",
                  "random_actions", "policy_actions", "q_table_size", "city_strength")
@@ -40,10 +48,18 @@ def parse_args(argv=None):
     parser.add_argument("--render-training", action="store_true")
     parser.add_argument("--render-delay-ms", type=int, default=0)
     parser.add_argument("--seed", type=int, help="training seed (default: 7, or checkpoint value)")
+    parser.add_argument("--agent", choices=tuple(AGENT_TYPES),
+                        help="learner for a new model (default: tactical; a checkpoint keeps its own)")
     for flag, kind in (("learning-rate", float), ("discount-factor", float), ("epsilon", float),
                        ("epsilon-decay", float), ("epsilon-min", float), ("state-precision", int),
                        ("initial-q", float)):
         parser.add_argument("--" + flag, type=kind)
+    parser.add_argument("--shaping", type=float,
+                        help="tactical learner health-potential shaping weight (default: 0.5)")
+    parser.add_argument("--learning-rate-decay", type=float,
+                        help="tactical learner per-episode learning-rate decay (default: 0.998)")
+    parser.add_argument("--learning-rate-min", type=float,
+                        help="tactical learner learning-rate floor (default: 0.01)")
     parser.add_argument("--guided-exploration", type=float,
                         help="guided fraction of epsilon exploration (default: 0.35)")
     parser.add_argument("--no-guidance", action="store_true", help="train without heuristic fallback")
@@ -70,12 +86,14 @@ def parse_args(argv=None):
     if args.curriculum_episodes is not None and args.curriculum_episodes < 0:
         parser.error("--curriculum-episodes must be non-negative")
     for name in ("epsilon", "epsilon_decay", "epsilon_min", "guided_exploration", "discount_factor",
-                 "mountain_density", "forest_density"):
+                 "mountain_density", "forest_density", "learning_rate_decay", "learning_rate_min"):
         value = getattr(args, name)
         if value is not None and not 0 <= value <= 1:
             parser.error(f"--{name.replace('_', '-')} must lie between 0 and 1")
     if args.learning_rate is not None and not 0 < args.learning_rate <= 1:
         parser.error("--learning-rate must lie above 0 and at most 1")
+    if args.shaping is not None and not 0 <= args.shaping <= 10:
+        parser.error("--shaping must lie between 0 and 10")
     return args
 
 
@@ -172,11 +190,27 @@ def _validate_training_state(agent):
 
 
 def build_agent(args, rng):
+    """Load or create the learner and settle the run's scenario and settings.
+
+    A checkpoint keeps its learner; a new model uses --agent (default tactical).
+    Sets args.config, args.agent, and args.observation for later environments.
+    """
     loaded = args.model_path.exists() and not args.fresh
-    agent = QLearningAgent.load(args.model_path, rng=rng) if loaded else None
+    agent = load_agent(args.model_path, rng=rng) if loaded else None
     if loaded and agent.observation_schema is not None:
         _validate_training_state(agent)
     saved = agent.training_state if loaded else {}
+    kind = agent.agent_kind if loaded else args.agent or "tactical"
+    if args.agent is not None and args.agent != kind:
+        raise ValueError(f"--agent {args.agent} differs from the checkpoint's {kind} learner; use --fresh")
+    if kind == "tactical" and args.state_precision is not None:
+        raise ValueError("--state-precision applies only to the joint learner; use --fresh --agent joint")
+    tactical_only = [flag for flag in ("shaping", "learning_rate_decay", "learning_rate_min")
+                     if getattr(args, flag) is not None]
+    if kind == "joint" and tactical_only:
+        raise ValueError(f"--{tactical_only[0].replace('_', '-')} applies only to the tactical learner")
+    args.agent = kind
+    args.observation = AGENT_TYPES[kind].observation_mode
     _restore_setting(args, saved, "seed", 7)
     _restore_setting(args, saved, "max_steps", 80)
     difficulty = args.difficulty or saved.get('config', {}).get('difficulty', 'normal')
@@ -192,9 +226,10 @@ def build_agent(args, rng):
         config = config_from_args(args, saved.get("config"))
     except (TypeError, KeyError) as error:
         raise ValueError(f'Invalid checkpoint scenario: {error}') from error
-    env = game.Game(config=config, seed=args.seed, ml_ai=True, render=False)
+    env = game.Game(config=config, seed=args.seed, ml_ai=True, render=False, observation=args.observation)
     try:
         schema, size, action_count = env.observation_schema, len(env.reset(seed=args.seed)), env.action_count
+        command_counts = [len(directions) for directions in env.unit_directions]
     finally:
         env.close()
     if loaded:
@@ -202,16 +237,19 @@ def build_agent(args, rng):
             raise ValueError("Checkpoint uses a different action/observation format; use --fresh to retrain")
         if args.state_precision is not None and args.state_precision != agent.state_precision:
             raise ValueError("State precision cannot change on resume; use --fresh")
-        for name in ("learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min", "initial_q"):
+        adjustable = ("learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min", "initial_q")
+        tactical = ("shaping", "learning_rate_decay", "learning_rate_min")
+        for name in adjustable + (tactical if kind == "tactical" else ()):
             if getattr(args, name) is not None:
                 setattr(agent, name, getattr(args, name))
     else:
         rng.seed(args.seed)
-        defaults = dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
-                        epsilon_min=0.05, state_precision=100, initial_q=-100.0)
         options = {name: default if getattr(args, name) is None else getattr(args, name)
-                   for name, default in defaults.items()}
-        agent = QLearningAgent(action_count, rng=rng, observation_schema=schema, observation_size=size, **options)
+                   for name, default in LEARNING_DEFAULTS[kind].items()}
+        if kind == "tactical":
+            agent = TacticalQAgent(command_counts, rng=rng, observation_schema=schema, **options)
+        else:
+            agent = QLearningAgent(action_count, rng=rng, observation_schema=schema, observation_size=size, **options)
     args.config = config
     return agent
 
@@ -264,10 +302,12 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
             source = agent.last_action_source
         next_state, reward, done = env.step(action)
         steps_taken = step + 1
-        truncated = steps_taken == max_steps and not done
         if train:
-            agent.learn(state, action, reward, next_state, done or truncated,
-                        next_valid_actions=[] if done or truncated else env.valid_actions())
+            # A turn limit cuts the episode short without ending the game, and the
+            # observation does not show the turn, so the cut-off state bootstraps.
+            # Treating it as terminal would make stalling until the limit look free.
+            agent.learn(state, action, reward, next_state, done,
+                        next_valid_actions=[] if done else env.valid_actions())
         counts[source] += 1
         total_reward += float(reward)
         state = next_state
@@ -298,7 +338,8 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
     original_size = agent.observation_size
     try:
         for policy in policies:
-            env = game.Game(config=config, seed=seed, ml_ai=True, render=render)
+            env = game.Game(config=config, seed=seed, ml_ai=True, render=render,
+                            observation=agent.observation_mode)
             rows = []
             try:
                 for index in range(count):
@@ -378,7 +419,8 @@ def train_agent(agent, args):
     for offset in range(args.episodes):
         episode = start_episode + offset
         config = episode_config(args, episode)
-        env = game.Game(config=config, seed=args.seed + episode, ml_ai=True, render=args.render_training)
+        env = game.Game(config=config, seed=args.seed + episode, ml_ai=True, render=args.render_training,
+                        observation=agent.observation_mode)
         try:
             result = run_episode(env, agent, episode, args.max_steps, train=True,
                                  seed=args.seed + episode, render_delay_ms=args.render_delay_ms,
@@ -481,8 +523,10 @@ def main(argv=None):
             print(f"saved model to {args.model_path}")
         evaluations = evaluate_agent(agent, args) if args.eval_episodes else {}
         settings = {name: getattr(agent, name) for name in
-                    ('learning_rate', 'discount_factor', 'epsilon', 'epsilon_decay', 'epsilon_min',
-                     'state_precision', 'initial_q', 'episodes_trained', 'observation_schema')}
+                    ('agent_kind', 'learning_rate', 'discount_factor', 'epsilon', 'epsilon_decay', 'epsilon_min',
+                     'state_precision', 'shaping', 'learning_rate_decay', 'learning_rate_min', 'initial_q',
+                     'episodes_trained', 'observation_schema')
+                    if hasattr(agent, name)}
         settings.update({name: getattr(args, name) for name in
                          ('seed', 'max_steps', 'eval_seed', 'eval_episodes', 'eval_policies',
                           'eval_guidance', 'validation_seed', 'validation_episodes',

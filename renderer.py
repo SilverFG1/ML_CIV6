@@ -5,15 +5,10 @@ import time
 
 import constants
 from class_hex import direction_between, neighbor_positions
+from economy import BUILDING_SPECS
+from icons import IconSet
 
-# Warriors share the plain unit sprite; other types get a short coloured label.
-UNIT_LABELS = {
-    'spearman': ('SPEARMAN', (170, 215, 255)),
-    'heavy_chariot': ('CHARIOT', (235, 160, 235)),
-    'slinger': ('SLINGER', (255, 190, 130)),
-    'archer': ('ARCHER', (255, 235, 140)),
-    'battering_ram': ('RAM', (200, 200, 200)),
-}
+# Each unit type carries an icon badge (icons.py).
 RAIDER_COLOR = (255, 110, 100)
 RIVER_COLOR = (64, 140, 225)
 # Polygon corner indices (from _polygon) for the side facing each neighbour.
@@ -29,6 +24,15 @@ TERRITORY_COLOR, CITIZEN_COLOR = (232, 72, 72), (250, 250, 250)
 MONUMENT_COLOR, GRANARY_COLOR, GRANARY_ROOF = (214, 208, 196), (206, 164, 92), (150, 104, 56)
 # Horizontal position of each building's icon on the city tile.
 BUILDING_SPOTS = {'monument': .24, 'granary': .76}
+# District tiles are outlined in their badge colour and labelled under the icon.
+DISTRICT_STYLES = {
+    'campus': ('CAMPUS', (96, 158, 232)),
+    'holy_site': ('HOLY SITE', (228, 168, 58)),
+    'encampment': ('ENCAMP', (214, 66, 66)),
+}
+BLOCKED_COLOR = constants.COLOR_RED
+FOUNDED_COLOR = constants.COLOR_PURPLE
+STATUS_ICON = 18
 WALL_COLOR = (196, 184, 156)
 RUINED_WALL_COLOR = (112, 102, 90)
 WALL_OUTLINE = (70, 62, 52)
@@ -47,14 +51,15 @@ class Renderer:
         self.size = max(20, min(96, int(1180 / (env.config.width + .5)),
                                int(720 / (env.config.height * .75 + .25))))
         self.margin = 24
-        width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
+        self.font = pygame.font.SysFont('Segoe UI', 16)
+        self.small_font = pygame.font.SysFont('Segoe UI', max(11, min(16, self.size // 5)))
+        self.icons = IconSet(pygame)
+        self.width = max(640, int((env.config.width + .5) * self.size) + 2 * self.margin)
         # Text panel under the map; the economy adds a line or two.
         self.panel_height = self._panel_height()
         height = int((env.config.height * .75 + .25) * self.size) + 2 * self.margin + self.panel_height
-        self.surface = pygame.display.set_mode((width, height))
+        self.surface = pygame.display.set_mode((self.width, height))
         pygame.display.set_caption('ML_CIV6 — training and evaluation')
-        self.font = pygame.font.SysFont('Segoe UI', 16)
-        self.small_font = pygame.font.SysFont('Segoe UI', max(11, min(16, self.size // 5)))
         self.clock = pygame.time.Clock()
         self.paused = False
         self.delay_ms = None
@@ -67,7 +72,44 @@ class Renderer:
             self.images[name] = pygame.transform.smoothscale(loaded, (self.size, self.size))
 
     def _panel_height(self):
-        return 118 + (44 if self.env.config.economy else 0)
+        """Room for the status rows, with a spare row once the economy runs, and the controls."""
+        width = self.width - 2 * self.margin
+        rows = self._field_rows(self.status_fields(), width)
+        if self.env.economy is not None:
+            rows += self._field_rows(self.env.economy.status_fields(), width) + 1
+        elif self.env.config.economy:
+            rows += 3
+        return 118 + 22 * (rows - 1)
+
+    def _icon(self, name, pos, size):
+        self.surface.blit(self.icons.get(name, max(1, int(size))), (int(pos[0]), int(pos[1])))
+
+    def _field_layout(self, fields, width):
+        """Place (icon, text) fields left to right, wrapping at width: [(row, x, field)]."""
+        placed, row, x = [], 0, 0
+        for field in fields:
+            icon, text = field
+            field_width = self.font.size(text)[0] + (STATUS_ICON + 4 if icon else 0)
+            if x and x + field_width > width:
+                row, x = row + 1, 0
+            placed.append((row, x, field))
+            x += field_width + self.font.size('   ')[0]
+        return placed
+
+    def _field_rows(self, fields, width):
+        placed = self._field_layout(fields, width)
+        return placed[-1][0] + 1 if placed else 0
+
+    def _draw_fields(self, fields, pos):
+        """Draw status fields with their icons; return the number of rows used."""
+        placed = self._field_layout(fields, self.surface.get_width() - 2 * self.margin)
+        for row, x, (icon, text) in placed:
+            x, y = pos[0] + x, pos[1] + 22 * row
+            if icon:
+                self._icon(icon, (x, y + 1), STATUS_ICON)
+                x += STATUS_ICON + 4
+            self._text(text, (x, y))
+        return placed[-1][0] + 1 if placed else 0
 
     def _position(self, position):
         x, y = position
@@ -108,11 +150,9 @@ class Renderer:
         if self.show_yields:
             for cell in self.env.map.grid.values():
                 self._draw_yields(cell)
-        if self.env.economy is not None:
-            for position in self.env.economy.worked_tiles():
-                center = self.citizen_marker(position)
-                p.draw.circle(self.surface, CITIZEN_COLOR, center, max(3, self.size // 14))
-                p.draw.circle(self.surface, TERRITORY_COLOR, center, max(3, self.size // 14), 2)
+        economy = self.env.economy
+        if economy is not None:
+            self._draw_city_systems(economy)
         cities = self.env.cities
         capital = self.env.capital
         towns = cities + ([capital] if capital is not None else [])
@@ -126,7 +166,9 @@ class Renderer:
             if obj.alive or is_city:
                 image = self.images['city' if is_city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
-                label = UNIT_LABELS.get(getattr(obj, 'unit_type', None))
+                label = None
+                if obj in self.env.units:
+                    self._icon(f'unit_{obj.unit_type}', (x + self.size * .04, y + self.size * .18), self.size * .3)
                 if obj is capital:
                     label = ('CAPITAL', (150, 200, 255)) if obj.alive else ('LOST', RAIDER_COLOR)
                 elif obj in raiders:
@@ -145,13 +187,21 @@ class Renderer:
                 self._draw_walls(obj)
                 self._draw_buildings(obj)
             self._text(f'{obj.name_instance} {obj.hp:.0f}', (x + 2, y + self.size * .7), small=True)
+        if economy is not None and self.env.city.alive:
+            # Drawn over units: a white token marks a worked tile, a red one a tile a unit is blocking.
+            for positions, color in ((economy.worked_tiles(), CITIZEN_COLOR), (economy.blocked_tiles(), BLOCKED_COLOR)):
+                for position in positions:
+                    center = self.citizen_marker(position)
+                    p.draw.circle(self.surface, color, center, max(3, self.size // 14))
+                    p.draw.circle(self.surface, TERRITORY_COLOR if color == CITIZEN_COLOR else (30, 30, 30),
+                                  center, max(3, self.size // 14), 2)
         if self.env.human:
             unit = self.env.units[self.selected_unit]
             p.draw.polygon(self.surface, (255, 230, 100), self._polygon(unit.position), 3)
         y = self.surface.get_height() - self.panel_height + 9
-        y += 22 * self._wrapped_text(self.status_text(), (self.margin, y))
+        y += 22 * self._draw_fields(self.status_fields(), (self.margin, y))
         if self.env.economy is not None:
-            y += 22 * self._wrapped_text(self.env.economy.status_text(), (self.margin, y))
+            y += 22 * self._draw_fields(self.env.economy.status_fields(), (self.margin, y))
         if self.env.human:
             controls = ('Tab: unit   Q/E/A/D/Z/X: move   Space: heal   F: shoot (archer/slinger)   '
                         'Y: yields   R: restart   Esc: quit')
@@ -163,7 +213,38 @@ class Renderer:
             self._text('PAUSED', (self.margin, y + 9 + 22 * control_lines), (255, 220, 100))
         p.display.flip()
 
+    def _draw_city_systems(self, economy):
+        """Farms, cities the settlers founded, districts and their buildings, and civilians."""
+        p, s = self.pygame, self.size
+        for position in economy.farms:
+            x, y = self._position(position)
+            self._icon('farm', (x + s * .31, y + s * .42), s * .38)
+        for position in economy.founded_cities:
+            x, y = self._position(position)
+            p.draw.polygon(self.surface, FOUNDED_COLOR, self._polygon(position), 3)
+            self._icon('settlement', (x + s * .27, y + s * .14), s * .46)
+            self._text('NEW CITY', (x + 2, y + s * .66), (235, 220, 255), small=True)
+        for district, position in economy.districts.items():
+            label, color = DISTRICT_STYLES[district]
+            x, y = self._position(position)
+            p.draw.polygon(self.surface, color, self._polygon(position), 4)
+            self._icon(f'district_{district}', (x + s * .29, y + s * .1), s * .42)
+            self._text(label, (x + 4, y + s * .56), color, small=True)
+            buildings = [name for name in self.env.city.buildings if BUILDING_SPECS[name].district == district]
+            for index, name in enumerate(buildings):
+                self._icon(f'building_{name}', (x + s * (.62 + .2 * index), y + s * .34), s * .22)
+        for civilian in self.env.civilians:
+            if civilian.alive:
+                x, y = self._position(civilian.position)
+                self._icon(f'civilian_{civilian.kind}', (x + s * .26, y + s * .16), s * .48)
+                charges = f' ({civilian.charges})' if civilian.kind == 'builder' else ''
+                self._text(civilian.name_instance + charges, (x + 2, y + s * .7), small=True)
+
     def status_text(self):
+        return '   '.join(text for _, text in self.status_fields())
+
+    def status_fields(self):
+        """The game's status line as (icon name or None, text) fields."""
         env = self.env
         city, cities, capital = env.city, env.cities, env.capital
         outcome = env.last_info['outcome']
@@ -173,22 +254,27 @@ class Renderer:
             outcome = 'CAPITAL LOST'
         else:
             outcome = outcome.upper()
+        fields = [('turn', f'Turn {env.turn_number}')]
         if len(cities) == 1:
             walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
                      if city.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
-            status = f'City {city.hp:.0f}/{city.hp_max:.0f}   {walls}'
+            fields += [('city_hp', f'City {city.hp:.0f}/{city.hp_max:.0f}'), ('walls', walls)]
         else:
-            status = f'Cities captured {env.cities_captured()}/{len(cities)}'
+            fields.append(('captured', f'Cities captured {env.cities_captured()}/{len(cities)}'))
         if capital is not None:
-            status += f'   Capital {capital.hp:.0f}/{capital.hp_max:.0f}'
-        text = f'Turn {env.turn_number}   {status}   {outcome}'
+            fields.append(('city_hp', f'Capital {capital.hp:.0f}/{capital.hp_max:.0f}'))
+        fields.append((None, outcome))
         if city.buildings:
-            effects = [f'+{amount} {kind}' for kind, amount in city.building_yields.items()]
+            effects = [f'+{amount:g} {kind}' for kind, amount in city.building_yields.items()]
             if city.building_housing:
-                effects.append(f'+{city.building_housing} housing')
+                effects.append(f'+{city.building_housing:g} housing')
             names = ', '.join(name.title() for name in city.buildings)
-            text += f'   {names} ({", ".join(effects)})'
-        return text
+            fields.append((f'building_{city.buildings[0]}', f'{names} ({", ".join(effects)})'))
+        if env.civilian_kinds:
+            captured = sum(c.status == 'captured' for c in env.civilians)
+            fields += [('captured', f'Civilians captured {captured}'),
+                       ('settlement', f'Cities founded {len(env.economy.founded_cities)}')]
+        return fields
 
     def citizen_marker(self, position):
         """Where a worked tile shows its citizen marker."""
@@ -220,6 +306,8 @@ class Renderer:
         outline = (40, 36, 32)
         city = city or self.env.city
         for name in city.buildings:
+            if name not in BUILDING_SPOTS:
+                continue  # Buildings in a district are drawn on the district's tile.
             cx, base = self.building_spot(name, city)
             if name == 'monument':
                 obelisk = [(cx - s * .05, base), (cx - s * .03, base - s * .2), (cx, base - s * .25),

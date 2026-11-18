@@ -187,6 +187,44 @@ class RendererTests(unittest.TestCase):
         self.assertTrue(env.render_frame())
         self.assertIn('CAPITAL LOST', renderer.status_text())
 
+    def test_draws_districts_civilians_farms_founded_cities_and_status_icons(self):
+        from renderer import BLOCKED_COLOR, DISTRICT_STYLES, FOUNDED_COLOR
+        env = Game(render=True, config=GameConfig(
+            unit_count=1, economy=True, city_population=4, districts=('campus', 'encampment'),
+            buildings=('monument', 'library', 'barracks'), city_builders=1, city_settlers=1,
+            city_governor='pingala', city_pantheon='fertility_rites', city_war_weariness=500))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        economy = env.economy
+        blocked = sorted(economy.workable_tiles())[0]
+        env.units[0].x, env.units[0].y = blocked
+        economy.farms.add(sorted(economy.workable_tiles())[0])
+        economy.founded_cities.append((0, 0))
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        surface = renderer.surface
+        for district in ('campus', 'encampment'):
+            corner = renderer._polygon(economy.districts[district])[1]
+            with self.subTest(district=district):
+                self.assertEqual(tuple(surface.get_at((int(corner[0]) - 1, int(corner[1]) + 1)))[:3],
+                                 DISTRICT_STYLES[district][1])
+        corner = renderer._polygon((0, 0))[1]
+        self.assertEqual(tuple(surface.get_at((int(corner[0]) - 1, int(corner[1]) + 1)))[:3], FOUNDED_COLOR)
+        center = renderer.citizen_marker(blocked)
+        self.assertEqual(tuple(surface.get_at((int(center[0]), int(center[1]))))[:3], BLOCKED_COLOR)
+        text = economy.status_text()
+        for expected in ('Pop 4', 'Amenities', 'Loyalty', 'War weariness 500', 'Science', 'Pingala, establishing',
+                         'toward Fertility rites'):
+            self.assertIn(expected, text)
+        self.assertIn('Civilians captured 0', renderer.status_text())
+        # Every status field with an icon draws it; a turn later the panel still fits.
+        icon_names = [icon for icon, _ in renderer.status_fields() + economy.status_fields() if icon]
+        self.assertIn('mood_displeased', icon_names)
+        for name in icon_names:
+            renderer.icons.get(name, 18)
+        env.step(env.encode_action(['SPACE']))
+        self.assertTrue(env.render_frame())
+
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))
         env.reset(seed=7)

@@ -375,7 +375,9 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'fresh'):
             self.make_agent(self.args('--buildings', 'monument'))
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            run_game.parse_args(['--buildings', 'library'])
+            run_game.parse_args(['--buildings', 'palace'])
+        with self.assertRaisesRegex(ValueError, 'campus'):
+            self.make_agent(self.args('--fresh', '--buildings', 'library'))
 
     def test_economy_resumes_and_rejects_changes(self):
         args = self.args('--economy', '--city-population', '2', '--build-queue', 'ancient_walls', 'monument')
@@ -439,6 +441,55 @@ class RunnerTests(unittest.TestCase):
             self.make_agent(self.args('--raid-interval', '5'))
         with self.assertRaisesRegex(ValueError, 'does not apply'):
             self.make_agent(self.args('--fresh', '--mode', 'empire', '--player-capital'))
+
+    def test_city_systems_resume_report_and_reject_changes(self):
+        flags = ('--economy', '--city-population', '4', '--districts', 'campus', '--buildings', 'monument', 'library',
+                 '--build-queue', 'ancient_walls', 'encampment', 'barracks', '--city-luxuries', '1',
+                 '--city-war-weariness', '100', '--city-loyalty', '90', '--foreign-city', '6', '5',
+                 '--city-governor', 'pingala', '--governor-promotion', 'researcher', '--pantheon', 'fertility_rites',
+                 '--city-faith', '5', '--city-builders', '1', '--city-settlers', '1')
+        args = self.args(*flags)
+        agent = self.make_agent(args)
+        config = args.config
+        self.assertEqual((config.districts, config.foreign_city, config.city_governor_promotion, config.city_pantheon),
+                         (('campus',), (6, 5), 'researcher', 'fertility_rites'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        evaluations = run_game.compare_policies(agent, args, verbose=False)
+        for summary in evaluations.values():
+            for name in ('average_city_population', 'average_builds_completed', 'average_civilians_captured',
+                         'average_cities_founded'):
+                self.assertIn(name, summary)
+            self.assertEqual(summary['free_cities'], 0)
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertEqual(resume_args.config, config)
+        for changed, flag in [(('--districts', 'holy_site'), '--districts'),
+                              (('--governor-promotion', 'connoisseur'), '--governor-promotion'),
+                              (('--pantheon', 'city_patron_goddess'), '--pantheon'),
+                              (('--foreign-city', '6', '6'), '--foreign-city'),
+                              (('--city-builders', '2'), '--city-builders')]:
+            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, f'{flag} differs.*fresh'):
+                self.make_agent(self.args(*changed))
+        with self.assertRaisesRegex(ValueError, 'need the city economy'):
+            self.make_agent(self.args('--fresh', '--city-luxuries', '1'))
+        with self.assertRaisesRegex(ValueError, '--pantheon does not apply'):
+            self.make_agent(self.args('--fresh', '--mode', 'empire', '--pantheon', 'fertility_rites'))
+        for bad in [('--city-builders', '3'), ('--pantheon', 'god_of_war'), ('--districts', 'forum')]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run_game.parse_args(list(bad))
+
+    def test_free_cities_are_counted_and_resume(self):
+        args = self.args('--economy', '--city-population', '3', '--city-loyalty', '1', '--foreign-city', '20', '4')
+        agent = self.make_agent(args)
+        run_game.train_agent(agent, args)
+        self.assertTrue(all(row['outcome'] == 'free_city' for row in agent.training_state['metrics']))
+        agent.save(args.model_path)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            evaluations = run_game.compare_policies(agent, args)
+        self.assertIn('free cities 2', output.getvalue())
+        self.assertEqual(evaluations['heuristic']['free_cities'], 2)
+        self.make_agent(self.args())  # free-city rows pass checkpoint validation
 
     def test_checkpoint_without_river_setting_resumes_without_rivers(self):
         args = self.args()

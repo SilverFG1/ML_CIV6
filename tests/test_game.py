@@ -678,7 +678,7 @@ class GameTests(unittest.TestCase):
                 self.assertEqual(env.city.buildings, buildings)
                 self.assertEqual((env.city.building_yields, env.city.building_housing), (yields, housing))
         with self.assertRaises(ValueError):
-            C_City(0, 0, buildings=('library',))
+            C_City(0, 0, buildings=('palace',))
 
     def test_buildings_do_not_change_play(self):
         def trace(buildings):

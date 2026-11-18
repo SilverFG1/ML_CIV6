@@ -15,7 +15,13 @@ from learning_ai import AGENT_TYPES, EmpireQAgent, QLearningAgent, TacticalQAgen
 
 
 DEFAULT_MODEL_PATH = Path("q_learning_model.json")
-TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types", "buildings", "build_queue")
+TUPLE_SETTINGS = ("city_position", "unit_strengths", "unit_types", "land_types", "buildings", "build_queue",
+                  "districts", "foreign_city")
+# The enemy capital's economy settings, by GameConfig field; each needs --economy.
+CITY_SETTINGS = ("districts", "city_luxuries", "city_war_weariness", "city_loyalty", "foreign_city", "city_governor",
+                 "city_governor_promotion", "city_pantheon", "city_faith", "city_builders", "city_settlers")
+# Flags whose names differ from their GameConfig fields.
+FLAG_NAMES = {"city_governor_promotion": "governor-promotion", "city_pantheon": "pantheon"}
 # Defaults for a new model of each learner; checkpoints restore their own values.
 LEARNING_DEFAULTS = {
     "tactical": dict(learning_rate=0.1, discount_factor=0.95, epsilon=1.0, epsilon_decay=0.995,
@@ -31,7 +37,7 @@ MODES = ("siege", "empire")
 # Scenario flags that only one mode understands.
 SIEGE_SETTINGS = ("unit_count", "unit_types", "unit_strengths", "city_strength", "wall_hp", "walls", "buildings",
                   "ranged_strength", "city_population", "build_queue", "city_position", "city_count",
-                  "raid_interval", "capital_strength", "raider_strength")
+                  "raid_interval", "capital_strength", "raider_strength") + CITY_SETTINGS
 EMPIRE_SETTINGS = ("rivals", "map_type", "turn_limit", "resource_density", "rival_bonus", "speed")
 # The empire curriculum ramps the rival's bonus up from this level.
 EMPIRE_CURRICULUM_START = 0.5
@@ -113,7 +119,8 @@ def parse_args(argv=None):
     parser.add_argument("--land-types", nargs="+", choices=game.LAND_TYPES,
                         help="Civ VI land types to fill the map with, in regions (default: grassland)")
     parser.add_argument("--buildings", nargs="+", choices=game.BUILDING_TYPES,
-                        help="city buildings: monument (+2 culture), granary (+1 food, +2 housing)")
+                        help="city buildings: monument (+2 culture, +1 loyalty), granary (+1 food, +2 housing); "
+                             "with --economy and their district, library, shrine and barracks")
     parser.add_argument("--economy", action="store_true",
                         help="run the city's economy: growth, production of --build-queue, and border growth")
     parser.add_argument("--city-population", type=int, choices=range(1, game.MAX_CITY_POPULATION + 1), metavar="N",
@@ -121,6 +128,27 @@ def parse_args(argv=None):
     parser.add_argument("--build-queue", nargs="+", choices=game.BUILD_ITEMS,
                         help="what the city builds, in order, with --economy (default: "
                              + " ".join(game.DEFAULT_BUILD_QUEUE) + ")")
+    city_group = parser.add_argument_group("enemy capital's economy (each needs --economy)")
+    city_group.add_argument("--districts", nargs="+", choices=game.DISTRICT_TYPES,
+                            help="ancient-era districts the city starts with")
+    city_group.add_argument("--city-luxuries", type=int, help="luxury resources, each one amenity (0-8, default: 0)")
+    city_group.add_argument("--city-war-weariness", type=int,
+                            help="war weariness the city's civilization starts with (0-10000 points, default: 0)")
+    city_group.add_argument("--city-loyalty", type=int, help="the city's starting loyalty (1-100, default: 100)")
+    city_group.add_argument("--foreign-city", type=int, nargs=2, metavar=("POPULATION", "DISTANCE"),
+                            help="a city of the squad's civilization 4-9 hexes away whose citizens pressure "
+                                 "the city's loyalty")
+    city_group.add_argument("--city-governor", choices=tuple(game.GOVERNORS),
+                            help="the governor appointed to the city when the game starts")
+    city_group.add_argument("--governor-promotion", dest="city_governor_promotion",
+                            choices=game.GOVERNOR_PROMOTIONS, help="the governor's one ancient-era promotion")
+    city_group.add_argument("--pantheon", dest="city_pantheon", choices=game.PANTHEONS,
+                            help="the pantheon belief the civilization founds once it stores 25 faith")
+    city_group.add_argument("--city-faith", type=int, help="faith the civilization starts with (0-500, default: 0)")
+    city_group.add_argument("--city-builders", type=int, choices=range(0, game.MAX_CIVILIANS + 1), metavar="N",
+                            help="builders the city starts with (0-2, default: 0)")
+    city_group.add_argument("--city-settlers", type=int, choices=range(0, game.MAX_CIVILIANS + 1), metavar="N",
+                            help="settlers the city starts with (0-2, default: 0)")
     parser.add_argument("--walls", choices=game.WALL_TYPES,
                         help="city walls; ancient gives 100 wall HP and a 15-strength ranged strike")
     parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
@@ -192,7 +220,7 @@ def config_from_args(args, saved=None):
                  "buildings", "ranged_strength", "mountain_density", "forest_density", "land_types", "hills_density",
                  "water_density", "river_count", "unit_strengths", "unit_types", "difficulty",
                  "city_population", "build_queue", "city_count", "raid_interval", "capital_strength",
-                 "raider_strength"):
+                 "raider_strength", *CITY_SETTINGS):
         value = getattr(args, name)
         if value is not None:
             explicit[name] = tuple(value) if name in TUPLE_SETTINGS else value
@@ -211,14 +239,12 @@ def config_from_args(args, saved=None):
         if name in TUPLE_SETTINGS and old is not None:
             old = tuple(old)
         if saved and old != value:
-            raise ValueError(f"--{name.replace('_', '-')} differs from the checkpoint; use --fresh for a new scenario")
+            flag = FLAG_NAMES.get(name, name.replace("_", "-"))
+            raise ValueError(f"--{flag} differs from the checkpoint; use --fresh for a new scenario")
         values[name] = value
     values["city_position"] = None if values["city_position"] is None else tuple(values["city_position"])
-    values["unit_strengths"] = tuple(values["unit_strengths"])
-    values["unit_types"] = tuple(values["unit_types"])
-    values["land_types"] = tuple(values["land_types"])
-    values["buildings"] = tuple(values["buildings"])
-    values["build_queue"] = tuple(values["build_queue"])
+    for name in TUPLE_SETTINGS[1:]:
+        values[name] = tuple(values[name])
     return game.GameConfig(**values)
 
 
@@ -322,7 +348,7 @@ def _validate_training_state(agent):
             raise ValueError('Checkpoint history action counts disagree')
         if demonstration and row['guidance_actions'] != row['steps']:
             raise ValueError('Checkpoint history demonstrations must be played entirely by the heuristic')
-        if row['outcome'] not in ('win', 'loss', 'timeout', 'quit') or not 0 <= row['epsilon'] <= 1:
+        if row['outcome'] not in ('win', 'loss', 'timeout', 'quit', 'free_city') or not 0 <= row['epsilon'] <= 1:
             raise ValueError('Checkpoint history contains invalid outcomes or exploration rates')
     best = state.get('best_validation_score')
     if best is not None and (not isinstance(best, list) or len(best) != 2
@@ -364,7 +390,7 @@ def build_agent(args, rng):
     if mode == "empire":
         wrong += [flag for flag in ("economy", "no_city_healing", "player_capital") if getattr(args, flag)]
     if wrong:
-        raise ValueError(f"--{wrong[0].replace('_', '-')} does not apply to --mode {mode}")
+        raise ValueError(f"--{FLAG_NAMES.get(wrong[0], wrong[0].replace('_', '-'))} does not apply to --mode {mode}")
     if kind != "joint" and args.state_precision is not None:
         raise ValueError("--state-precision applies only to the joint learner; use --fresh --agent joint")
     if kind != "tactical" and args.shaping is not None:
@@ -589,6 +615,8 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 "losses": sum(row["outcome"] == "loss" for row in rows),
                 "timeouts": sum(row["outcome"] == "timeout" for row in rows),
                 "quits": sum(row["outcome"] == "quit" for row in rows),
+                # The enemy capital declared independence: it left its civilization without being captured.
+                "free_cities": sum(row["outcome"] == "free_city" for row in rows),
                 "win_rate": wins / completed if completed else 0.0,
                 "average_reward": sum(row["reward"] for row in rows) / completed if completed else 0.0,
                 "average_steps": sum(row["steps"] for row in rows) / completed if completed else 0.0,
@@ -607,8 +635,9 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                                 if name.startswith("average_")
                                 and name not in ("average_reward", "average_steps", "average_capital_lost"))
                 capital = f" (capital lost {summary['capital_losses']})" if "capital_losses" in summary else ""
+                free = f", free cities {summary['free_cities']}" if summary["free_cities"] else ""
                 print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}{capital}, "
-                      f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}{extra}")
+                      f"timeouts {summary['timeouts']}{free}, average reward {summary['average_reward']:.2f}{extra}")
             if summaries[policy]["quits"]:
                 break
     finally:

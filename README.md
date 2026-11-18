@@ -79,9 +79,13 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--ranged-strength` | Configure the city's ranged attack strength. |
 | `--wall-hp` | Set the city's initial wall health. |
 | `--walls none\|ancient` | Give the city Civ VI Ancient Walls: 100 wall health and a ranged strike. |
-| `--buildings monument granary` | Give the city a Monument (+2 culture) and/or a Granary (+1 food, +2 housing). |
+| `--buildings ...` | Give the city buildings: Monument, Granary, or with `--economy` and their district, Library, Shrine and Barracks (see [City buildings and districts](#city-buildings-and-districts)). |
 | `--economy` | Run the city's economy: it grows, builds, and claims tiles while you besiege it. |
-| `--city-population N`, `--build-queue ...` | With `--economy`, set the starting population (1–20, default 1) and what the city builds, in order (default: `monument granary ancient_walls`). |
+| `--city-population N`, `--build-queue ...` | With `--economy`, set the starting population (1–20, default 1) and what the city builds, in order (default: `monument granary ancient_walls`); districts can be queued too. |
+| `--districts campus holy_site encampment` | With `--economy`, districts the city starts with. |
+| `--city-luxuries N`, `--city-war-weariness POINTS`, `--city-loyalty N`, `--foreign-city POPULATION DISTANCE` | With `--economy`, the city's amenities, its civilization's war weariness, its loyalty, and a city of yours that pressures it (see [City economy](#city-economy)). |
+| `--city-governor NAME`, `--governor-promotion NAME`, `--pantheon BELIEF`, `--city-faith N` | With `--economy`, the city's governor and promotion, and the pantheon its civilization founds once it stores 25 faith. |
+| `--city-builders N`, `--city-settlers N` | With `--economy`, up to two builders and two settlers that you can capture. |
 | `--mountain-density`, `--forest-density` | Control terrain generation. |
 | `--land-types grassland plains desert tundra snow` | Fill the map with these Civ VI land types, in regions (default: grassland). |
 | `--hills-density`, `--water-density` | Turn this share of land into hills, or of all tiles into water. |
@@ -110,33 +114,67 @@ Rivers run along the edges between tiles, not across tiles. Each river starts at
 
 The environment offers two observations. The tactical learner uses the egocentric encoding described in [How the AI works](#how-the-ai-works). Terrain, rivers, walls, and the economy reach it only through the features and odds they change, so its format never varies. The joint learner (`--agent joint`) uses the raw encoding: normalized absolute city/unit coordinates, row parity, health, survival, melee/ranged strengths, attack range, walls, and the terrain grid. With any of `--land-types`, `--hills-density`, or `--water-density`, each tile instead reports three combat properties: impassable, extra movement cost, and defense bonus, and the raw observation schema includes `:terrain`. With rivers enabled, it also has three river flags per tile, for the tile's east, southeast, and southwest edges, and the schema ends in `:rivers`. `--economy` adds city features and `:economy` (see [City economy](#city-economy)). Each further enemy city adds its own city features (schema `:cities=N`), and `--player-capital` adds the capital and up to four raiders (schema `:capital`). Scenarios without these options keep the earlier observation format, so existing models still load. Legal-action masks account for sequential movement, exclude impossible choices, and restrict dead units to waiting. Joint actions grow exponentially: three warriors produce 343 combinations before masking, and four produce 2,401. Each archer or slinger has eight possible commands instead of seven. The tactical learner still chooses among these joint actions, but its tables store values per unit and tactic, so their size does not grow with the number of joint actions. Use the reported baselines to judge whether training improves the learned policy.
 
-### City buildings
+### City buildings and districts
 
-`--buildings` gives the city Civ VI city-centre buildings, with their base-game values:
+`--buildings` gives the city Civ VI buildings, and `--districts` (with `--economy`) its ancient-era districts. Values follow Gathering Storm:
 
-| Building | Effect | Production cost | Requires |
+| Building | Stands in | Effect | Production cost | Requires |
+| --- | --- | --- | --- | --- |
+| Monument | City centre | +2 culture, +1 loyalty | 60 | — |
+| Granary | City centre | +1 food, +2 housing | 65 | Pottery |
+| Ancient Walls | City centre | 100 wall health and a ranged strike (see above) | 80 | Masonry |
+| Library | Campus | +2 science | 80 | Writing |
+| Shrine | Holy Site | +2 faith | 65 | Astrology |
+| Barracks | Encampment | +1 production, +1 housing | 80 | Bronze Working |
+
+| District | Cost | Placement | Adjacency bonus |
 | --- | --- | --- | --- |
-| Monument | +2 culture | 60 | — |
-| Granary | +1 food, +2 housing | 65 | Pottery |
+| `campus` | 54 | An owned land tile within 3 hexes of the centre | Science: +1 per adjacent mountain, +1 per 2 adjacent districts |
+| `holy_site` | 54 | An owned land tile within 3 hexes of the centre | Faith: +1 per adjacent mountain, +1 per 2 adjacent woods, +1 per 2 adjacent districts |
+| `encampment` | 54 | An owned land tile 2–3 hexes from the centre | None |
 
-Some wikis list a later cost of 50 for both; the simulator records cost but has no production yet. The city exposes the totals as `city.building_yields` (e.g. `{'food': 1, 'culture': 2}`) and `city.building_housing`. The renderer draws an obelisk (Monument) and a small barn (Granary) on the city tile and lists the buildings and their effects in the status line. As in Civ VI, neither building affects combat. Without `--economy` they change nothing else either; with it, their yields and housing feed the city's growth and borders.
+The city exposes its building totals as `city.building_yields` (e.g. `{'food': 1, 'culture': 2}`), `city.building_housing` and `city.building_loyalty`. Buildings never affect combat, and without `--economy` they change nothing else either. With several enemy cities, every city gets the city-centre buildings and walls; only the enemy capital has districts. A building in a district needs that district, given with `--districts` or queued before it.
+
+- **Placement.** A district goes on the free tile with the best adjacency bonus, then the lowest yields; the city centre counts as a district for adjacency. Citizens no longer work its tile, a district placed on a farm replaces it, and a tile with a unit, civilian or raider on it cannot take one. A starting district claims the land it needs, as if the borders had grown earlier.
+- **District limit.** One district, plus one for every three citizens beyond the first (1 at population 1–3, 2 at 4–6, and so on). A starting configuration over the limit is rejected; a queued district waits.
+- **The Encampment** blocks movement like a mountain and cannot be attacked, but it is never placed where it would cut any tile off from the city. Each turn it strikes a unit within 2 hexes of it at the city's ranged strength, or 15 (Civ VI's value without ranged units) when the city has none. Battering rams help against Ancient Walls as they do against `--wall-hp`.
+
+The renderer draws an obelisk (Monument) and a small barn (Granary) on the city tile and lists the buildings and their effects in the status line. Each district is outlined in its own colour with a badge (an open book, a star, a shield) and the icons of its buildings.
 
 ### City economy
 
 `--economy` runs a Civ VI-style economy for the city you are besieging (with several cities, the enemy capital), at the end of each of its turns:
 
-- **Yields.** The city collects yields from its centre tile (always at least 2 food and 1 production), one worked tile per citizen, and its buildings.
-- **Citizens** work the owned tiles with the most food and production, preferring food on ties. They swap production for food when the city would otherwise starve. They cannot work mountains, the centre, or **a tile one of your units stands on**, so a siege can starve the city or slow its building.
+- **Yields.** The city collects yields from its centre tile (always at least 2 food and 1 production), one worked tile per citizen, its buildings, and its districts' adjacency bonuses.
+- **Citizens** work the owned tiles with the most food and production, preferring food on ties. They swap production for food when the city would otherwise starve. They cannot work mountains, the centre, districts, tiles more than 3 hexes out, or **a tile one of your units stands on**, so a siege can starve the city or slow its building.
 - **Food.** Each citizen eats 2 food. Surplus fills the food store, and the city grows when it holds 15, 24, 33, 44, … food (15 + 8(n−1) + (n−1)^1.5). If the store would go negative, the city loses a citizen.
-- **Housing** is 2, or 3 next to water, or 5 next to a river; a Granary adds 2. Growth halves one citizen below housing, drops to a quarter at or above it, and stops five above it.
-- **Production** builds the `--build-queue` in order: Monument (60), Granary (65), Ancient Walls (80). Overflow carries over, and items the city already has are skipped. Finished walls arrive at full health and switch on the city's ranged strike.
-- **Culture** (2 per turn from a Monument) claims a new tile every 10, then 10 + (6t)^1.3 culture, where t is the number of tiles claimed so far. Each claim takes the best unowned tile next to the territory, up to 3 tiles from the centre. A new city owns its centre and the six tiles around it.
+- **Housing** is 2, or 3 next to water, or 5 next to a river; a Granary adds 2, Barracks 1, and each farm half a house. Growth halves one citizen below housing, drops to a quarter at or above it, and stops five above it.
+- **Production** goes to the first item in the `--build-queue` (default `monument granary ancient_walls`) that the city can build now. An item waits while its district is missing, the district limit is reached or no tile is free, keeping its progress. Overflow carries over to the next item, production is lost when nothing can be built, and items the city already has are skipped. Finished walls arrive at full health and switch on the city's ranged strike.
+- **Culture** claims a new tile every 10, then 10 + (6t)^1.3 culture, where t is the number of tiles claimed so far. Borders grow ring by ring out to 5 hexes, workable land with the best yields first within a ring, but never onto another city or your capital. A new city owns its centre and the six tiles around it. A city with a Monument claims its first tile on turn 5 and four tiles in 60 turns.
+- **Amenities and mood.** A capital needs no amenities for its first two citizens, one for the third, and one more per two citizens after that; each `--city-luxuries` resource gives one. The balance sets the mood, which scales growth and every yield but food. These are Gathering Storm's tiers; sources differ between expansions on some yield changes.
 
-The economy sets a clock on the siege. Left alone on the default grassland map, a size-1 city building walls first finishes them in a median 40 turns. Standing on three of its tiles doubled that to a median 80 in testing, because grassland has no production and the forests that do are easy to block. On plains with hills it needs about 27 turns. The rule-based baseline usually takes the city within about 6 turns, before anything is built, so the clock mostly pressures slower policies such as the learner. Rewards are unchanged. The observation gains the city's population, progress towards growth, production and the next tile, its housing, and which item it is building; the schema ends in `:economy`.
+  | Amenities vs. needed | Mood | Growth | Other yields |
+  | --- | --- | --- | --- |
+  | +5 or more | Ecstatic | +20% | +20% |
+  | +3 to +4 | Happy | +10% | +10% |
+  | 0 to +2 | Content | — | — |
+  | −1 to −2 | Displeased | −15% | −5% |
+  | −3 to −4 | Unhappy | −30% | −10% |
+  | −5 to −6 | Unrest | stops | −15% |
+  | −7 or fewer | Revolt | stops | −20% |
 
-The renderer outlines the city's territory in red, marks worked tiles with a white citizen token, and adds an economy line to the status panel, for example `Pop 3   Housing 5   Food 21/33 (+2)   Granary 0/65 (+2)   Culture 0/10 (+2)`.
+- **War weariness.** Every combat at the enemy capital adds 16 points to its civilization's weariness (`--city-war-weariness` sets a starting value): a melee attack or shot at it, its ranged strike, or its encampment's. Fighting the other enemy cities does not count, since they belong to other civilizations. Weariness fades by 50 a turn, and every 400 points cost one amenity, but never more than the city needs.
+- **Loyalty** (0–100, `--city-loyalty`, default 100) changes every turn. Citizens within 9 tiles add 1 a turn, 10% less per tile away; the capital's own citizens count double, and cities its settlers found add theirs. `--foreign-city POPULATION DISTANCE` adds a city of your civilization, 4–9 hexes away and not drawn on the map, whose citizens subtract loyalty the same way. Pressure is capped at 20 either way. The mood adds +6 (ecstatic) to −6 (unhappy or worse), a Monument +1, and an established governor +8. Below 75 loyalty, growth and yields fall by 25%; below 25, growth by 75% and yields by 50%. At 0 and still falling, the city declares independence: the game ends with the outcome `free_city`, you gain 5 reward, and evaluation summaries count `free_cities`. Civ VI's exact conversion from pressure to loyalty is not documented, so 1 per citizen is an approximation.
+- **Governors.** `--city-governor` appoints one at the start, with up to one ancient-era promotion (`--governor-promotion`). It takes effect once established, after 5 turns (3 for Victor). Only effects that can matter here are modelled: Victor's `defense_logistics` lets the city heal while surrounded; Magnus's `surplus_logistics` adds 20% food; Liang's `zoning_commissioner` adds 20% production toward districts; Pingala adds 15% science and culture, and `connoisseur` or `researcher` 1 culture or science per citizen. The other titles (Reyna, Amani, Moksha) only add loyalty. The establishment times and the 20% values come from community sources.
+- **Pantheon.** With `--pantheon BELIEF`, the city's faith (holy site adjacency, a Shrine) is stored from `--city-faith`, and once 25 is stored the civilization founds the pantheon. `fertility_rites` adds 10% growth and a free builder; `city_patron_goddess` adds 25% production toward a district while the city has none; `religious_settlements` grows borders 15% faster and brings a free settler. The free civilian appears next to the city when the pantheon is founded.
+- **Builders and settlers.** `--city-builders N` and `--city-settlers N` (up to two each) start on free tiles in the territory and move one hex a turn after the squad, around units, raiders, cities and each other. A builder has three charges and farms flat grassland and plains without woods (+1 food, half a house). A settler walks to the nearest tile at least 4 hexes from every city, your capital and earlier settlements, and founds a city there; the new city is drawn and adds loyalty but is not otherwise simulated. Moving onto a civilian captures it; battering rams cannot, and raiders walk around them. The heuristic hunts a civilian within 3 hexes with any unit that can capture it and has at least a third of its health.
+- **Rewards.** The economy now feeds the reward: you lose 1 each time the city grows, completes a district or building, or founds its pantheon, and gain 1 each time it starves. Capturing a builder earns 2 and a settler 4, a city founded by a settler costs 5, and independence earns 5.
 
-Simplifications: there are no districts, specialists, gold or loyalty; the city cannot buy tiles or repair walls; a city's own culture comes only from its buildings; and the city never builds units. The 2-food-1-production centre minimum and the rule that enemy units block worked tiles come from Civ VI play rather than a source found while writing this.
+The economy sets a clock on the siege. Left alone on a map with forests (`--forest-density 0.2 --mountain-density 0.1`), a size-1 city building walls first finishes them in a median 40 turns; on pure grassland, with no production but its centre's, it takes 80. On plains with hills it needs about 27 turns. The rule-based baseline usually takes the city within about 6 turns, before anything is built, so the clock mostly pressures slower policies such as the learner. The raw observation gains the city's population, progress towards growth, production and the next tile, its housing, which item it is building, its amenity balance, loyalty, war weariness, governor and pantheon progress, which items it has built, and each civilian's position, whether it is in play and a builder's charges. The schema ends in `:economy`, plus `:civilians=...` with civilians. Raw models trained before districts and the city systems existed need `--fresh`; the tactical learner's format does not change.
+
+The renderer outlines the city's territory in red, marks worked tiles with a white citizen token and tiles a unit is blocking with a red one, draws farms, civilians (with a builder's charges) and settlers' new cities, and adds an economy line with an icon for each field, for example `Pop 3   Housing 5   Food 21/33 (+2)   Granary 0/65 (+2)   Culture 0/10 (+2)   Amenities 0/1 Displeased   Loyalty 100 (+3)`.
+
+Simplifications: there are no specialists or gold; the city cannot buy tiles or repair walls, never builds units and never trains civilians; Classical-era religion, the Water Mill, the Government Plaza, rising district costs, maintenance and pillaging are not modelled; and only the enemy capital has an economy. Civilians move one hex a turn rather than Civ VI's two. The 2-food-1-production centre minimum and the rule that enemy units block worked tiles come from Civ VI play rather than a source found while writing this. Building costs come from community references, so check them against your game's Civilopedia if exact values matter.
 
 ### Terrain and yields
 
@@ -191,7 +229,7 @@ python run_game.py --episodes 1000 --player-capital --model-path runs/capital/mo
 - A raider threatens the capital when the raiders within three hexes of it could together destroy it, with a 25% margin, unless the city being besieged is nearly taken. Then the heuristic's fighting units turn back for the nearest one, and the tactical observation describes them relative to that raider instead of the city. A raider has no walls and neither shoots nor heals, and attacking it is `ATTACK`. The tactical schema ends in `:capital`, so models trained with and without a capital are not interchangeable.
 - Evaluation summaries show how many losses came from losing the capital.
 
-Over 100 games of up to 200 turns with default settings otherwise, the heuristic wins 99% against one city with a capital to defend, 99% against three cities, and 65% against three cities with a capital to defend, where it loses the capital in 16% of games and runs out of turns in 12% (94% and 4% on `--difficulty easy`). Left undefended by random play, the capital falls in every game, around turn 23. After 1,000 training episodes (training seed 7, 100 held-out games), the tactical learner wins all 100 games against three cities in 200 turns, as the heuristic does, and all 100 with a capital to defend, where the heuristic wins 98 and loses its capital once.
+Over 100 games of up to 200 turns with default settings otherwise, the heuristic wins 99% against one city with a capital to defend, 99% against three cities, and 65% against three cities with a capital to defend, where it loses the capital in 16% of games and runs out of turns in 12% (94% and 4% on `--difficulty easy`). Left undefended by random play, the capital falls in every game, around turn 23. After 1,000 training episodes (training seed 7, 100 held-out games), the tactical learner wins all 100 games against three cities in 200 turns, as the heuristic does, and all 100 with a capital to defend, where the heuristic wins 98 and loses its capital once. Against three cities with a capital to defend it wins 68, loses 16 (13 of them by losing the capital) and runs out of turns in 16, where the heuristic wins 60 on the same seeds.
 
 ### Example scenarios
 
@@ -217,6 +255,18 @@ For a city that grows and builds while you besiege it:
 
 ```powershell
 python run_game.py --episodes 200 --unit-count 3 --economy --city-population 2 --build-queue ancient_walls monument --land-types plains grassland --hills-density 0.2 --model-path runs/economy/model.json --metrics-dir runs/economy --fresh
+```
+
+For a city with districts, civilians, a governor and a pantheon:
+
+```powershell
+python run_game.py --episodes 300 --unit-count 3 --unit-types warrior spearman battering_ram --economy --city-population 4 --districts campus --buildings monument library --build-queue ancient_walls encampment barracks --city-builders 1 --city-settlers 1 --city-governor pingala --pantheon fertility_rites --forest-density 0.3 --model-path runs/districts/model.json --metrics-dir runs/districts --fresh
+```
+
+For a city whose loyalty a large city of yours wears down:
+
+```powershell
+python run_game.py --episodes 300 --unit-count 3 --economy --city-population 3 --foreign-city 12 4 --model-path runs/loyalty/model.json --metrics-dir runs/loyalty --fresh
 ```
 
 For a city with Ancient Walls:
@@ -469,13 +519,13 @@ Against a city with a ranged attack and three warriors, the learner still declin
 
 Each run writes to `--metrics-dir` (default `training_metrics`):
 
-- `training.csv`: episode-level training metrics, including reward, win/termination outcome, length, Q-table size (table rows for the tactical learner), guidance usage, and whether the heuristic played the episode as a demonstration.
+- `training.csv`: episode-level training metrics, including reward, win/termination outcome (`win`, `loss`, `timeout`, `quit`, or `free_city` when the city declares independence), length, Q-table size (table rows for the tactical learner), guidance usage, and whether the heuristic played the episode as a demonstration.
 - `metrics.json`: scenario and learning settings, seeds, training history, and evaluation summaries for comparing runs.
 - `learning_curve.svg`: training curves that open in a browser without extra plotting packages. The reward, win-rate, and length panels show only the learner's own episodes, not demonstrations; the training log's average reward and win count leave demonstrations out too.
 
 Use separate output directories for experiments. Checkpoints save atomically; periodic saves preserve recoverable progress during long runs. `--checkpoint-every N` controls their interval.
 
-Siege evaluations against several cities also report the average number captured, and with `--player-capital` how many losses came from losing the capital, for example `heuristic: wins 65/100, losses 23 (capital lost 16), ..., cities captured 2.4`.
+Siege evaluations with `--economy` also report the city's average final population and builds completed, and with civilians how many were captured and how many cities they founded; free cities are counted when there are any. Siege evaluations against several cities also report the average number captured, and with `--player-capital` how many losses came from losing the capital, for example `heuristic: wins 65/100, losses 23 (capital lost 16), ..., cities captured 2.4`.
 
 In empire mode, `steps` counts turns, and the `city_strength` column records the episode's rival bonus, which a curriculum ramps. Evaluation summaries also average each policy's final score, the rival's score, cities, population, technologies and gold, for example `learned: wins 9/30, ..., score 83.2, rival score 97.2, cities 4.8, ...`.
 
@@ -497,4 +547,4 @@ Run `python game.py` to play a siege manually. **Tab** selects a unit, **Q/E/A/D
 python -m unittest discover -s tests -v
 ```
 
-The tests cover simulation rules, independent environments, terminal rewards, legal actions, Q-learning updates, checkpoint validation/resumption, and runner behavior. `tests/test_tactical.py` checks the combat odds against simulated attacks, the tactical encoding, the heuristic's rules, and the tactical learner's arithmetic and checkpoints. Game tests cover domination (city placement, capture rewards, every city shooting and healing, shot targeting, rams, the target city) and the player's capital (placement, raids taking turns, raider movement and blockades, healing, losing it, fighting raiders, and when the heuristic defends), and check that every legal command has a tactic in the tactical encoding throughout heuristic games with both. A short training regression checks that the learner wins held-out games without guidance. Runner tests check that demonstrations are played entirely by the heuristic and train the learner through its normal update, that they pause while they score below the learner's own episodes, that a run with demonstrations split by a checkpoint matches an uninterrupted one, and that older checkpoints resume without them. `tests/test_empire.py` covers the empire's map mirroring, settlers and city sites, housing, amenities, purchases, bankruptcy, borders, research and boosts, strategic resources, improvements, trade routes and roads, movement points, rivers, zones of control, embarking, ships, combat odds against simulated fights, walls, city strikes, capture and domination, and whole random and heuristic games; `tests/test_empire_learning.py` checks the empire learner's arithmetic, its own-entity exclusion, the demonstration margin and its checkpoints; and runner tests check that empire training resumes exactly. GitHub Actions runs the suite on Python 3.12 with headless dependencies and executes a short CLI training/evaluation run. [UPGRADE_STATUS.md](UPGRADE_STATUS.md) tracks the upgrade areas and their integration evidence.
+The tests cover simulation rules, independent environments, terminal rewards, legal actions, Q-learning updates, checkpoint validation/resumption, and runner behavior. `tests/test_tactical.py` checks the combat odds against simulated attacks, the tactical encoding, the heuristic's rules, and the tactical learner's arithmetic and checkpoints. Game tests cover domination (city placement, capture rewards, every city shooting and healing, shot targeting, rams, the target city) and the player's capital (placement, raids taking turns, raider movement and blockades, healing, losing it, fighting raiders, and when the heuristic defends), and check that every legal command has a tactic in the tactical encoding throughout heuristic games with both. `tests/test_city_systems.py` covers the enemy capital's districts and their placement, adjacency, limit and Encampment, production overflow and district bonuses, builders, settlers and capture, the pantheon's civilian, fractional housing, growth rewards, amenities and moods, war weariness, loyalty and independence, governors, faith and pantheons, and border growth; `tests/test_icons.py` checks that the code-drawn icons cover every unit, district, building, civilian and mood. A short training regression checks that the learner wins held-out games without guidance. Runner tests check that demonstrations are played entirely by the heuristic and train the learner through its normal update, that they pause while they score below the learner's own episodes, that a run with demonstrations split by a checkpoint matches an uninterrupted one, and that older checkpoints resume without them. `tests/test_empire.py` covers the empire's map mirroring, settlers and city sites, housing, amenities, purchases, bankruptcy, borders, research and boosts, strategic resources, improvements, trade routes and roads, movement points, rivers, zones of control, embarking, ships, combat odds against simulated fights, walls, city strikes, capture and domination, and whole random and heuristic games; `tests/test_empire_learning.py` checks the empire learner's arithmetic, its own-entity exclusion, the demonstration margin and its checkpoints; and runner tests check that empire training resumes exactly. GitHub Actions runs the suite on Python 3.12 with headless dependencies and executes a short CLI training/evaluation run. [UPGRADE_STATUS.md](UPGRADE_STATUS.md) tracks the upgrade areas and their integration evidence.

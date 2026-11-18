@@ -9,7 +9,10 @@ import random
 import numpy as np
 
 import constants
-from economy import CityEconomy
+from economy import (AMENITY_MOODS, BUILDING_SPECS, BUILDING_TYPES, DISTRICT_SPECS, DISTRICT_TYPES,  # noqa: F401
+                     FARM_LAND, GOVERNOR_PROMOTIONS, GOVERNORS, LOYALTY_RANGE, MAX_CITY_POPULATION, MAX_LUXURIES,
+                     MAX_STARTING_FAITH, MAX_WAR_WEARINESS, MIN_FOREIGN_CITY_DISTANCE, PANTHEON_CIVILIANS, PANTHEONS,
+                     BuildingSpec, CityEconomy, district_limit)
 from class_hex import LAND_TYPES, YIELD_TYPES, HexMap, hex_distance, terrain_code
 from class_hex import hex_coords  # noqa: F401  Kept importable from game, where it used to live.
 
@@ -73,32 +76,41 @@ WALL_SPECS = {
 WALL_TYPES = tuple(WALL_SPECS)
 
 
-@dataclass(frozen=True)
-class BuildingSpec:
-    """A Civ VI city-centre building: production cost, yields and housing."""
-    civ6_type: str
-    cost: int
-    yields: tuple = ()  # (yield type, amount) pairs
-    housing: int = 0
-    technology: str | None = None
-
-
-# Base-game values from CivFanatics. Some wikis list a later cost of 50 for both.
-# Neither building affects combat; with the city economy on, their yields and
-# housing feed the city's growth, production and borders.
-BUILDING_SPECS = {
-    'monument': BuildingSpec('BUILDING_MONUMENT', cost=60, yields=(('culture', 2),)),
-    'granary': BuildingSpec('BUILDING_GRANARY', cost=65, yields=(('food', 1),), housing=2,
-                            technology='TECH_POTTERY'),
-}
-BUILDING_TYPES = tuple(BUILDING_SPECS)
-
+# Buildings and districts (BUILDING_SPECS and DISTRICT_SPECS) live in economy.py.
+# Buildings do not affect combat. With the city economy on, their yields,
+# housing and loyalty feed the city; without it they change nothing.
 # What the city can build with the economy on, and its default order.
-BUILD_ITEMS = BUILDING_TYPES + ('ancient_walls',)
+BUILD_ITEMS = BUILDING_TYPES + ('ancient_walls',) + DISTRICT_TYPES
 BUILD_COSTS = {**{name: spec.cost for name, spec in BUILDING_SPECS.items()},
-               'ancient_walls': WALL_SPECS['ancient'].cost}
+               'ancient_walls': WALL_SPECS['ancient'].cost,
+               **{name: spec.cost for name, spec in DISTRICT_SPECS.items()}}
 DEFAULT_BUILD_QUEUE = ('monument', 'granary', 'ancient_walls')
-MAX_CITY_POPULATION = 20
+# The encampment strikes a unit within this range each turn, at the city's
+# ranged strength, or 15 (Civ VI's value without ranged units) when it has none.
+STRIKE_RANGE = 2
+CITY_STRIKE_STRENGTH = 15
+
+# Civilians belong to the enemy capital when its economy runs. A builder has
+# Civ VI's 3 build charges and farms the city's flat grassland and plains. A
+# settler walks to the nearest tile at least 4 hexes from every city (Civ VI's
+# minimum spacing) and founds a city there. A unit that moves onto a civilian
+# captures it.
+CIVILIAN_KINDS = ('builder', 'settler')
+BUILDER_CHARGES = 3
+SETTLE_DISTANCE = 4
+MAX_CIVILIANS = 2  # of each kind
+# The heuristic hunts a civilian within this many hexes instead of besieging.
+HUNT_RANGE = 3
+
+# Rewards for the economy's events, from the attacker's side: the city growing
+# or completing a build costs 1, starving earns 1, capturing a builder or a
+# settler earns 2 or 4, a city founded by a settler costs 5, and the city
+# declaring independence earns 5.
+POPULATION_REWARD = 1.0
+BUILD_REWARD = 1.0
+CAPTURE_REWARDS = {'builder': 2.0, 'settler': 4.0}
+CITY_FOUNDED_PENALTY = 5.0
+INDEPENDENCE_REWARD = 5.0
 
 # Each enemy city is a rival civilization's capital. Capturing all of them is a
 # domination victory.
@@ -229,6 +241,17 @@ class GameConfig:
     economy: bool = False
     city_population: int = 1
     build_queue: tuple = ()
+    districts: tuple = ()
+    city_luxuries: int = 0
+    city_war_weariness: int = 0
+    city_loyalty: int = 100
+    foreign_city: tuple = ()  # (population, distance) of a city of the attacker's civilization
+    city_governor: str = ''
+    city_governor_promotion: str = ''
+    city_pantheon: str = ''
+    city_faith: int = 0
+    city_builders: int = 0
+    city_settlers: int = 0
     city_count: int = 1
     player_capital: bool = False
     capital_strength: float = 28
@@ -236,13 +259,21 @@ class GameConfig:
     raider_strength: float = 20
 
     def __post_init__(self):
-        try:
-            object.__setattr__(self, 'buildings', tuple(self.buildings))
-        except TypeError as exc:
-            raise ValueError('buildings must be a sequence of building names') from exc
+        for name in ('buildings', 'build_queue', 'districts', 'foreign_city'):
+            try:
+                object.__setattr__(self, name, tuple(getattr(self, name)))
+            except TypeError as exc:
+                raise ValueError(f'{name} must be a sequence') from exc
         if (any(not isinstance(name, str) or name not in BUILDING_SPECS for name in self.buildings)
                 or len(set(self.buildings)) != len(self.buildings)):
             raise ValueError(f'buildings must name distinct buildings from {", ".join(BUILDING_TYPES)}')
+        if (any(not isinstance(name, str) or name not in DISTRICT_SPECS for name in self.districts)
+                or len(set(self.districts)) != len(self.districts)):
+            raise ValueError(f'districts must name distinct districts from {", ".join(DISTRICT_TYPES)}')
+        for name in self.buildings:
+            district = BUILDING_SPECS[name].district
+            if district != 'city_center' and district not in self.districts:
+                raise ValueError(f'{name} needs a {district} district')
         if not isinstance(self.walls, str) or self.walls not in WALL_SPECS:
             raise ValueError(f'walls must be one of {", ".join(WALL_TYPES)}')
         # Walls supply their defaults for wall HP and ranged strength left at zero.
@@ -295,15 +326,16 @@ class GameConfig:
         if (isinstance(self.city_population, bool) or not isinstance(self.city_population, int)
                 or not 1 <= self.city_population <= MAX_CITY_POPULATION):
             raise ValueError(f'city_population must be an integer between 1 and {MAX_CITY_POPULATION}')
-        try:
-            object.__setattr__(self, 'build_queue', tuple(self.build_queue))
-        except TypeError as exc:
-            raise ValueError('build_queue must be a sequence of build items') from exc
         if (any(not isinstance(name, str) or name not in BUILD_ITEMS for name in self.build_queue)
                 or len(set(self.build_queue)) != len(self.build_queue)):
             raise ValueError(f'build_queue must name distinct items from {", ".join(BUILD_ITEMS)}')
-        if not self.economy and (self.city_population != 1 or self.build_queue):
-            raise ValueError('city_population and build_queue need the city economy')
+        available = {'city_center', *self.districts}
+        for name in self.build_queue:
+            district = BUILDING_SPECS[name].district if name in BUILDING_SPECS else 'city_center'
+            if district not in available:
+                raise ValueError(f'{name} needs a {district} district built or queued before it')
+            available.add(name)
+        self._validate_city_systems()
         if self.city_position is not None:
             if len(self.city_position) != 2 or any(isinstance(v, bool) or not isinstance(v, int)
                                                  for v in self.city_position):
@@ -312,6 +344,54 @@ class GameConfig:
             if not (0 <= x < self.width and 0 <= y < self.height):
                 raise ValueError('city_position must lie inside the map')
         self._validate_cities()
+
+    def _validate_city_systems(self):
+        """Check the settings of the enemy capital's economy: districts, mood, loyalty, governor, religion, civilians."""
+        def integer(name, low, high):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f'{name} must be an integer between {low} and {high}')
+
+        integer('city_luxuries', 0, MAX_LUXURIES)
+        integer('city_war_weariness', 0, MAX_WAR_WEARINESS)
+        integer('city_loyalty', 1, 100)
+        integer('city_faith', 0, MAX_STARTING_FAITH)
+        integer('city_builders', 0, MAX_CIVILIANS)
+        integer('city_settlers', 0, MAX_CIVILIANS)
+        if self.foreign_city and (len(self.foreign_city) != 2
+                                  or any(isinstance(v, bool) or not isinstance(v, int) for v in self.foreign_city)
+                                  or not 1 <= self.foreign_city[0] <= MAX_CITY_POPULATION
+                                  or not MIN_FOREIGN_CITY_DISTANCE <= self.foreign_city[1] <= LOYALTY_RANGE):
+            raise ValueError(f'foreign_city must be (population 1-{MAX_CITY_POPULATION}, '
+                             f'distance {MIN_FOREIGN_CITY_DISTANCE}-{LOYALTY_RANGE})')
+        if self.city_governor not in ('', *GOVERNORS):
+            raise ValueError(f'city_governor must be one of: {", ".join(GOVERNORS)}')
+        offered = GOVERNORS[self.city_governor].promotions if self.city_governor else ()
+        if self.city_governor_promotion and self.city_governor_promotion not in offered:
+            raise ValueError('city_governor_promotion must be one of: '
+                             + (', '.join(offered) if offered else 'none for this governor'))
+        if self.city_pantheon not in ('', *PANTHEONS):
+            raise ValueError(f'city_pantheon must be one of: {", ".join(PANTHEONS)}')
+        if len(self.districts) > district_limit(self.city_population):
+            limit = district_limit(self.city_population)
+            raise ValueError(f'a city of {self.city_population} can have at most {limit} '
+                             f'district{"s" if limit != 1 else ""}')
+        if not self.economy:
+            needed = [name for name, value, default in (
+                ('city_population', self.city_population, 1), ('build_queue', self.build_queue, ()),
+                ('districts', self.districts, ()), ('city_luxuries', self.city_luxuries, 0),
+                ('city_war_weariness', self.city_war_weariness, 0), ('city_loyalty', self.city_loyalty, 100),
+                ('foreign_city', self.foreign_city, ()), ('city_governor', self.city_governor, ''),
+                ('city_pantheon', self.city_pantheon, ''), ('city_faith', self.city_faith, 0),
+                ('city_builders', self.city_builders, 0), ('city_settlers', self.city_settlers, 0))
+                if value != default]
+            if needed:
+                raise ValueError(f'{", ".join(needed)} need the city economy')
+
+    @property
+    def civilian_kinds(self):
+        """The enemy capital's starting civilians, in order."""
+        return ('builder',) * self.city_builders + ('settler',) * self.city_settlers
 
     def _validate_cities(self):
         """Check the domination and player-capital settings, and that the map can hold the cities."""
@@ -449,6 +529,10 @@ class C_City(C_Sprite):
     def building_housing(self):
         return sum(BUILDING_SPECS[name].housing for name in self.buildings)
 
+    @property
+    def building_loyalty(self):
+        return sum(BUILDING_SPECS[name].loyalty for name in self.buildings)
+
     def take_turn(self):
         if self.env is not None and self.alive:
             self.env.city_turn()
@@ -483,6 +567,24 @@ class C_City(C_Sprite):
             self.alive = False
             self.status = 'dead'
             self._event(self.capture_event)
+
+
+class C_Civilian(C_Sprite):
+    """The enemy capital's builder or settler. Civilians cannot fight; the squad captures them."""
+    def __init__(self, x, y, kind, name_instance, env=None):
+        if kind not in CIVILIAN_KINDS:
+            raise ValueError(f'Unknown civilian: {kind}')
+        super().__init__(x, y, name_instance=name_instance, strength=0, env=env)
+        self.kind = kind
+        self.charges = BUILDER_CHARGES if kind == 'builder' else 0
+        self.status = 'active'
+
+    def leave(self, status, event, **details):
+        """Remove the civilian from play as captured, settled or used up."""
+        if self.alive:
+            self.alive = False
+            self.status = status
+            self._event(event, civilian=self.kind, **details)
 
 
 class C_Capital(C_City):
@@ -550,13 +652,15 @@ class Game:
                                        + (':capital' if self.config.player_capital else '')
                                        + (':terrain' if self.config.extended_terrain else '')
                                        + (':rivers' if self.config.river_count else '')
-                                       + (':economy' if self.config.economy else ''))
+                                       + (':economy' if self.config.economy else '')
+                                       + (':civilians=' + ','.join(self.civilian_kinds) if self.civilian_kinds else ''))
         self._renderer = None
         self.quit = False
         self.units = []
         self.cities = []
         self.capital = None
         self.raiders = []
+        self.civilians = []
         self.economy = None
         self.events = []
         self.turn_number = 0
@@ -569,6 +673,16 @@ class Game:
     def city(self):
         """The first enemy city (the enemy capital); single-city callers use this."""
         return self.cities[0] if self.cities else None
+
+    @property
+    def civilian_kinds(self):
+        """Every civilian the enemy capital can have: its starting ones, then a pantheon's free one."""
+        c = self.config
+        return c.civilian_kinds + ((PANTHEON_CIVILIANS[c.city_pantheon],) if c.city_pantheon in PANTHEON_CIVILIANS
+                                   else ())
+
+    def civilian_at(self, position):
+        return next((c for c in self.civilians if c.alive and c.position == tuple(position)), None)
 
     @property
     def objects(self):
@@ -615,12 +729,19 @@ class Game:
                 'capital_lost': self.capital is not None and not self.capital.alive}
 
     def summary(self):
-        """End-of-game figures that evaluation averages: cities captured and whether the capital fell."""
+        """End-of-game figures that evaluation averages: cities captured, whether the capital fell, and the
+        enemy capital's size, completed builds, civilians captured and cities its settlers founded."""
         result = {}
         if self.config.city_count > 1:
             result['cities_captured'] = self.cities_captured()
         if self.config.player_capital:
             result['capital_lost'] = int(self.capital is not None and not self.capital.alive)
+        if self.economy is not None:
+            result['city_population'] = self.economy.population
+            result['builds_completed'] = len(self.economy.completed)
+            if self.civilian_kinds:
+                result['civilians_captured'] = sum(c.status == 'captured' for c in self.civilians)
+                result['cities_founded'] = len(self.economy.founded_cities)
         return result
 
     def reset(self, seed=None):
@@ -650,7 +771,9 @@ class Game:
             self.map.grid[enemy_capital].set_terrain('GRASSLAND')
             component = self.map.reachable(enemy_capital)
             adjacent = self.map.grid[enemy_capital].get_neighbors(self.map.grid)
-            if (len(component) >= c.unit_count + c.city_count + c.player_capital
+            needed = (c.unit_count + c.city_count + c.player_capital + len(c.civilian_kinds)
+                      + ('encampment' in c.districts))
+            if (len(component) >= needed
                     and sum(not cell.block_path for cell in adjacent) >= min(c.unit_count, 3)):
                 city_positions = place_cities(enemy_capital, component, c.city_count, self.rng, fits)
                 home = None
@@ -674,7 +797,29 @@ class Game:
             self.map.classify_water()
         # Rivers never block movement, so they cannot disconnect the start area.
         self.map.generate_rivers(c.river_count, self.rng)
-        free = sorted(component - set(sites))
+        # Every enemy city shares the scenario's strength, walls and city-centre buildings;
+        # the enemy capital alone has districts and their buildings.
+        centre_buildings = tuple(name for name in c.buildings if BUILDING_SPECS[name].district == 'city_center')
+        self.cities = [C_City(*position, name_instance=CITY_NAMES[i], strength=c.city_strength,
+                              wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
+                              ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
+                              buildings=c.buildings if i == 0 else centre_buildings, walls=c.walls)
+                       for i, position in enumerate(city_positions)]
+        self.capital = (C_Capital(*home, name_instance=PLAYER_CAPITAL_NAME, strength=c.capital_strength, env=self)
+                        if home is not None else None)
+        self.units, self.raiders, self.civilians = [], [], []
+        self._valid_cache_key = None
+        self._route_cache = {}
+        # The economy runs in the enemy capital, the first city.
+        self.economy = (CityEconomy(self, c, c.build_queue or DEFAULT_BUILD_QUEUE, BUILD_COSTS)
+                        if c.economy else None)
+        for district in c.districts:
+            # A starting district that needs more land claims it, as if borders grew earlier.
+            while self.economy.district_site(district) is None and self.economy.claim_tile():
+                pass
+            self.complete_build(district)
+        # An encampment never cuts a tile off, so the rest of the start area stays connected.
+        free = sorted(position for position in component - set(sites) if not self.map.grid[position].block_path)
         if home is None:
             start_positions = self.rng.sample(free, c.unit_count)
         else:
@@ -689,18 +834,8 @@ class Game:
         self.units = [C_Unit(*pos, name_instance=names[i], strength=strengths[i], env=self,
                              unit_type=self.unit_types[i], strength_ranged=specs[i].ranged_strength)
                       for i, pos in enumerate(start_positions)]
-        # Every enemy city shares the scenario's strength, walls and buildings.
-        self.cities = [C_City(*position, name_instance=CITY_NAMES[i], strength=c.city_strength,
-                              wall_hp=c.wall_hp, strength_ranged=c.ranged_strength,
-                              ranged_combat=c.ranged_strength > 0, heal=c.city_heals, env=self,
-                              buildings=c.buildings, walls=c.walls)
-                       for i, position in enumerate(city_positions)]
-        self.capital = (C_Capital(*home, name_instance=PLAYER_CAPITAL_NAME, strength=c.capital_strength, env=self)
-                        if home is not None else None)
-        self.raiders = []
-        # The economy runs in the enemy capital, the first city.
-        self.economy = (CityEconomy(self, c.city_population, c.build_queue or DEFAULT_BUILD_QUEUE, BUILD_COSTS)
-                        if c.economy else None)
+        if self.economy is not None:
+            self.civilians = self._place_civilians(free)
         self.turn_number = 0
         self.events = []
         self.last_info = self._info('ongoing')
@@ -708,6 +843,44 @@ class Game:
         self._valid_cache_key = None
         self._route_cache = {}
         return self.observe()
+
+    def _place_civilians(self, free):
+        """Start civilians on free tiles in the city's territory, then on the free tiles nearest the city.
+
+        A pantheon's free civilian waits out of play until the pantheon is founded.
+        """
+        taken = {u.position for u in self.units}
+        territory = [p for p in sorted(self.economy.territory_tiles()) if p in free and p not in taken]
+        self.rng.shuffle(territory)
+        nearby = sorted((p for p in free if p not in taken and p not in territory),
+                        key=lambda p: (hex_distance(p, self.city.position), p[1], p[0]))
+        spots = territory + nearby
+        counts, civilians = {}, []
+        for kind, position in zip(self.config.civilian_kinds, spots):
+            counts[kind] = counts.get(kind, 0) + 1
+            name = kind.capitalize() + ('' if counts[kind] == 1 else f' {counts[kind]}')
+            civilians.append(C_Civilian(*position, kind, name, env=self))
+        if len(self.civilian_kinds) > len(self.config.civilian_kinds):
+            kind = self.civilian_kinds[-1]
+            civilian = C_Civilian(*self.city.position, kind, f'Pantheon {kind}', env=self)
+            civilian.alive, civilian.status = False, 'not yet trained'
+            civilians.append(civilian)
+        return civilians
+
+    def on_pantheon_founded(self):
+        """The pantheon's free civilian appears on the free tile nearest the city."""
+        civilian = next((c for c in self.civilians if c.status == 'not yet trained'), None)
+        if civilian is None:
+            return
+        towns = {city.position for city in self.cities} | ({self.capital.position} if self.capital else set())
+        taken = ({u.position for u in self.units if u.alive} | {c.position for c in self.civilians if c.alive}
+                 | {r.position for r in self.raiders if r.alive} | towns)
+        spots = sorted((p for p, cell in self.map.grid.items() if not cell.block_path and p not in taken),
+                       key=lambda p: (hex_distance(p, self.city.position), p[1], p[0]))
+        if spots:
+            civilian.x, civilian.y = spots[0]
+            civilian.alive, civilian.status = True, 'active'
+            civilian._event(f'{civilian.kind}_trained')
 
     def game_initialize(self, ep_number=0, seed=None):
         self.episode_number = ep_number
@@ -721,10 +894,10 @@ class Game:
         """Legal joint actions account for moves executed earlier in the turn."""
         if self.city is None:
             raise RuntimeError('Call reset before using the environment')
-        terrain = tuple(cell.terrain_type for cell in self.map.grid.values())
         key = (tuple((u.position, u.alive) for u in self.units),
                tuple((city.position, city.alive) for city in self.cities),
-               tuple((raider.position, raider.alive) for raider in self.raiders), terrain)
+               tuple((raider.position, raider.alive) for raider in self.raiders),
+               tuple((civilian.position, civilian.alive) for civilian in self.civilians), self._terrain_key())
         if key == self._valid_cache_key:
             return list(self._valid_cache)
         result = []
@@ -752,7 +925,7 @@ class Game:
                 if self.capital is not None and destination == self.capital.position:
                     continue
                 attacks = self.enemy_at(destination) is not None
-                if unit.support and attacks:
+                if unit.support and (attacks or self.civilian_at(destination) is not None):
                     continue
                 final = unit.position if attacks else destination
                 visit(index + 1, action + [direction], remaining | {final})
@@ -760,6 +933,10 @@ class Game:
         visit(0, [], occupied)
         self._valid_cache_key, self._valid_cache = key, result
         return list(result)
+
+    def _terrain_key(self):
+        """What movement depends on: every tile's terrain and whether an encampment fortifies it."""
+        return tuple((cell.terrain_type, cell.fortified) for cell in self.map.grid.values())
 
     def action_mask(self):
         mask = np.zeros(self.action_count, dtype=bool)
@@ -782,6 +959,15 @@ class Game:
             unit.status = 'hit wall'
             unit._event('invalid_move')
             return
+        civilian = self.civilian_at(destination)
+        if civilian is not None and self.occupant(destination, exclude=unit) is None:
+            if unit.support:
+                unit._event('blocked_move')
+                return
+            civilian.leave('captured', 'civilian_captured', by=unit.name_instance)
+            unit.x, unit.y = destination
+            unit.status = 'captured'
+            return
         target = self.occupant(destination, exclude=unit)
         if target is not None and target is self.capital:
             unit._event('blocked_move')
@@ -796,6 +982,7 @@ class Game:
                 unit.status = 'attacked'
         elif isinstance(target, C_City):
             damage_out, damage_taken = attack(unit, target)
+            self.combat_fought(target)
             unit._event('attacked')
             unit.take_damage(damage_taken)
             target.take_damage(damage_out, aggressor_alive=unit.alive,
@@ -830,24 +1017,107 @@ class Game:
         return MELEE_WALL_DAMAGE
 
     def city_turn(self):
-        """Each city that has not been captured shoots and heals; then the enemy capital's economy runs."""
+        """Each city that has not been captured shoots and heals; then the enemy capital's civilians act
+        and its economy runs."""
+        economy = self.economy if self.economy is not None and self.city.alive else None
         for city in self.living_cities():
             if city.ranged_combat:
                 targets = [u for u in self.units if u.alive and hex_distance(u.position, city.position) <= 2]
                 if targets:
                     target = self.rng.choice(targets)
                     damage, _ = attack(city, target, ranged=True)
+                    self.combat_fought(city)
+                    target.take_damage(damage)
+            encampment = economy.districts.get('encampment') if economy is not None and city is self.city else None
+            if encampment is not None:
+                targets = [u for u in self.units if u.alive and hex_distance(u.position, encampment) <= STRIKE_RANGE]
+                if targets:
+                    target = self.rng.choice(targets)
+                    damage, _ = attack(city, target, ranged=True)
+                    self.combat_fought(city)
+                    city._event('encampment_strike', target=target.name_instance)
                     target.take_damage(damage)
             if city.heal:
                 besiegers = sum(u.alive and hex_distance(u.position, city.position) == 1 for u in self.units)
-                if besiegers < min(3, self.config.unit_count):
+                # Victor's Defense Logistics: the city cannot be put under siege.
+                sieged = besiegers >= min(3, self.config.unit_count)
+                if not sieged or (economy is not None and city is self.city
+                                  and economy.governor_has('defense_logistics')):
                     healed = min(10, city.hp_max - city.hp)
                     if healed > 0:
                         city.hp += healed
                         city.status = 'healed'
                         city._event(city.heal_event, amount=healed)
-        if self.economy is not None and self.city.alive:
-            self.economy.turn()
+        if economy is not None:
+            for civilian in self.civilians:
+                if civilian.alive:
+                    (self.builder_turn if civilian.kind == 'builder' else self.settler_turn)(civilian)
+            economy.turn()
+
+    def combat_fought(self, city):
+        """Each combat around the enemy capital adds to its civilization's war weariness."""
+        if self.economy is not None and city is self.city:
+            self.economy.combat_fought()
+
+    def _civilian_step(self, civilian, goals):
+        """Move one hex toward the nearest reachable goal, around units, cities and other civilians."""
+        towns = {city.position for city in self.living_cities()} | ({self.capital.position} if self.capital else set())
+        blocked = ({u.position for u in self.units if u.alive} | {r.position for r in self.raiders if r.alive}
+                   | {c.position for c in self.civilians if c.alive and c is not civilian} | towns)
+        steps = self._steps_to_goals([goal for goal in goals if goal not in blocked], blocked)
+        here = steps.get(civilian.position)
+        options = [(steps[cell.index], cell.index[1], cell.index[0])
+                   for cell in self.map.grid[civilian.position].get_neighbors(self.map.grid)
+                   if cell.index in steps and cell.index not in blocked]
+        if here is not None and options and min(options)[0] < here:
+            _, y, x = min(options)
+            civilian.x, civilian.y = x, y
+
+    def _steps_to_goals(self, goals, blocked):
+        """Hex steps from every reachable tile to the nearest goal, avoiding blocked tiles."""
+        adjacency = self._adjacency()
+        steps = {goal: 0 for goal in goals}
+        pending = collections.deque(steps)
+        while pending:
+            position = pending.popleft()
+            for neighbor in adjacency.get(position, ()):
+                if neighbor not in steps and neighbor not in blocked:
+                    steps[neighbor] = steps[position] + 1
+                    pending.append(neighbor)
+        return steps
+
+    def farm_sites(self):
+        """Unfarmed flat grassland and plains without woods in the enemy capital's territory."""
+        grid = self.map.grid
+        return [p for p in sorted(self.economy.territory_tiles())
+                if grid[p].spec.land_type in FARM_LAND and grid[p].spec.elevation == 'FLAT'
+                and grid[p].feature is None and p not in self.economy.farms]
+
+    def builder_turn(self, builder):
+        sites = self.farm_sites()
+        if builder.position not in sites:
+            self._civilian_step(builder, sites)
+            return
+        self.economy.farms.add(builder.position)
+        builder.charges -= 1
+        builder._event('farm_built', position=list(builder.position), charges=builder.charges)
+        if builder.charges == 0:
+            builder.leave('used up', 'builder_used_up')
+
+    def settlement_sites(self):
+        """Open tiles far enough from every city to found a new one."""
+        towns = ([city.position for city in self.cities] + self.economy.founded_cities
+                 + ([self.capital.position] if self.capital is not None else []))
+        return [p for p, cell in self.map.grid.items() if not cell.block_path
+                and all(hex_distance(p, town) >= SETTLE_DISTANCE for town in towns)]
+
+    def settler_turn(self, settler):
+        sites = self.settlement_sites()
+        if settler.position not in sites:
+            self._civilian_step(settler, sites)
+            return
+        self.economy.founded_cities.append(settler.position)
+        settler.leave('settled', 'city_founded', position=list(settler.position))
 
     def raider_turn(self):
         """Raiders next to the capital attack it. The rest march toward it, stepping around
@@ -872,7 +1142,7 @@ class Game:
                 if after is None or after >= here:
                     continue
                 occupant = self.occupant(destination)
-                if occupant is None:
+                if occupant is None and self.civilian_at(destination) is None:
                     moves.append((after, order, destination))
                 elif occupant in self.units:
                     blockers.append((occupant.hp, self.units.index(occupant), occupant))
@@ -908,7 +1178,8 @@ class Game:
             dx, dy = constants.movement_delta(direction, city.y)
             site = city.x + dx, city.y + dy
             cell = self.map.grid.get(site)
-            if cell is not None and not cell.block_path and self.occupant(site) is None:
+            if (cell is not None and not cell.block_path and self.occupant(site) is None
+                    and self.civilian_at(site) is None):
                 sites.append((steps.get(site, math.inf), order, site))
         if not sites:
             return
@@ -935,10 +1206,17 @@ class Game:
         """Whether the city already has a build item; any walls count as walls."""
         if item == 'ancient_walls':
             return self.city.wall_hp_max > 0
+        if item in DISTRICT_SPECS:
+            return self.economy is not None and item in self.economy.districts
         return item in self.city.buildings
 
     def complete_build(self, item):
-        """Add a finished building to the city; walls arrive at full health with their ranged strike."""
+        """Add a finished item to the enemy capital; return whether it could be added.
+
+        Walls arrive at full health with their ranged strike. A district takes
+        its best free site; an encampment fortifies its tile and gives the city
+        a ranged strength for its strike.
+        """
         city = self.city
         if item == 'ancient_walls':
             spec = WALL_SPECS['ancient']
@@ -946,8 +1224,15 @@ class Game:
             city.wall_hp = city.wall_hp_max = float(spec.hp)
             if not city.ranged_combat:
                 city.strength_ranged, city.ranged_combat = float(spec.ranged_strength), True
+        elif item in DISTRICT_SPECS:
+            if self.economy is None or self.economy.place_district(item) is None:
+                return False
+            self._valid_cache_key = None
+            if item == 'encampment' and city.strength_ranged == 0:
+                city.strength_ranged = float(CITY_STRIKE_STRENGTH)
         else:
             city.buildings += (item,)
+        return True
 
     def shoot(self, unit):
         if not unit.alive or not self.living_cities():
@@ -957,6 +1242,7 @@ class Game:
             unit._event('invalid_move')
             return
         damage, _ = attack(unit, target, ranged=True)
+        self.combat_fought(target)
         unit._event('ranged_attack')
         if isinstance(target, C_Raider):
             target.take_damage(damage)
@@ -967,6 +1253,8 @@ class Game:
     def _outcome(self):
         if all(not city.alive or city.hp <= 0 for city in self.cities):
             return 'win'
+        if self.economy is not None and self.economy.independent:
+            return 'free_city'
         if self.capital is not None and not self.capital.alive:
             return 'loss'
         if not any(u.alive and u.hp > 0 and not u.support for u in self.units):
@@ -1002,6 +1290,18 @@ class Game:
                 reward -= .2
             elif kind == 'moved':
                 reward += .05 * event['progress'] - .01 * (event['cost'] - 1)
+            elif kind == 'city_grew':
+                reward -= POPULATION_REWARD
+            elif kind == 'city_starved':
+                reward += POPULATION_REWARD
+            elif kind in ('building_completed', 'district_completed', 'pantheon_founded'):
+                reward -= BUILD_REWARD
+            elif kind == 'civilian_captured':
+                reward += CAPTURE_REWARDS[event['civilian']]
+            elif kind == 'city_founded':
+                reward -= CITY_FOUNDED_PENALTY
+            elif kind == 'city_declared_independence':
+                reward += INDEPENDENCE_REWARD
         # Each city captured before the last earns 5; the last one brings the 10-point victory.
         captures = sum(event['type'] == 'city_captured' for event in self.events)
         if self.last_info['outcome'] == 'win':
@@ -1084,6 +1384,9 @@ class Game:
                           for flag in self.map.river_flags((x, y)))
         if self.economy is not None:
             values.extend(self.economy.observation(BUILD_ITEMS))
+            for civilian in self.civilians:
+                values.extend([civilian.x / (c.width - 1), civilian.y / (c.height - 1),
+                               float(civilian.alive), civilian.charges / BUILDER_CHARGES])
         return np.asarray(values, dtype=float)
 
     def target_city(self):
@@ -1094,18 +1397,28 @@ class Game:
         return min(options)[-1] if options else None
 
     def objective(self, unit, threat=None):
-        """What unit is working toward: a raider threatening the capital, else the target city.
+        """What unit is working toward: a raider threatening the capital, a civilian to capture
+        (see hunt_target()), else the target city.
 
-        Battering rams cannot fight raiders, so they always head for the target city.
-        After the last capture this is the enemy capital, so terminal states stay encodable.
+        Battering rams cannot fight raiders or capture civilians, so they always head for the
+        target city. After the last capture this is the enemy capital, so terminal states stay
+        encodable.
         """
         if threat is not None and not unit.support:
             return threat
-        return self.target_city() or self.city
+        return self.hunt_target(unit) or self.target_city() or self.city
+
+    def hunt_target(self, unit):
+        """The nearest civilian within HUNT_RANGE of a unit that can capture and has a third of its health."""
+        if not unit.alive or unit.support or unit.hp < .35 * unit.hp_max:
+            return None
+        nearby = [(hex_distance(c.position, unit.position), index, c) for index, c in enumerate(self.civilians)
+                  if c.alive and hex_distance(c.position, unit.position) <= HUNT_RANGE]
+        return min(nearby)[-1] if nearby else None
 
     def _adjacency(self):
         """Passable neighbors of every passable tile, cached for the current terrain."""
-        terrain = tuple(cell.terrain_type for cell in self.map.grid.values())
+        terrain = self._terrain_key()
         cached = self._route_cache.get('adjacency')
         if cached is None or cached[0] != terrain:
             grid = self.map.grid
@@ -1190,6 +1503,8 @@ class Game:
     def melee_death_probability(self, unit, target=None):
         """Chance that the retaliation of target (default: the enemy capital) kills unit if it attacks now."""
         target = target or self.city
+        if isinstance(target, C_Civilian):
+            return 0.0
         bonus = self.map.grid[unit.position].defense_bonus
         strength = target.strength + self.river_defense(unit, target)
         return damage_at_least(unit.hp, math.exp((strength - unit.strength - bonus) / 25))
@@ -1205,6 +1520,8 @@ class Game:
         target = target or self.city
         if not unit.alive or unit.support or not target.alive:
             return 0.0
+        if isinstance(target, C_Civilian):
+            return 1.0
         river = self.river_defense(unit, target)
         if isinstance(target, C_Raider):
             bonus = self.map.grid[target.position].defense_bonus
@@ -1227,7 +1544,9 @@ class Game:
         the fewest turns to the objective along a route around the other living
         units, so the encoding does not depend on absolute coordinates, the map
         size or the seed. Whether a move is legal this turn is left to
-        valid_actions(). A dead unit's block is zero with every command unavailable.
+        valid_actions(). A civilian to capture is an objective with no walls,
+        strikes or healing, and moving onto a civilian is ATTACK. A dead unit's
+        block is zero with every command unavailable.
         """
         if self.city is None:
             raise RuntimeError('Call reset before tactical_observation')
@@ -1274,7 +1593,8 @@ class Game:
         cell = self.map.grid.get(destination)
         if cell is None or cell.block_path or (self.capital is not None and destination == self.capital.position):
             return -1
-        if self.enemy_at(destination) is not None:
+        if self.enemy_at(destination) is not None or self.civilian_at(destination) is not None:
+            # Moving onto a civilian captures it, so it is an attack too.
             return -1 if unit.support else TACTIC_INDEX['ATTACK']
         after = steps.get(destination, math.inf)
         return TACTIC_INDEX['ADVANCE' if after < distance else 'SIDESTEP' if after == distance else 'RETREAT']
@@ -1316,7 +1636,8 @@ class Game:
         in place, hold next to the city until enough of them surround it to stop
         its healing, and wait just outside a ranged city's reach until the squad
         has closed up. When raiders could take the player's capital, the
-        fighting units turn back to stop the nearest one first. Ties use rng.
+        fighting units turn back to stop the nearest one first; otherwise a
+        healthy unit hunts a civilian within HUNT_RANGE. Ties use rng.
         """
         rng = rng or self.rng
         city = self.target_city() or self.city
@@ -1337,6 +1658,10 @@ class Game:
             elif threat is not None and not unit.support:
                 # A raider does not heal or shoot, so only the retaliation's risk holds a unit back.
                 scores.append(self._command_scores(index, threat, self.step_distances(threat), True, .1, False))
+            elif self.hunt_target(unit) is not None:
+                # Chase the civilian; moving onto it captures it.
+                prey = self.hunt_target(unit)
+                scores.append(self._command_scores(index, prey, self.step_distances(prey), True, 0.0, False))
             else:
                 scores.append(self._command_scores(index, city, steps, ready, tolerance, staging))
         best, choices = math.inf, []
@@ -1397,6 +1722,8 @@ class Game:
             if self.enemy_at(destination) is not None:
                 # Another city or raider is not the objective; attack it only if nothing else is possible.
                 scores[command] = 50.0
+                continue
+            if self.civilian_at(destination) is not None and unit.support:
                 continue
             after = steps.get(destination, math.inf)
             if staging and distance == 3 and after == 2:

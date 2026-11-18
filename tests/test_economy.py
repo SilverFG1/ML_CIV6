@@ -142,10 +142,16 @@ class EconomyTests(unittest.TestCase):
         env = self.make_env(city_population=2)
         self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior:economy')
         observation = env.get_observation()
-        self.assertEqual(observation.shape[0], plain.get_observation().shape[0] + 5 + len(BUILD_ITEMS))
-        features = observation[-(5 + len(BUILD_ITEMS)):]
+        width = 10 + 2 * len(BUILD_ITEMS)
+        self.assertEqual(observation.shape[0], plain.get_observation().shape[0] + width)
+        features = observation[-width:]
         np.testing.assert_allclose(features[:5], [.1, 0, 0, 0, env.economy.housing() / 20])
-        self.assertEqual(features[5:].tolist(), [1.0, 0.0, 0.0])  # Building the monument.
+        building = features[5:5 + len(BUILD_ITEMS)]
+        self.assertEqual(building.tolist(), [float(name == 'monument') for name in BUILD_ITEMS])
+        # Content mood, full loyalty, no war weariness, no governor or pantheon, nothing built.
+        after = 5 + len(BUILD_ITEMS)
+        np.testing.assert_allclose(features[after:after + 5], [0, 1, 0, 0, 0])
+        self.assertEqual(features[after + 5:].tolist(), [0.0] * len(BUILD_ITEMS))
 
     def test_invalid_economy_settings_are_rejected(self):
         for kwargs in [{'economy': 1}, {'economy': True, 'city_population': 0},

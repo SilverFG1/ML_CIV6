@@ -141,6 +141,9 @@ class HexCell:
     index: tuple
     terrain_type: str = 'GRASSLAND'
     feature: str | None = None
+    district: str | None = None
+    # A defensible district (an encampment) blocks attacking units like a mountain.
+    fortified: bool = False
 
     def __post_init__(self):
         feature = self.feature
@@ -201,7 +204,7 @@ class HexCell:
 
     @property
     def block_path(self):
-        return self.spec.impassable or self.spec.water
+        return self.spec.impassable or self.spec.water or self.fortified
 
     @property
     def defense_bonus(self):

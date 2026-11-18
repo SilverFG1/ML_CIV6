@@ -25,14 +25,18 @@ def growth_threshold(population):
 
 
 def growth_multiplier(population, housing):
-    """Growth slows near the housing limit and stops five citizens above it."""
-    if population <= housing - 2:
-        return 1.0
-    if population == housing - 1:
-        return 0.5
-    if population <= housing + 4:
+    """Growth slows near the housing limit and stops five citizens above it.
+
+    Full rate more than one citizen below housing, half within one citizen of it, a quarter at or above it and
+    none five or more above it. Housing may be fractional (empire mode's improvements add half a house each).
+    """
+    if population >= housing + 5:
+        return 0.0
+    if population >= housing:
         return 0.25
-    return 0.0
+    if population >= housing - 1:
+        return 0.5
+    return 1.0
 
 
 def border_cost(tiles_acquired):

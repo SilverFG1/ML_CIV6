@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from class_hex import direction_between
-from game import Game, GameConfig
+from game import C_Raider, Game, GameConfig
 
 
 @unittest.skipUnless(importlib.util.find_spec('pygame'), 'optional pygame not installed')
@@ -148,6 +148,44 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(tuple(renderer.surface.get_at((int((x1 + x2) / 2), int((y1 + y2) / 2))))[:3], TERRITORY_COLOR)
         self.assertGreater(renderer.panel_height, 118)
         self.assertIn('Pop 2', env.economy.status_text())
+
+    def test_draws_captured_cities_and_domination_victory(self):
+        from renderer import WALL_COLOR
+        env = Game(render=True, config=GameConfig(city_count=3, walls='ancient'))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        env.cities[1].death()
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        self.assertIn('Cities captured 1/3', renderer.status_text())
+        # Every city draws its own walls.
+        for city in env.cities:
+            x, y = renderer._wall_ring(city)[0]
+            self.assertEqual(tuple(renderer.surface.get_at((int(x), int(y))))[:3], WALL_COLOR)
+        for city in env.cities:
+            city.death()
+        env.step(env.encode_action(['SPACE'] * 3))
+        self.assertEqual(env.last_info['outcome'], 'win')
+        self.assertTrue(env.render_frame())
+        self.assertIn('DOMINATION VICTORY', renderer.status_text())
+
+    def test_draws_capital_raiders_and_capital_loss(self):
+        from renderer import RAIDER_COLOR
+        env = Game(render=True, config=GameConfig(player_capital=True))
+        env.reset(seed=7)
+        self.addCleanup(env.close)
+        free = next(position for position in sorted(env.map.grid) if env.occupant(position) is None)
+        env.raiders.append(C_Raider(*free, name_instance='Raider 1', strength=20, env=env))
+        self.assertTrue(env.render_frame())
+        renderer = env._renderer
+        corner = renderer._polygon(free)[1]
+        self.assertEqual(tuple(renderer.surface.get_at((int(corner[0]) - 1, int(corner[1]))))[:3], RAIDER_COLOR)
+        self.assertIn('Capital 100/100', renderer.status_text())
+        env.capital.death()
+        env.step(env.encode_action(['SPACE'] * 3))
+        self.assertTrue(env.last_info['capital_lost'])
+        self.assertTrue(env.render_frame())
+        self.assertIn('CAPITAL LOST', renderer.status_text())
 
     def test_human_slinger_shoots_adjacent_city(self):
         env = Game(render=True, human=True, config=GameConfig(unit_count=1, unit_types=('slinger',)))

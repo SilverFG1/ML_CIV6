@@ -400,6 +400,46 @@ class RunnerTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 run_game.parse_args(list(flags))
 
+    def test_domination_scenario_reports_cities_captured(self):
+        for agent_kind in ('tactical', 'joint'):
+            with self.subTest(agent=agent_kind):
+                args = self.args('--city-count', '2', '--agent', agent_kind, '--fresh')
+                agent = self.make_agent(args)
+                self.assertEqual(args.config.city_count, 2)
+                run_game.train_agent(agent, args)
+                agent.save(args.model_path)
+                evaluations = run_game.compare_policies(agent, args, verbose=False)
+                for summary in evaluations.values():
+                    self.assertIn('average_cities_captured', summary)
+                    self.assertTrue(all(0 <= row['cities_captured'] <= 2 for row in summary['episodes_detail']))
+                resume_args = self.args()
+                self.make_agent(resume_args)
+                self.assertEqual(resume_args.config.city_count, 2)
+                with self.assertRaisesRegex(ValueError, 'fresh'):
+                    self.make_agent(self.args('--city-count', '3'))
+
+    def test_player_capital_scenario_reports_capital_losses(self):
+        args = self.args('--player-capital', '--raid-interval', '3')
+        agent = self.make_agent(args)
+        self.assertTrue(args.config.player_capital)
+        self.assertTrue(agent.observation_schema.endswith(':capital'))
+        run_game.train_agent(agent, args)
+        agent.save(args.model_path)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            evaluations = run_game.compare_policies(agent, args)
+        self.assertIn('(capital lost', output.getvalue())
+        for summary in evaluations.values():
+            self.assertLessEqual(summary['capital_losses'], summary['losses'])
+            self.assertTrue(all('capital_lost' in row for row in summary['episodes_detail']))
+        resume_args = self.args()
+        self.make_agent(resume_args)
+        self.assertTrue(resume_args.config.player_capital)
+        self.assertEqual(resume_args.config.raid_interval, 3)
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.make_agent(self.args('--raid-interval', '5'))
+        with self.assertRaisesRegex(ValueError, 'does not apply'):
+            self.make_agent(self.args('--fresh', '--mode', 'empire', '--player-capital'))
+
     def test_checkpoint_without_river_setting_resumes_without_rivers(self):
         args = self.args()
         agent = self.make_agent(args)

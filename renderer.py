@@ -14,6 +14,7 @@ UNIT_LABELS = {
     'archer': ('ARCHER', (255, 235, 140)),
     'battering_ram': ('RAM', (200, 200, 200)),
 }
+RAIDER_COLOR = (255, 110, 100)
 RIVER_COLOR = (64, 140, 225)
 # Polygon corner indices (from _polygon) for the side facing each neighbour.
 SIDE_CORNERS = {'NE': (0, 1), 'E': (1, 2), 'SE': (2, 3), 'SW': (3, 4), 'W': (4, 5), 'NW': (5, 0)}
@@ -112,12 +113,26 @@ class Renderer:
                 center = self.citizen_marker(position)
                 p.draw.circle(self.surface, CITIZEN_COLOR, center, max(3, self.size // 14))
                 p.draw.circle(self.surface, TERRITORY_COLOR, center, max(3, self.size // 14), 2)
-        for obj in self.env.objects:
+        cities = self.env.cities
+        capital = self.env.capital
+        towns = cities + ([capital] if capital is not None else [])
+        raiders = self.env.living_raiders()
+        # Cities first, so a unit standing in a captured city is drawn on top.
+        for obj in towns + raiders + self.env.units:
             x, y = self._position(obj.position)
-            if obj.alive:
-                image = self.images['city' if obj is self.env.city else 'unit']
+            is_city = obj in towns
+            if obj in raiders:
+                p.draw.polygon(self.surface, RAIDER_COLOR, self._polygon(obj.position), 3)
+            if obj.alive or is_city:
+                image = self.images['city' if is_city else 'unit']
                 self.surface.blit(image, (x, y - self.size // 6))
                 label = UNIT_LABELS.get(getattr(obj, 'unit_type', None))
+                if obj is capital:
+                    label = ('CAPITAL', (150, 200, 255)) if obj.alive else ('LOST', RAIDER_COLOR)
+                elif obj in raiders:
+                    label = ('RAIDER', RAIDER_COLOR)
+                elif is_city and not obj.alive:
+                    label = ('CAPTURED', (140, 230, 140))
                 if label is not None:
                     self._text(label[0], (x + 2, y + 2), label[1], small=True)
             else:
@@ -126,9 +141,9 @@ class Renderer:
                             (x + 2 * s / 3, y + 2 * s / 3), 3)
                 p.draw.line(self.surface, constants.COLOR_RED, (x + 2 * s / 3, y + s / 3),
                             (x + s / 3, y + 2 * s / 3), 3)
-            if obj is self.env.city:
-                self._draw_walls()
-                self._draw_buildings()
+            if obj in cities:
+                self._draw_walls(obj)
+                self._draw_buildings(obj)
             self._text(f'{obj.name_instance} {obj.hp:.0f}', (x + 2, y + self.size * .7), small=True)
         if self.env.human:
             unit = self.env.units[self.selected_unit]
@@ -149,11 +164,24 @@ class Renderer:
         p.display.flip()
 
     def status_text(self):
-        city = self.env.city
-        walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
-                 if city.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
-        text = (f'Turn {self.env.turn_number}   City {city.hp:.0f}/{city.hp_max:.0f}   {walls}   '
-                f'{self.env.last_info["outcome"].upper()}')
+        env = self.env
+        city, cities, capital = env.city, env.cities, env.capital
+        outcome = env.last_info['outcome']
+        if outcome == 'win' and len(cities) > 1:
+            outcome = 'DOMINATION VICTORY'
+        elif outcome == 'loss' and capital is not None and not capital.alive:
+            outcome = 'CAPITAL LOST'
+        else:
+            outcome = outcome.upper()
+        if len(cities) == 1:
+            walls = (f'Ancient walls {city.wall_hp:.0f}/{city.wall_hp_max:.0f}'
+                     if city.walls == 'ancient' else f'Walls {city.wall_hp:.0f}')
+            status = f'City {city.hp:.0f}/{city.hp_max:.0f}   {walls}'
+        else:
+            status = f'Cities captured {env.cities_captured()}/{len(cities)}'
+        if capital is not None:
+            status += f'   Capital {capital.hp:.0f}/{capital.hp_max:.0f}'
+        text = f'Turn {env.turn_number}   {status}   {outcome}'
         if city.buildings:
             effects = [f'+{amount} {kind}' for kind, amount in city.building_yields.items()]
             if city.building_housing:
@@ -182,16 +210,17 @@ class Renderer:
                 if (x + dx, y + dy) not in territory:
                     self.pygame.draw.line(self.surface, TERRITORY_COLOR, inset[first], inset[second], width)
 
-    def building_spot(self, name):
+    def building_spot(self, name, city=None):
         """Centre-bottom point of a building's icon on the city tile."""
-        x, y = self._position(self.env.city.position)
+        x, y = self._position((city or self.env.city).position)
         return x + self.size * BUILDING_SPOTS[name], y + self.size * .52
 
-    def _draw_buildings(self):
+    def _draw_buildings(self, city=None):
         p, s = self.pygame, self.size
         outline = (40, 36, 32)
-        for name in self.env.city.buildings:
-            cx, base = self.building_spot(name)
+        city = city or self.env.city
+        for name in city.buildings:
+            cx, base = self.building_spot(name, city)
             if name == 'monument':
                 obelisk = [(cx - s * .05, base), (cx - s * .03, base - s * .2), (cx, base - s * .25),
                            (cx + s * .03, base - s * .2), (cx + s * .05, base)]
@@ -258,19 +287,19 @@ class Renderer:
             for point in (start, end):  # Round the joints between river segments.
                 self.pygame.draw.circle(self.surface, RIVER_COLOR, point, width / 2)
 
-    def _wall_ring(self):
+    def _wall_ring(self, city=None):
         """Corners of the city's walls, just inside its tile."""
-        polygon = self._polygon(self.env.city.position)
+        polygon = self._polygon((city or self.env.city).position)
         cx = sum(x for x, _ in polygon) / 6
         cy = sum(y for _, y in polygon) / 6
         return [(cx + (x - cx) * .9, cy + (y - cy) * .9) for x, y in polygon]
 
-    def _draw_walls(self):
+    def _draw_walls(self, city=None):
         """A stone ring with corner towers; broken walls leave only ruined towers."""
-        city = self.env.city
+        city = city or self.env.city
         if city.wall_hp_max <= 0:
             return
-        ring = self._wall_ring()
+        ring = self._wall_ring(city)
         intact = city.wall_hp > 0
         color = WALL_COLOR if intact else RUINED_WALL_COLOR
         if intact:

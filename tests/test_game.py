@@ -12,7 +12,8 @@ import numpy as np
 
 import constants
 from class_hex import HexMap, _edge_corners
-from game import BUILDING_SPECS, C_City, C_Unit, Game, GameConfig, attack, hex_distance
+from game import (BUILDING_SPECS, COMMANDS, MAX_RAIDERS, MIN_CITY_DISTANCE, TACTIC_INDEX, TACTICAL_FIRST_TACTIC,
+                  TACTICAL_UNIT_WIDTH, C_City, C_Raider, C_Unit, Game, GameConfig, attack, hex_distance)
 
 
 class GameTests(unittest.TestCase):
@@ -25,6 +26,10 @@ class GameTests(unittest.TestCase):
     def place(self, env, positions):
         for unit, pos in zip(env.units, positions):
             unit.x, unit.y = pos
+
+    def place_cities(self, env, positions):
+        for city, pos in zip(env.cities, positions):
+            city.x, city.y = pos
 
     def wait(self, env):
         return env.encode_action(['SPACE'] * len(env.units))
@@ -229,7 +234,12 @@ class GameTests(unittest.TestCase):
                        {'walls': ['ancient']}, {'land_types': ('lava',)},
                        {'land_types': ('plains', 'plains')}, {'land_types': 5}, {'hills_density': 1.5},
                        {'water_density': -.1}, {'mountain_density': .3, 'water_density': .3, 'forest_density': .3},
-                       {'buildings': ('library',)}, {'buildings': ('monument', 'monument')}, {'buildings': 5}]:
+                       {'buildings': ('library',)}, {'buildings': ('monument', 'monument')}, {'buildings': 5},
+                       {'city_count': 0}, {'city_count': 5}, {'city_count': True},
+                       {'width': 3, 'height': 3, 'city_count': 2},
+                       {'player_capital': 1}, {'capital_strength': 0}, {'raider_strength': 101},
+                       {'raid_interval': -1}, {'raid_interval': 2.5},
+                       {'player_capital': True, 'width': 3, 'height': 3}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 GameConfig(**kwargs)
         env = self.make_env()
@@ -682,6 +692,357 @@ class GameTests(unittest.TestCase):
                     break
             return steps
         self.assertEqual(trace(('monument', 'granary')), trace(()))
+
+    def test_single_city_game_keeps_its_layout(self):
+        env = self.make_env()
+        self.assertEqual(env.cities, [env.city])
+        self.assertEqual(env.city.name_instance, 'Ottertopia')
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior')
+        self.assertEqual(env.last_info['cities_captured'], 0)
+        self.assertEqual(env.summary(), {})
+
+    def test_multiple_cities_are_spaced_reachable_and_besiegeable(self):
+        for seed in range(12):
+            env = Game(config=GameConfig(city_count=3, forest_density=.2, mountain_density=.15), seed=seed)
+            env.reset(seed=seed)
+            positions = [city.position for city in env.cities]
+            self.assertEqual([c.name_instance for c in env.cities], ['Ottertopia', 'Kelpford', 'Clamhaven'])
+            self.assertEqual(positions[0], (4, 4))
+            for i, first in enumerate(positions):
+                for second in positions[i + 1:]:
+                    self.assertGreaterEqual(hex_distance(first, second), MIN_CITY_DISTANCE)
+                open_tiles = [cell for cell in env.map.grid[first].get_neighbors(env.map.grid) if not cell.block_path]
+                self.assertGreaterEqual(len(open_tiles), 3)
+            self.assertTrue(set(positions) <= env.map.reachable(positions[0]))
+            self.assertFalse({u.position for u in env.units} & set(positions))
+            self.assertIn(env.guided_action(), env.valid_actions())
+        self.assertEqual(env.get_observation().shape, (7 * 3 + 8 * 3 + 64,))
+        self.assertEqual(env.observation_schema, 'ml_civ6.v2:8x8:warrior,warrior,warrior:cities=3')
+        self.assertEqual(env.summary(), {'cities_captured': 0})
+
+    def test_cities_on_rough_terrain_stay_flat_open_land(self):
+        config = GameConfig(city_count=3, player_capital=True, width=12, height=12, hills_density=.4,
+                            land_types=('plains', 'desert'), river_count=3, forest_density=.2)
+        for seed in range(6):
+            env = Game(config=config, seed=seed)
+            env.reset(seed=seed)
+            for town in env.cities + [env.capital]:
+                cell = env.map.grid[town.position]
+                self.assertEqual((cell.spec.elevation, cell.feature), ('FLAT', None))
+                self.assertFalse(cell.block_path)
+            self.assertIn(env.guided_action(), env.valid_actions())
+
+    def test_domination_requires_capturing_every_city(self):
+        env = self.make_env(unit_count=2, city_count=2, city_heals=False, ranged_strength=20)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(3, 4), (6, 6)])
+        env.city.hp = 1
+        with patch('game.attack', return_value=(5, 0)):
+            _, reward, done = env.step(env.encode_action(['E', 'W']))
+        self.assertFalse(done)
+        self.assertFalse(env.city.alive)
+        self.assertEqual(env.last_info['outcome'], 'ongoing')
+        self.assertEqual(env.last_info['cities_captured'], 1)
+        # Turn cost, city damage, capture bonus, and the other unit's step toward the next city.
+        self.assertAlmostEqual(reward, -.05 + .03 + 5 + .05)
+        # Later units still act, and the captured city no longer shoots.
+        self.assertEqual(env.units[1].position, (5, 6))
+        self.assertEqual(env.units[0].hp, 100)
+        # A captured city's tile is open to the squad.
+        self.assertIn(env.encode_action(['E', 'SPACE']), env.valid_actions())
+        env.step(env.encode_action(['E', 'SPACE']))
+        self.assertEqual(env.units[0].position, (4, 4))
+        self.place(env, [(2, 1), (6, 6)])
+        env.cities[1].hp = 1
+        with patch('game.attack', return_value=(5, 0)):
+            _, reward, done = env.step(env.encode_action(['W', 'SPACE']))
+        self.assertTrue(done)
+        self.assertEqual(env.last_info['outcome'], 'win')
+        self.assertEqual(env.last_info['cities_captured'], 2)
+        self.assertEqual(env.summary(), {'cities_captured': 2})
+        self.assertAlmostEqual(reward, -.05 + .03 + 10)
+
+    def test_every_uncaptured_city_shoots_and_heals(self):
+        env = self.make_env(unit_count=2, city_count=2, ranged_strength=20)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(2, 4), (1, 3)])
+        for city in env.cities:
+            city.hp = 50
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(self.wait(env))
+        self.assertEqual([u.hp for u in env.units], [95, 95])
+        self.assertEqual([c.hp for c in env.cities], [60, 60])
+        env.cities[1].death()
+        with patch('game.attack', return_value=(5, 0)):
+            env.step(self.wait(env))
+        # Both units heal back to full; only the capital still shoots.
+        self.assertEqual([u.hp for u in env.units], [95, 100])
+        self.assertEqual([c.hp for c in env.cities], [70, 0])
+
+    def test_every_city_gets_the_scenario_walls_and_the_economy_runs_in_the_capital(self):
+        env = self.make_env(unit_count=2, city_count=2, walls='ancient', buildings=('monument',), economy=True)
+        self.assertEqual([(c.wall_hp, c.buildings) for c in env.cities], [(100, ('monument',))] * 2)
+        self.assertIs(env.economy.env.city, env.cities[0])
+        env.cities[0].death()
+        self.place(env, [(0, 7), (1, 7)])
+        env.step(self.wait(env))
+        self.assertFalse([e for e in env.events if e['type'] in ('city_grew', 'border_expanded')])
+
+    def test_shot_hits_closest_city_then_weakest(self):
+        env = self.make_env(unit_count=1, unit_types=('archer',), city_count=2, city_heals=False)
+        self.place_cities(env, [(4, 4), (4, 0)])
+        self.place(env, [(3, 2)])
+        env.cities[1].hp = 50
+        self.assertIs(env.shoot_target(env.units[0]), env.cities[1])
+        env.cities[0].hp = 40
+        self.assertIs(env.shoot_target(env.units[0]), env.cities[0])
+        with patch('game.attack', return_value=(10, 0)):
+            env.step(env.encode_action(['SHOOT']))
+        self.assertEqual([c.hp for c in env.cities], [30, 50])
+        self.place(env, [(4, 1)])
+        self.assertIs(env.shoot_target(env.units[0]), env.cities[1])
+
+    def test_ram_only_helps_against_the_city_it_is_next_to(self):
+        env = self.make_env(unit_count=2, unit_types=('warrior', 'battering_ram'), city_count=2,
+                            wall_hp=30, city_heals=False)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(2, 1), (5, 4)])
+        with patch('game.attack', return_value=(20, 0)):
+            env.step(env.encode_action(['W', 'SPACE']))
+        self.assertEqual(env.cities[1].wall_hp, 20)
+        self.place(env, [(2, 1), (1, 2)])
+        with patch('game.attack', return_value=(20, 0)):
+            env.step(env.encode_action(['W', 'SPACE']))
+        self.assertEqual(env.cities[1].wall_hp, 0)
+
+    def test_heuristic_focuses_on_one_city(self):
+        env = self.make_env(unit_count=3, city_count=2, city_heals=False)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(0, 7), (1, 7), (2, 7)])
+        env.cities[1].hp = 20
+        self.assertIs(env.target_city(), env.cities[1])
+        steps = env.step_distances(env.target_city())
+        self.assertEqual(steps[(1, 1)], 0)
+        self.assertNotIn((4, 4), steps)
+        env.cities[0].hp = 10
+        self.assertIs(env.target_city(), env.cities[0])
+        env.cities[0].death()
+        self.assertIs(env.target_city(), env.cities[1])
+
+    def test_tactical_encoding_follows_the_target_city(self):
+        env = Game(config=GameConfig(unit_count=2, city_count=2, city_heals=False), seed=7, observation='tactical')
+        env.reset(seed=7)
+        self.place_cities(env, [(4, 4), (1, 1)])
+        self.place(env, [(2, 1), (6, 6)])
+        env.cities[1].hp = 30
+        block = env.tactical_observation()[:TACTICAL_UNIT_WIDTH]
+        self.assertEqual(block[2], .3)  # the target's health, not the capital's
+        self.assertEqual(block[TACTICAL_FIRST_TACTIC + COMMANDS.index('W')], TACTIC_INDEX['ATTACK'])
+        self.assertEqual(env.observation_schema, 'ml_civ6.tactical.v1:warrior,warrior')
+
+    def test_tactical_encoding_covers_every_legal_command_in_domination_and_defense(self):
+        config = GameConfig(city_count=3, player_capital=True, raid_interval=2, width=10, height=10,
+                            unit_types=('warrior', 'archer', 'battering_ram'), forest_density=.15,
+                            mountain_density=.05, river_count=2)
+        env = Game(config=config, seed=3, observation='tactical')
+        rng = random.Random(3)
+        for episode in range(3):
+            env.reset(seed=episode)
+            for _ in range(60):
+                observation = env.tactical_observation()
+                tactics = observation.reshape(len(env.units), TACTICAL_UNIT_WIDTH)[:, TACTICAL_FIRST_TACTIC:]
+                for action in env.valid_actions():
+                    for index, command in enumerate(env.actions[action]):
+                        if env.units[index].alive:
+                            self.assertGreaterEqual(tactics[index, COMMANDS.index(command)], 0)
+                _, _, done = env.step(env.guided_action(rng))
+                if done:
+                    break
+
+    # Player capital and raiders. capital_env pins the capital to (1, 6), four hexes
+    # from the enemy city at (4, 4), and turns raids off unless a test asks for them.
+    def capital_env(self, **kwargs):
+        env = self.make_env(**{'player_capital': True, 'raid_interval': 0, 'city_heals': False, **kwargs})
+        env.capital.x, env.capital.y = 1, 6
+        return env
+
+    def add_raider(self, env, position, hp=100):
+        raider = C_Raider(*position, name_instance=f'Raider {len(env.raiders) + 1}', hp=hp, strength=20, env=env)
+        env.raiders.append(raider)
+        return raider
+
+    def test_player_capital_is_off_by_default(self):
+        env = self.make_env()
+        self.assertIsNone(env.capital)
+        self.assertEqual(env.raiders, [])
+        self.assertEqual(env.get_observation().shape, (7 + 8 * 3 + 64,))
+        self.assertNotIn(':capital', env.observation_schema)
+        env.step(self.wait(env))
+        self.assertFalse(env.last_info['capital_lost'])
+
+    def test_player_capital_is_placed_away_from_enemies_with_the_squad_beside_it(self):
+        for seed in range(12):
+            env = Game(config=GameConfig(player_capital=True, city_count=2, forest_density=.2,
+                                         mountain_density=.1), seed=seed)
+            env.reset(seed=seed)
+            home = env.capital.position
+            self.assertEqual(env.capital.name_instance, 'Otterholt')
+            for city in env.cities:
+                self.assertGreaterEqual(hex_distance(home, city.position), MIN_CITY_DISTANCE)
+            open_tiles = [cell for cell in env.map.grid[home].get_neighbors(env.map.grid) if not cell.block_path]
+            self.assertGreaterEqual(len(open_tiles), 3)
+            self.assertIn(home, env.map.reachable(env.city.position))
+            self.assertTrue(all(hex_distance(u.position, home) <= 2 for u in env.units))
+            self.assertNotIn(home, [u.position for u in env.units])
+        self.assertEqual(env.get_observation().shape, (14 + 24 + 4 + 4 * MAX_RAIDERS + 64,))
+        self.assertTrue(env.observation_schema.endswith(':cities=2:capital'))
+        tactical = Game(config=GameConfig(player_capital=True), observation='tactical')
+        self.assertTrue(tactical.observation_schema.endswith(':capital'))
+
+    def test_units_cannot_enter_their_own_capital(self):
+        env = self.capital_env()
+        self.place(env, [(2, 6), (7, 0), (6, 0)])
+        blocked = env.encode_action(['W', 'SPACE', 'SPACE'])
+        self.assertNotIn(blocked, env.valid_actions())
+        env.step(blocked)
+        self.assertEqual(env.units[0].position, (2, 6))
+        self.assertIn('blocked_move', [e['type'] for e in env.events])
+
+    def test_raids_take_turns_between_enemy_cities(self):
+        env = self.capital_env(city_count=2, raid_interval=2)
+        expected = {1: None, 2: env.cities[0], 3: None, 4: env.cities[1], 6: env.cities[0]}
+        for turn, city in expected.items():
+            env.turn_number = turn
+            self.assertIs(env.raiding_city(), city)
+        env.cities[1].death()
+        env.turn_number = 4
+        self.assertIsNone(env.raiding_city())
+        env.turn_number = 2
+        env.spawn_raiders()
+        raider = env.raiders[0]
+        self.assertEqual(hex_distance(raider.position, env.cities[0].position), 1)
+        self.assertIn('raider_spawned', [e['type'] for e in env.events])
+        quiet = self.capital_env(raid_interval=0)
+        quiet.turn_number = 6
+        self.assertIsNone(quiet.raiding_city())
+
+    def test_raiders_are_capped_and_reuse_slots(self):
+        env = self.capital_env(raid_interval=1)
+        for position in [(7, 0), (7, 1), (7, 2), (7, 3)]:
+            self.add_raider(env, position)
+        env.turn_number = 1
+        env.spawn_raiders()
+        self.assertEqual(len(env.living_raiders()), MAX_RAIDERS)
+        env.raiders[1].death_unit()
+        env.spawn_raiders()
+        self.assertEqual(len(env.raiders), MAX_RAIDERS)
+        self.assertTrue(env.raiders[1].alive)
+        self.assertEqual(env.raiders[1].name_instance, 'Raider 2')
+        self.assertEqual(hex_distance(env.raiders[1].position, env.city.position), 1)
+
+    def test_raider_marches_on_the_capital_and_attacks_it(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        raider = self.add_raider(env, (4, 6))
+        distances = []
+        for _ in range(2):
+            env.step(self.wait(env))
+            distances.append(hex_distance(raider.position, env.capital.position))
+        self.assertEqual(distances, [2, 1])
+        with patch('game.attack', return_value=(10, 5)):
+            _, reward, done = env.step(self.wait(env))
+        self.assertFalse(done)
+        self.assertEqual((env.capital.hp, raider.hp), (90, 95))
+        # Turn cost, capital damage, and the damage the capital dealt back.
+        self.assertAlmostEqual(reward, -.05 - .3 + .025)
+        self.assertNotIn('capital_healed', [e['type'] for e in env.events])
+
+    def test_raider_steps_around_the_squad_but_attacks_a_full_blockade(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        steps = env._raider_steps()
+
+        def forward(position):
+            return [cell.index for cell in env.map.grid[position].get_neighbors(env.map.grid)
+                    if steps.get(cell.index, 1e9) < steps[position]]
+
+        start = next(p for p in sorted(steps) if hex_distance(p, env.capital.position) == 3
+                     and len(forward(p)) == 2 and env.occupant(p) is None
+                     and hex_distance(p, env.city.position) > 1)
+        first, second = sorted(forward(start), key=lambda p: steps[p])
+        raider = self.add_raider(env, start)
+        self.place(env, [first, (7, 0), (6, 0)])
+        env.step(self.wait(env))
+        self.assertEqual(raider.position, second)
+        self.assertEqual(env.units[0].hp, 100)
+        env.raiders.clear()
+        raider = self.add_raider(env, start)
+        self.place(env, [first, second, (6, 0)])
+        env.units[1].hp = 60
+        with patch('game.attack', return_value=(20, 5)):
+            env.step(self.wait(env))
+        self.assertEqual(raider.position, start)
+        self.assertEqual([u.hp for u in env.units[:2]], [100, 50])
+
+    def test_capital_heals_only_without_a_raider_beside_it(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        env.capital.hp = 50
+        env.step(self.wait(env))
+        self.assertEqual(env.capital.hp, 60)
+        self.assertIn('capital_healed', [e['type'] for e in env.events])
+        self.add_raider(env, (2, 6))
+        with patch('game.attack', return_value=(0, 0)):
+            env.step(self.wait(env))
+        self.assertEqual(env.capital.hp, 60)
+
+    def test_losing_the_capital_loses_the_game(self):
+        env = self.capital_env()
+        self.place(env, [(7, 0), (6, 0), (5, 0)])
+        self.add_raider(env, (2, 6))
+        env.capital.hp = 5
+        with patch('game.attack', return_value=(10, 0)):
+            _, reward, done = env.step(self.wait(env))
+        self.assertTrue(done)
+        self.assertEqual(env.last_info['outcome'], 'loss')
+        self.assertTrue(env.last_info['capital_lost'])
+        self.assertEqual(env.summary(), {'capital_lost': 1})
+        self.assertAlmostEqual(reward, -.05 - .15 - 10)
+
+    def test_squad_fights_raiders_in_melee_and_at_range(self):
+        env = self.capital_env()
+        self.place(env, [(4, 2), (7, 7), (6, 7)])
+        raider = self.add_raider(env, (3, 2))
+        with patch('game.attack', return_value=(30, 10)):
+            _, reward, _ = env.step(env.encode_action(['W', 'SPACE', 'SPACE']))
+        self.assertEqual((raider.hp, env.units[0].hp, env.units[0].position), (70, 90, (4, 2)))
+        self.assertNotEqual(raider.position, (3, 2))
+        self.assertAlmostEqual(reward, -.05 + .15 - .05)
+        archers = self.capital_env(unit_count=2, unit_types=('archer', 'battering_ram'))
+        self.place(archers, [(3, 0), (2, 2)])
+        raider = self.add_raider(archers, (3, 2), hp=20)
+        self.assertIs(archers.shoot_target(archers.units[0]), raider)
+        self.assertNotIn(archers.encode_action(['SPACE', 'E']), archers.valid_actions())
+        with patch('game.attack', return_value=(30, 0)):
+            archers.step(archers.encode_action(['SHOOT', 'SPACE']))
+        self.assertFalse(raider.alive)
+        self.assertIn('raider_killed', [e['type'] for e in archers.events])
+
+    def test_heuristic_defends_only_when_the_capital_could_fall(self):
+        env = self.capital_env()
+        self.place(env, [(3, 6), (7, 0), (6, 0)])
+        raider = self.add_raider(env, (2, 6))
+        self.assertIsNone(env.threat())
+        env.capital.hp = 60
+        self.assertIs(env.threat(), raider)
+        self.assertEqual(env.actions[env.guided_action(random.Random(1))][0], 'W')
+        # The tactical encoding points the fighting units at the raider, so demonstrations
+        # and the learner agree on what attacking means.
+        env.observation_mode = 'tactical'
+        block = env.observe()[:TACTICAL_UNIT_WIDTH]
+        self.assertEqual(block[TACTICAL_FIRST_TACTIC + COMMANDS.index('W')], TACTIC_INDEX['ATTACK'])
+        env.city.hp = 30
+        self.assertIsNone(env.threat())
 
 
 if __name__ == '__main__':

@@ -30,7 +30,8 @@ LEARNING_DEFAULTS = {
 MODES = ("siege", "empire")
 # Scenario flags that only one mode understands.
 SIEGE_SETTINGS = ("unit_count", "unit_types", "unit_strengths", "city_strength", "wall_hp", "walls", "buildings",
-                  "ranged_strength", "city_population", "build_queue", "city_position")
+                  "ranged_strength", "city_population", "build_queue", "city_position", "city_count",
+                  "raid_interval", "capital_strength", "raider_strength")
 EMPIRE_SETTINGS = ("rivals", "map_type", "turn_limit", "resource_density", "rival_bonus", "speed")
 # The empire curriculum ramps the rival's bonus up from this level.
 EMPIRE_CURRICULUM_START = 0.5
@@ -124,6 +125,15 @@ def parse_args(argv=None):
                         help="city walls; ancient gives 100 wall HP and a 15-strength ranged strike")
     parser.add_argument("--river-count", type=int, choices=range(0, game.MAX_RIVERS + 1), metavar="N",
                         help=f"rivers to generate along hex sides (0-{game.MAX_RIVERS}, default: 0)")
+    parser.add_argument("--city-count", type=int, choices=range(1, game.MAX_CITIES + 1), metavar="N",
+                        help=f"enemy capitals (1-{game.MAX_CITIES}); capture them all for a domination victory "
+                             "(default: 1)")
+    parser.add_argument("--player-capital", action="store_true",
+                        help="give the squad its own capital to defend against raiders; losing it loses the game")
+    parser.add_argument("--raid-interval", type=int,
+                        help="turns between raids on the player's capital; 0 disables raids (default: 6)")
+    parser.add_argument("--capital-strength", type=float, help="player's capital combat strength (default: 28)")
+    parser.add_argument("--raider-strength", type=float, help="raider combat strength (default: 20)")
     parser.add_argument("--city-position", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--no-city-healing", action="store_true")
     parser.add_argument("--unit-strengths", type=float, nargs="+")
@@ -181,7 +191,8 @@ def config_from_args(args, saved=None):
     for name in ("width", "height", "unit_count", "city_position", "city_strength", "wall_hp", "walls",
                  "buildings", "ranged_strength", "mountain_density", "forest_density", "land_types", "hills_density",
                  "water_density", "river_count", "unit_strengths", "unit_types", "difficulty",
-                 "city_population", "build_queue"):
+                 "city_population", "build_queue", "city_count", "raid_interval", "capital_strength",
+                 "raider_strength"):
         value = getattr(args, name)
         if value is not None:
             explicit[name] = tuple(value) if name in TUPLE_SETTINGS else value
@@ -189,6 +200,8 @@ def config_from_args(args, saved=None):
         explicit["city_heals"] = False
     if args.economy:
         explicit["economy"] = True
+    if args.player_capital:
+        explicit["player_capital"] = True
     if args.difficulty is not None and args.city_strength is None:
         explicit["city_strength"] = DIFFICULTY_STRENGTHS[args.difficulty]
     elif not saved and args.city_strength is None:
@@ -348,8 +361,8 @@ def build_agent(args, rng):
         raise ValueError("the empire learner plays only --mode empire, and --mode empire needs the empire learner")
     wrong = [name for name in (SIEGE_SETTINGS if mode == "empire" else EMPIRE_SETTINGS)
              if getattr(args, name) is not None]
-    if mode == "empire" and (args.economy or args.no_city_healing):
-        wrong.append("economy" if args.economy else "no_city_healing")
+    if mode == "empire":
+        wrong += [flag for flag in ("economy", "no_city_healing", "player_capital") if getattr(args, flag)]
     if wrong:
         raise ValueError(f"--{wrong[0].replace('_', '-')} does not apply to --mode {mode}")
     if kind != "joint" and args.state_precision is not None:
@@ -582,14 +595,19 @@ def compare_policies(agent, args, *, count=None, seed=None, config=None, policie
                 "episodes_detail": rows,
             }
             if hasattr(env, "summary") and completed:
-                # Empire games also report the averages of their end-of-game summaries.
+                # Games also report the averages of their end-of-game summaries: the empire's
+                # scores, cities captured in a domination siege, and how often the capital fell.
                 for name in env.summary():
                     summaries[policy][f"average_{name}"] = sum(row[name] for row in rows) / completed
+            if getattr(config, "player_capital", False):
+                summaries[policy]["capital_losses"] = sum(row["capital_lost"] for row in rows)
             if verbose:
                 summary = summaries[policy]
                 extra = "".join(f", {name[8:].replace('_', ' ')} {value:.1f}" for name, value in summary.items()
-                                if name.startswith("average_") and name not in ("average_reward", "average_steps"))
-                print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}, "
+                                if name.startswith("average_")
+                                and name not in ("average_reward", "average_steps", "average_capital_lost"))
+                capital = f" (capital lost {summary['capital_losses']})" if "capital_losses" in summary else ""
+                print(f"{policy}: wins {wins}/{completed}, losses {summary['losses']}{capital}, "
                       f"timeouts {summary['timeouts']}, average reward {summary['average_reward']:.2f}{extra}")
             if summaries[policy]["quits"]:
                 break

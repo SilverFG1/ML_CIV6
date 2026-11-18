@@ -21,6 +21,8 @@ BUILDUP_TURN = 30
 # A melee assault on a city needs this capture chance, or a death chance below the risk limit.
 ASSAULT_CAPTURE = .5
 ASSAULT_RISK = .15
+# Gold kept back for emergencies; anything above it buys whatever a city is building.
+GOLD_RESERVE = 100
 MELEE_PREFERENCE = ('horseman', 'swordsman', 'heavy_chariot', 'spearman', 'warrior')
 
 
@@ -30,6 +32,7 @@ class Plan:
     def __init__(self, env, owner):
         self.env, self.owner = env, owner
         self.player = env.players[owner]
+        self.spent = 0  # Gold this turn's purchases will take.
         self.cities = sorted(env.player_cities(owner), key=lambda c: c.id)
         land = [u for u in env.player_units(owner) if u.spec.military and u.spec.domain == 'land']
         self.threats = env.threats(owner)
@@ -136,10 +139,11 @@ def _city(env, plan, decision, rng):
     defenders = len(plan.defenders_near(city.position))
     if city.item is not None:
         price = env.item_price(plan.owner, city.item)
-        gold = plan.player.gold
-        urgent = city.item in R.LAND_MILITARY and threat > defenders
+        gold = plan.player.gold - plan.spent
+        urgent = city.item in R.LAND_MILITARY and threat > defenders and gold >= price
         if 'buy' in names and (urgent or (city.item == 'settler' and gold >= price + 30)
-                               or (city.item == 'builder' and gold >= price + 60)):
+                               or (city.item == 'builder' and gold >= price + 60) or gold >= price + GOLD_RESERVE):
+            plan.spent += price  # Later cities this turn see what is left.
             return 'buy'
         return city.item
     choice = _city_item(env, plan, city, names, threat, defenders)

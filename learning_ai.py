@@ -875,14 +875,17 @@ class EmpireQAgent:
     option is better.
 
     Thirty or more entities share one reward, so a single unit's choice barely
-    moves its target and learned advantages are noisy. Demonstrations
-    therefore also teach with a large-margin loss (DQfD, Hester et al. 2018):
-    on a demonstrated decision, every other option valued within
-    demonstration_margin of the demonstrated one has its advantage pushed
-    down by learning_rate of the shortfall. The demonstrated option keeps its
-    temporal-difference estimate. The greedy policy follows the demonstrations
-    unless the learner's own experience values another option by more than
-    the margin.
+    moves its target and learned advantages are noisy. The heuristic therefore
+    also teaches with a large-margin loss (DQfD, Hester et al. 2018): for each
+    decision it labels, every other legal option valued within
+    demonstration_margin of the labelled one has its advantage pushed down by
+    learning_rate of the shortfall, while the labelled option keeps its
+    temporal-difference estimate. Demonstrations label their own moves. With
+    margin_on "all", the heuristic also labels the states of the learner's own
+    episodes, as in DAgger (Ross et al. 2011), because the learner's play
+    reaches states that demonstrations never show. The greedy policy follows
+    the labels unless the learner's own experience values another option by
+    more than the margin.
 
     Exploration is per decision: each explores with probability epsilon, using
     the heuristic's option for a guided share of those, so a turn mixes
@@ -895,8 +898,9 @@ class EmpireQAgent:
 
     agent_kind = "empire"
     observation_mode = "empire"
-    # run_game.run_episode tells learn() which transitions are demonstrations.
-    learns_from_demonstrations = True
+    # run_game.run_episode passes learn() the heuristic's choices as teacher labels.
+    learns_from_teacher = True
+    MARGIN_SCOPES = ("demonstrations", "all")
 
     def __init__(
         self,
@@ -910,6 +914,7 @@ class EmpireQAgent:
         learning_rate_min=0.01,
         untried_penalty=0.5,
         demonstration_margin=1.0,
+        margin_on="all",
         rng=None,
         observation_schema=None,
     ):
@@ -923,6 +928,7 @@ class EmpireQAgent:
         self.learning_rate_min = _finite(learning_rate_min, "learning_rate_min", 0.0, 1.0)
         self.untried_penalty = _finite(untried_penalty, "untried_penalty", 0.0, 100.0)
         self.demonstration_margin = _finite(demonstration_margin, "demonstration_margin", 0.0, 100.0)
+        self.margin_on = margin_on
         self.rng = rng if rng is not None else random.Random()
         if not isinstance(self.rng, random.Random):
             raise ValueError("rng must be a random.Random instance")
@@ -945,6 +951,8 @@ class EmpireQAgent:
         _finite(self.initial_q, "initial_q")
         _finite(self.untried_penalty, "untried_penalty", 0.0, 100.0)
         _finite(self.demonstration_margin, "demonstration_margin", 0.0, 100.0)
+        if self.margin_on not in self.MARGIN_SCOPES:
+            raise ValueError(f"margin_on must be one of {', '.join(self.MARGIN_SCOPES)}")
         _integer(self.episodes_trained, "episodes_trained")
         if self.observation_schema is not None and (
             not isinstance(self.observation_schema, str) or not self.observation_schema.strip()
@@ -1078,16 +1086,22 @@ class EmpireQAgent:
         return float(sum(self._best(kind, features, legal)[1] for kind, features, legal in parsed) / len(parsed))
 
     def learn(self, observation, action, reward, next_observation, done, next_valid_actions=None,
-              demonstration=False):
+              teacher=None, demonstration=False):
         """Move every decision's value for its chosen option toward the shared one-step target.
 
         The target bootstraps from the next turn's decisions unless the game
-        ended. A turn cut off by a turn limit bootstraps too. With
-        demonstration, the large-margin loss also applies to every decision.
+        ended. A turn cut off by a turn limit bootstraps too. teacher holds the
+        heuristic's option for each decision; the large-margin loss keeps the
+        others below it on demonstrations (demonstration=True, where teacher
+        defaults to action) and, with margin_on "all", on every transition.
         """
         self._validate_configuration()
         if not isinstance(demonstration, (bool, np.bool_)):
             raise ValueError("demonstration must be a boolean")
+        if demonstration and teacher is None:
+            teacher = action
+        if not demonstration and self.margin_on == "demonstrations":
+            teacher = None
         reward = _finite(reward, "reward")
         if not isinstance(done, (bool, np.bool_)):
             raise ValueError("done must be a boolean")
@@ -1095,13 +1109,18 @@ class EmpireQAgent:
         if isinstance(action, (str, bytes)) or len(action) != len(decisions):
             raise ValueError("action must hold one option per decision")
         following = self._decode(next_observation, None if done or next_valid_actions is None else next_valid_actions)
-        chosen, legal_options = [], {}
-        for (kind, entity, features, legal), option in zip(decisions, action):
+        if teacher is not None and (isinstance(teacher, (str, bytes)) or len(teacher) != len(decisions)):
+            raise ValueError("teacher must hold one option per decision")
+        chosen, labels = [], []
+        for index, ((kind, entity, features, legal), option) in enumerate(zip(decisions, action)):
             option = self._option(kind, option)
             if option not in legal:
                 raise ValueError(f"option {option} is not legal for the {kind} decision")
             chosen.append((kind, entity, features, option))
-            legal_options[(kind, entity)] = legal
+            label = None if teacher is None else self._option(kind, teacher[index])
+            if label is not None and label not in legal:
+                raise ValueError(f"teacher option {label} is not legal for the {kind} decision")
+            labels.append((label, legal))
         successors, total = {}, 0.0
         if not done:
             for kind, entity, features, legal in following:
@@ -1109,7 +1128,7 @@ class EmpireQAgent:
                 successors[(kind, entity)] = best
                 total += best
         rate = self.learning_rate
-        for kind, entity, features, option in chosen:
+        for (kind, entity, features, option), (label, legal) in zip(chosen, labels):
             target = reward
             if successors:
                 own = successors.get((kind, entity))
@@ -1136,11 +1155,11 @@ class EmpireQAgent:
                 row = self.q_table[key]
                 row[0] += value_step
                 row[1 + option] += advantage_step
-            if demonstration and self.demonstration_margin > 0:
+            if label is not None and self.demonstration_margin > 0:
                 advantages = self._parts(kind, features)[1]
-                for other in legal_options[(kind, entity)]:
-                    shortfall = advantages[other] + self.demonstration_margin - advantages[option]
-                    if other != option and shortfall > 0:
+                for other in legal:
+                    shortfall = advantages[other] + self.demonstration_margin - advantages[label]
+                    if other != label and shortfall > 0:
                         for key in keys:
                             self.q_table[key][1 + other] -= rate * shortfall / groups
 
@@ -1202,6 +1221,7 @@ class EmpireQAgent:
             "learning_rate_min": self.learning_rate_min,
             "untried_penalty": self.untried_penalty,
             "demonstration_margin": self.demonstration_margin,
+            "margin_on": self.margin_on,
             "episodes_trained": self.episodes_trained,
             "observation_schema": self.observation_schema,
             "training_state": self.training_state,
@@ -1227,7 +1247,7 @@ class EmpireQAgent:
             raise ValueError("not an empire agent checkpoint")
         required = ("encoding", "learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min",
                     "initial_q", "learning_rate_decay", "learning_rate_min", "untried_penalty",
-                    "demonstration_margin", "episodes_trained",
+                    "demonstration_margin", "margin_on", "episodes_trained",
                     "observation_schema", "training_state", "rng_state", "q_table")
         missing = [name for name in required if name not in payload]
         if missing:
@@ -1239,7 +1259,7 @@ class EmpireQAgent:
             epsilon=payload["epsilon"], epsilon_decay=payload["epsilon_decay"], epsilon_min=payload["epsilon_min"],
             initial_q=payload["initial_q"], learning_rate_decay=payload["learning_rate_decay"],
             learning_rate_min=payload["learning_rate_min"], untried_penalty=payload["untried_penalty"],
-            demonstration_margin=payload["demonstration_margin"], rng=rng,
+            demonstration_margin=payload["demonstration_margin"], margin_on=payload["margin_on"], rng=rng,
             observation_schema=payload["observation_schema"],
         )
         agent.episodes_trained = _integer(payload["episodes_trained"], "episodes_trained")

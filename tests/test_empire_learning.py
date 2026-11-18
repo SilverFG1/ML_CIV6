@@ -138,6 +138,22 @@ class EmpireAgentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             agent.learn(observation, garrison, 1.0, (), done=True, demonstration='yes')
 
+    def test_the_teacher_labels_the_learners_own_moves_unless_limited_to_demonstrations(self):
+        observation, siege, garrison = (land(),), (LAND['siege'],), (LAND['garrison'],)
+        results = {}
+        for scope in EmpireQAgent.MARGIN_SCOPES:
+            agent = self.agent(learning_rate=0.5, untried_penalty=0.5, demonstration_margin=1.0, margin_on=scope)
+            for _ in range(10):  # The learner besieges; the heuristic would have garrisoned.
+                agent.learn(observation, siege, 1.0, (), done=True, teacher=garrison)
+            results[scope] = agent.choose_action(observation, explore=False)
+        self.assertEqual(results, {'all': garrison, 'demonstrations': siege})
+        with self.assertRaises(ValueError):
+            self.agent().learn(observation, siege, 0.0, (), done=True, teacher=(LAND['hunt'],))
+        with self.assertRaises(ValueError):
+            self.agent().learn(observation, siege, 0.0, (), done=True, teacher=())
+        with self.assertRaises(ValueError):
+            EmpireQAgent(margin_on='sometimes')
+
     def test_terminal_updates_do_not_bootstrap(self):
         observation, action = (land(),), (LAND['fortify'],)
         results = []

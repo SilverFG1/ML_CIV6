@@ -1187,7 +1187,6 @@ class EmpireGame:
     # ------------------------------------------------------------- turn end
 
     def _city_turn(self, city, available):
-        player = self.players[city.owner]
         yields = self.city_yields(city, available)
         surplus = self.food_surplus(city, yields)
         if surplus > 0:

@@ -686,6 +686,25 @@ class GameTests(unittest.TestCase):
         self.assertAlmostEqual(reward, .5 + .1 * (env.score(0) - before))
         self.assertIn(warrior, env.units)
 
+    def test_consulting_the_heuristic_changes_nothing(self):
+        env = EmpireGame(EmpireConfig(turn_limit=60), seed=6)
+        env.reset(seed=6)
+        rng = random.Random(6)
+        for _ in range(40):
+            env.step(env.guided_action(rng))
+        env.players[0].gold = 900  # Rich enough that the heuristic buys in several cities.
+        env._decisions = env._build_decisions(0)
+
+        def snapshot():
+            return (env.players[0].gold, [(u.id, u.position, u.hp, u.moves) for u in env.units],
+                    [(c.id, c.item, c.production, c.population) for c in env.cities], env.rng.getstate(),
+                    env.observe())
+        before = snapshot()
+        action = env.guided_action(random.Random(1))
+        self.assertEqual(snapshot(), before)
+        buys = sum(DECISION_KINDS[d.kind].options[a] == 'buy' for d, a in zip(env.observe(), action))
+        self.assertGreater(buys, 0)
+
     def test_heuristic_rival_expands_and_researches(self):
         env = EmpireGame(EmpireConfig(turn_limit=60), seed=4)
         env.reset(seed=4)

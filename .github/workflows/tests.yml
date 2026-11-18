@@ -19,10 +19,12 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Train and compare evaluation policies
         run: python run_game.py --episodes 2 --max-steps 4 --eval-episodes 2 --fresh --no-save --metrics-dir artifacts/smoke
+      - name: Train and compare evaluation policies in empire mode
+        run: python run_game.py --mode empire --episodes 2 --turn-limit 20 --eval-episodes 2 --fresh --no-save --metrics-dir artifacts/empire-smoke
       - name: Retain smoke metrics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-metrics
-          path: artifacts/smoke
+          path: artifacts/
           if-no-files-found: ignore

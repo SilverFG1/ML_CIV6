@@ -715,6 +715,10 @@ class EmpireRunnerTests(unittest.TestCase):
         demonstration, own = agent.training_state["metrics"]
         flags = [call.kwargs["demonstration"] for call in learn.call_args_list]
         self.assertEqual(flags, [True] * demonstration["steps"] + [False] * own["steps"])
+        # In its own episode the learner is also told what the heuristic would have chosen.
+        teachers = [call.kwargs["teacher"] for call in learn.call_args_list]
+        self.assertTrue(all(teacher is None for teacher in teachers[:demonstration["steps"]]))
+        self.assertTrue(all(isinstance(teacher, tuple) for teacher in teachers[demonstration["steps"]:]))
         self.assertTrue(demonstration["demonstration"])
         self.assertEqual(demonstration["guidance_actions"], demonstration["steps"])
         self.assertFalse(own["demonstration"])

@@ -25,7 +25,7 @@ LEARNING_DEFAULTS = {
                   epsilon_min=0.05, state_precision=100, initial_q=-100.0),
     "empire": dict(learning_rate=0.1, discount_factor=0.97, epsilon=1.0, epsilon_decay=0.995,
                    epsilon_min=0.05, initial_q=0.0, learning_rate_decay=0.998, learning_rate_min=0.01,
-                   untried_penalty=0.5, demonstration_margin=1.0),
+                   untried_penalty=0.5, demonstration_margin=1.0, margin_on="all"),
 }
 MODES = ("siege", "empire")
 # Scenario flags that only one mode understands.
@@ -92,6 +92,9 @@ def parse_args(argv=None):
                         help="empire learner: how far below a situation's value untried options start (default: 0.5)")
     parser.add_argument("--demonstration-margin", type=float,
                         help="empire learner: margin by which demonstrated options must lead the others (default: 1.0)")
+    parser.add_argument("--margin-on", choices=EmpireQAgent.MARGIN_SCOPES,
+                        help="empire learner: apply the margin to demonstrations only, or also to the heuristic's "
+                             "choices in the learner's own episodes (default: all)")
     parser.add_argument("--guided-exploration", type=float,
                         help="guided fraction of epsilon exploration (default: 0.35)")
     parser.add_argument("--demonstrations", type=float,
@@ -353,7 +356,8 @@ def build_agent(args, rng):
         raise ValueError("--state-precision applies only to the joint learner; use --fresh --agent joint")
     if kind != "tactical" and args.shaping is not None:
         raise ValueError("--shaping applies only to the tactical learner")
-    empire_only = [flag for flag in ("untried_penalty", "demonstration_margin") if getattr(args, flag) is not None]
+    empire_only = [flag for flag in ("untried_penalty", "demonstration_margin", "margin_on")
+                   if getattr(args, flag) is not None]
     if kind != "empire" and empire_only:
         raise ValueError(f"--{empire_only[0].replace('_', '-')} applies only to the empire learner")
     annealing = [flag for flag in ("learning_rate_decay", "learning_rate_min") if getattr(args, flag) is not None]
@@ -401,7 +405,7 @@ def build_agent(args, rng):
         adjustable = ("learning_rate", "discount_factor", "epsilon", "epsilon_decay", "epsilon_min", "initial_q")
         extra = {"tactical": ("shaping", "learning_rate_decay", "learning_rate_min"),
                  "empire": ("learning_rate_decay", "learning_rate_min", "untried_penalty",
-                            "demonstration_margin")}.get(kind, ())
+                            "demonstration_margin", "margin_on")}.get(kind, ())
         for name in adjustable + extra:
             if getattr(args, name) is not None:
                 setattr(agent, name, getattr(args, name))
@@ -492,6 +496,7 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
     policy_rng = rng if rng is not None else agent.rng
     for step in range(max_steps):
         valid = env.valid_actions()
+        fallback = None
         if policy == "heuristic":
             action, source = env.guided_action(policy_rng), "guided"
         elif policy == "random":
@@ -510,9 +515,10 @@ def run_episode(env, agent, episode_number, max_steps, train, render_delay_ms=0,
             # A turn limit cuts the episode short without ending the game, and the
             # observation does not show the turn, so the cut-off state bootstraps.
             # Treating it as terminal would make stalling until the limit look free.
-            # Learners that treat demonstrations specially are told which moves are the heuristic's.
-            extra = ({"demonstration": policy == "heuristic"}
-                     if getattr(agent, "learns_from_demonstrations", False) else {})
+            # A learner taught by the heuristic hears which moves are demonstrations and,
+            # in its own episodes, what the heuristic would have chosen.
+            extra = ({"demonstration": policy == "heuristic", "teacher": fallback}
+                     if getattr(agent, "learns_from_teacher", False) else {})
             agent.learn(state, action, reward, next_state, done,
                         next_valid_actions=[] if done else env.valid_actions(), **extra)
         counts[source] += 1
@@ -765,7 +771,8 @@ def main(argv=None):
         settings = {name: getattr(agent, name) for name in
                     ('agent_kind', 'learning_rate', 'discount_factor', 'epsilon', 'epsilon_decay', 'epsilon_min',
                      'state_precision', 'shaping', 'learning_rate_decay', 'learning_rate_min', 'initial_q',
-                     'untried_penalty', 'demonstration_margin', 'episodes_trained', 'observation_schema')
+                     'untried_penalty', 'demonstration_margin', 'margin_on', 'episodes_trained',
+                     'observation_schema')
                     if hasattr(agent, name)}
         settings.update({name: getattr(args, name) for name in
                          ('mode', 'seed', 'max_steps', 'eval_seed', 'eval_episodes', 'eval_policies',

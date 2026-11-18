@@ -39,6 +39,25 @@ class EconomyTests(unittest.TestCase):
         self.assertEqual(border_cost(0), 10)
         self.assertAlmostEqual(border_cost(1), 10 + 6 ** 1.3)
 
+    def test_growth_multiplier_with_fractional_housing(self):
+        # Empire improvements add half a house, so housing is often fractional.
+        self.assertEqual([growth_multiplier(n, 5.5) for n in (3, 4, 5, 6, 10, 11)], [1.0, 1.0, .5, .25, .25, 0.0])
+
+    def test_growth_multiplier_matches_the_integer_rule(self):
+        def integer_rule(population, housing):
+            if population <= housing - 2:
+                return 1.0
+            if population == housing - 1:
+                return 0.5
+            if population <= housing + 4:
+                return 0.25
+            return 0.0
+
+        for housing in range(0, 25):
+            for population in range(1, 35):
+                self.assertEqual(growth_multiplier(population, housing), integer_rule(population, housing),
+                                 (population, housing))
+
     def test_housing_depends_on_water_rivers_and_granary(self):
         env = self.make_env()
         ring = self.set_ring(env, ['GRASSLAND'] * 6)

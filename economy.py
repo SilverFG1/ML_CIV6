@@ -169,21 +169,10 @@ def growth_threshold(population):
 
 
 def growth_multiplier(population, housing):
-    """Growth slows near the housing limit and stops five citizens above it."""
-    if population <= housing - 2:
-        return 1.0
-    if population == housing - 1:
-        return 0.5
-    if population <= housing + 4:
-        return 0.25
-    return 0.0
+    """Growth slows near the housing limit and stops five citizens above it.
 
-
-def housing_growth_rate(population, housing):
-    """growth_multiplier for housing that may be fractional, such as half a house per farm.
-
-    Growth is halved one citizen below the housing limit, cut to a quarter at
-    the limit, and stops five citizens above it.
+    Full rate more than one citizen below housing, half within one citizen of it, a quarter at or above it and
+    none five or more above it. Housing may be fractional (empire mode's improvements add half a house each).
     """
     if population >= housing + 5:
         return 0.0
@@ -418,7 +407,7 @@ class CityEconomy:
             change = self.mood()[1] + loyalty_effects(self.loyalty)[0]
             if self.pantheon_has('fertility_rites'):
                 change += FERTILITY_RITES_GROWTH
-            rate = max(0, 1 + change) * housing_growth_rate(self.population, self.housing())
+            rate = max(0, 1 + change) * growth_multiplier(self.population, self.housing())
             if rate != 1:
                 surplus = round(surplus * rate, 4)
         return surplus
@@ -705,7 +694,7 @@ class CityEconomy:
         report = {'population': self.population, 'food': self.food, 'growth_threshold': growth_threshold(self.population),
                   'yields': yields, 'food_surplus': self.food_surplus(yields),
                   'growth_surplus': self.growth_surplus(yields), 'housing': self.housing(),
-                  'growth_rate': housing_growth_rate(self.population, self.housing()),
+                  'growth_rate': growth_multiplier(self.population, self.housing()),
                   'amenities': available, 'amenities_needed': needed, 'mood': self.mood()[0],
                   'war_weariness': self.war_weariness, 'amenities_lost_to_war': self.amenities_lost_to_war(),
                   'loyalty': self.loyalty, 'loyalty_per_turn': self.loyalty_per_turn(),

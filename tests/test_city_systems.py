@@ -7,7 +7,7 @@ from unittest.mock import patch
 import constants
 from class_hex import hex_distance
 from economy import (DISTRICT_SPECS, amenities_needed, amenity_mood, citizen_pressure, district_limit,
-                     housing_growth_rate, loyalty_effects)
+                     growth_multiplier, loyalty_effects)
 from game import (BUILD_ITEMS, COMMANDS, TACTIC_INDEX, TACTICAL_FIRST_TACTIC, TACTICAL_UNIT_WIDTH, Game,
                   GameConfig)
 
@@ -303,11 +303,11 @@ class CitySystemsTests(unittest.TestCase):
         self.assertAlmostEqual(rewards[0], -1.05)
 
     # Growth, housing and rewards.
-    def test_housing_growth_rate_handles_half_houses(self):
+    def test_growth_multiplier_handles_half_houses(self):
         for population, housing, rate in [(3, 5, 1.0), (4, 5, .5), (5, 5, .25), (9, 5, .25), (10, 5, 0.0),
                                           (4, 5.5, 1.0), (5, 5.5, .5), (6, 5.5, .25), (11, 5.5, 0.0)]:
             with self.subTest(population=population, housing=housing):
-                self.assertEqual(housing_growth_rate(population, housing), rate)
+                self.assertEqual(growth_multiplier(population, housing), rate)
 
     def test_growth_and_starvation_change_the_reward(self):
         env = self.make_env()

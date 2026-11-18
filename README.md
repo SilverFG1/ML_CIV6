@@ -308,7 +308,7 @@ Siege-only options such as `--unit-types` or `--economy` are rejected in empire 
 
 - **Settlers** found cities on open land at least four tiles from every city and outside foreign territory. A city starts with its tile and the six around it; the first is the capital, whose Palace adds 2 production, 2 science, 5 gold and 1 culture. A settler can only be started in a city of two or more citizens, costs a citizen when it completes, and costs 30 more (at standard speed) for each settler the civilization has already trained.
 - **Citizens** work the city's best tiles, as in the siege economy, and cannot work a tile an enemy unit stands on. Each citizen also produces half a science.
-- **Housing** is 2, 3 next to water, or 5 next to a river, plus 2 for a Granary and half a house for every farm, pasture, plantation or fishing boats in the city's territory. Growth slows near the housing limit as in the siege economy.
+- **Housing** is 2, 3 next to water, or 5 next to a river, plus 2 for a Granary and half a house for every farm, pasture, plantation or fishing boats in the city's territory. Growth slows near the housing limit as in the siege economy, counting half houses: with 5.5 housing, a city of 4 grows at the full rate and one of 5 at half.
 - **Amenities.** A city needs one amenity for every two citizens, the first at three. Each improved luxury type supplies one amenity to up to four of its owner's cities, neediest first. The surplus sets the city's mood:
 
 | Surplus | Mood | Growth | Non-food yields |
@@ -444,6 +444,8 @@ The odds are the exact chances that an attack succeeds and that the retaliation 
 ### Empire results
 
 Held-out results over 100 evaluation games (seeds 100007–100106) against the heuristic rival with default settings (14×13 map, 100 turns, online speed, normal difficulty). "Learned" was trained for 500 episodes, on training seeds 1–3 for continents and seed 1 for islands; ties at the turn limit count as neither a win nor a loss.
+
+These results were measured before a fix to the housing growth rule, which slowed cities with fractional housing (the half houses from improvements) too early: a city of 4 with 5.5 housing grew at a quarter of the full rate. The learned rows have not been re-measured. Re-running the heuristic and random rows on the same seeds after the fix raised the heuristic's average population from 28.1 to 30.7 on continents and from 26.6 to 29.7 on islands, and its score and the rival's by 3–4 points; its win rate moved within noise (56% and 44%), and random play barely changed.
 
 | Map | Policy | Wins | Losses | Score | Rival score | Cities | Population | Gold left |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |

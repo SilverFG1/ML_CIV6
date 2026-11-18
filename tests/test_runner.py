@@ -709,9 +709,12 @@ class EmpireRunnerTests(unittest.TestCase):
     def test_empire_demonstrations_are_played_by_the_heuristic(self):
         args = self.empire_args("--no-save", "--episodes", "2")
         agent = run_game.build_agent(args, random.Random(1))
-        with patch.object(run_game, "is_demonstration", side_effect=lambda _, episode: episode == 0):
+        with patch.object(run_game, "is_demonstration", side_effect=lambda _, episode: episode == 0), \
+                patch.object(agent, "learn", wraps=agent.learn) as learn:
             run_game.train_agent(agent, args)
         demonstration, own = agent.training_state["metrics"]
+        flags = [call.kwargs["demonstration"] for call in learn.call_args_list]
+        self.assertEqual(flags, [True] * demonstration["steps"] + [False] * own["steps"])
         self.assertTrue(demonstration["demonstration"])
         self.assertEqual(demonstration["guidance_actions"], demonstration["steps"])
         self.assertFalse(own["demonstration"])

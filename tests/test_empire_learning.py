@@ -118,6 +118,26 @@ class EmpireAgentTests(unittest.TestCase):
         alone.learn((holding,), (LAND['fortify'],), 0.0, (holding,), done=False)
         self.assertAlmostEqual(alone._parts('land', holding.features)[0], 8.0 + .5 * (0.9 * 8.0 - 8.0))
 
+    def test_demonstrations_keep_other_options_a_margin_below_the_demonstrated_one(self):
+        agent = self.agent(learning_rate=0.5, untried_penalty=0.0, demonstration_margin=1.0)
+        observation, garrison = (land(),), (LAND['garrison'],)
+        agent.learn(observation, garrison, 1.0, (), done=True)
+        before = agent._parts('land', land().features)[1]
+        self.assertAlmostEqual(before[LAND['fortify']], before[LAND['garrison']])
+        agent.learn(observation, garrison, 1.0, (), done=True, demonstration=True)
+        advantages = agent._parts('land', land().features)[1]
+        # Legal rivals within the margin move half way down to it; illegal options are untouched.
+        for option in (LAND['fortify'], LAND['siege']):
+            self.assertAlmostEqual(advantages[option], advantages[LAND['garrison']] - .5)
+        self.assertAlmostEqual(advantages[LAND['hunt']], before[LAND['hunt']])
+        for _ in range(20):
+            agent.learn(observation, garrison, 1.0, (), done=True, demonstration=True)
+        values = agent._values('land', land().features)
+        self.assertLess(values[LAND['siege']], values[LAND['garrison']] - .99)
+        self.assertEqual(agent.choose_action(observation, explore=False), garrison)
+        with self.assertRaises(ValueError):
+            agent.learn(observation, garrison, 1.0, (), done=True, demonstration='yes')
+
     def test_terminal_updates_do_not_bootstrap(self):
         observation, action = (land(),), (LAND['fortify'],)
         results = []

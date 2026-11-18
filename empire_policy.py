@@ -10,7 +10,7 @@ likely.
 
 import empire_rules as R
 from class_hex import hex_distance
-from empire import DECISION_KINDS, OPTION_INDEX, City
+from empire import DECISION_KINDS, OPTION_INDEX, TREASURY_RESERVE, City
 
 RESEARCH_ORDER = ('pottery', 'mining', 'animal_husbandry', 'bronze_working', 'archery', 'irrigation', 'writing',
                   'the_wheel', 'masonry', 'sailing', 'horseback_riding', 'iron_working', 'currency', 'shipbuilding',
@@ -22,7 +22,7 @@ BUILDUP_TURN = 30
 ASSAULT_CAPTURE = .5
 ASSAULT_RISK = .15
 # Gold kept back for emergencies; anything above it buys whatever a city is building.
-GOLD_RESERVE = 100
+GOLD_RESERVE = TREASURY_RESERVE
 MELEE_PREFERENCE = ('horseman', 'swordsman', 'heavy_chariot', 'spearman', 'warrior')
 
 

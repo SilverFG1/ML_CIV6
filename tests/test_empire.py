@@ -240,6 +240,7 @@ class CityTests(unittest.TestCase):
         env._decisions = env._build_decisions(0)
         decision = next(d for d in env.observe() if d.kind == 'city')
         self.assertEqual(options(decision), ['ancient_walls', 'buy'])
+        self.assertEqual(dict(zip(DECISION_KINDS['city'].features, decision.features))['treasury'], 2)
         act(env, lambda d: 'buy' if d.kind == 'city' else holding(d))
         self.assertEqual((city.wall_hp, city.wall_hp_max), (100, 100))
         purchase = next(e for e in env.events if e['type'] == 'item_purchased')

@@ -19,7 +19,7 @@ def land(features=(3, 0, 3, 0, 0, 0, 3, 1, 0, 1, 0), valid=('fortify', 'garrison
     return Decision('land', entity, features, tuple(LAND[name] for name in valid))
 
 
-def city(features=(3, 1, 1, 1, 2, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1), valid=('warrior', 'builder', 'settler'),
+def city(features=(3, 1, 1, 1, 2, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0), valid=('warrior', 'builder', 'settler'),
          entity=2):
     return Decision('city', entity, features, tuple(CITY[name] for name in valid))
 

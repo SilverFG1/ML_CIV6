@@ -1,8 +1,8 @@
 # ML_CIV6
 
-A small Civ-inspired hex-grid combat environment and tabular Q-learning experiment, originally inspired by [this Civilization VI machine-learning video](https://www.youtube.com/watch?v=kjA9LxLx9IQ). Units move, heal, fight, and attempt to capture a defended city. The simulation supports Civ VI terrain types with their yields, rivers, city walls (including Civ VI Ancient Walls), ranged units, and difficulty presets. It implements a limited combat scenario rather than the full Civilization VI ruleset.
+A small Civ-inspired hex-grid environment and tabular Q-learning experiment, originally inspired by [this Civilization VI machine-learning video](https://www.youtube.com/watch?v=kjA9LxLx9IQ). It has two modes. In the original **siege**, units move, heal, fight, and attempt to capture a defended city, with Civ VI terrain types and their yields, rivers, city walls (including Civ VI Ancient Walls), ranged units, and difficulty presets. In **[empire mode](#empire-mode)**, you play a whole civilization against a rival: settlers found cities, which grow within their housing and amenities, build units and buildings, and claim tiles; gold, science and a 15-technology tree drive the economy; builders improve tiles, traders lay roads, and units embark or sail the coast. Both are limited simulations rather than the full Civilization VI ruleset.
 
-The default learner is a tactical squad Q-learner. After 1,000 training episodes it captures the city in almost every evaluation game on seeds it never trained on, including hard and walled sieges. Part of its training watches the rule-based heuristic play, which teaches it assaults it would not find on its own; see [How the AI works](#how-the-ai-works).
+The default siege learner is a tactical squad Q-learner. After 1,000 training episodes it captures the city in almost every evaluation game on seeds it never trained on, including hard and walled sieges. Part of its training watches the rule-based heuristic play, which teaches it assaults it would not find on its own; see [How the AI works](#how-the-ai-works). Empire mode has its own learner, in which every city, unit and the research queue decide each turn; see [How the empire learner works](#how-the-empire-learner-works).
 
 An optional [real Civilization VI integration](docs/REAL_CIV6.md) now provides structured observations, saved snapshots, a basic tactical controller, and individual unit commands through FireTuner. Start with `python run_civ6.py doctor`. Orders are previewed until `--execute` is supplied. This first milestone controls a local player's units; full-game strategy and training the learner against the real game remain future work.
 
@@ -70,11 +70,7 @@ python run_game.py --episodes 500 --difficulty easy --width 7 --height 7 --unit-
 | `--width`, `--height` | Set map dimensions from 3 to 32. |
 | `--unit-count` | Choose one to four starting units. |
 | `--unit-types warrior spearman heavy_chariot slinger archer battering_ram ...` | Set one type per unit; omitted types default to warriors. |
-| `--city-count N` | Choose one to four enemy cities; capture all of them for a domination victory. |
-| `--city-position X Y` | Set the enemy capital's map coordinate (the first city; other cities are placed randomly). |
-| `--player-capital` | Give the squad its own capital to defend against raiders; losing it loses the game. |
-| `--raid-interval N` | Turns between raids on the player's capital (default 6); 0 disables raids. |
-| `--capital-strength`, `--raider-strength` | Set the player's capital (default 28) and raider (default 20) combat strengths. |
+| `--city-position X Y` | Set the city's map coordinate (default: the map center). |
 | `--unit-strengths N [N ...]`, `--city-strength` | Override unit and city combat strengths. |
 | `--ranged-strength` | Configure the city's ranged attack strength. |
 | `--wall-hp` | Set the city's initial wall health. |
@@ -197,42 +193,201 @@ For a walled siege with a battering ram:
 python run_game.py --episodes 200 --unit-count 3 --unit-types warrior spearman battering_ram --wall-hp 50 --model-path runs/siege/model.json --metrics-dir runs/siege --fresh
 ```
 
-## Domination victory
+## Empire mode
 
-Each enemy city is a rival civilization's capital. Capturing every one is a domination victory and ends the game as a win; with the default single city, this is the same as capturing it. Use `--city-count 2` to `4` for a longer campaign:
-
-```powershell
-python run_game.py --episodes 500 --city-count 3 --difficulty easy --max-steps 200 --model-path runs/domination/model.json --metrics-dir runs/domination --fresh
-```
-
-- The enemy capital sits at `--city-position` (or the map center). Other cities are placed randomly at least three hexes apart, in reach of the squad, and with enough open tiles around them for a full siege.
-- Every city that has not been captured shoots and heals on its own; all cities share the strength, wall, and ranged settings.
-- A captured city stops fighting and its tile opens to your units. Capturing a city before the last earns +5, and the last one earns the +10 victory reward.
-- Ranged units shoot the closest city in range; ties go to the city with the least health plus walls. A battering ram helps only against the city it stands next to.
-- Evaluation summaries add the average number of cities captured, which shows progress even when games time out.
-
-Domination is much harder than a single siege, because damage carries over between cities. With three units on normal difficulty, the built-in heuristic wins 65–73% of games against two to four cities, and most other games time out after a unit is lost. On easy difficulty, it wins every three-city game. Allow more turns with `--max-steps` for larger campaigns.
-
-## Defending your capital
-
-Add `--player-capital` to give the squad its own capital, Otterholt, which the enemy raids. Losing it loses the game. It combines with every other option, including domination:
+`--mode empire` plays a whole civilization instead of a single siege. You (the learner) and a rival played by the rule-based heuristic each start with a settler and a warrior, found cities, grow them, research technologies, trade, and fight. With a rival, the map is mirrored top to bottom, so neither start is favoured, and the two civilizations alternate moving first each turn.
 
 ```powershell
-python run_game.py --episodes 500 --player-capital --model-path runs/capital/model.json --metrics-dir runs/capital --fresh
+python run_game.py --mode empire --episodes 1000 --eval-episodes 100 --model-path runs/empire/model.json --metrics-dir runs/empire --fresh
 ```
 
-- The capital is placed as far from the enemy cities as the map allows, at least three hexes from each, and the squad starts around it. Your units cannot enter it.
-- It has 100 HP and strength 28 (`--capital-strength`). It hits back when attacked and heals 10 HP at the end of any turn with no raider next to it.
-- Every 6 turns (`--raid-interval`; 0 disables raids), an enemy city sends a raider (strength 20, `--raider-strength`) from a tile beside it. With several enemy cities, they take turns, so each city you capture slows the raids. At most four raiders are on the map at once.
-- Raiders march toward the capital and attack it once they reach it. They step around your units when they can, and attack a unit that blocks every way forward.
-- Move into a raider to attack it. Archers and slingers can also shoot raiders, and their shots can kill. Battering rams cannot fight raiders.
-- Damage to the capital costs 3 reward per 100 HP, damage dealt to raiders earns 0.5 per 100 HP, and losing the capital is a −10 loss.
-- The observation adds the capital's position, health, and strength, and the position and health of up to four raiders. Models trained with and without `--player-capital` are not interchangeable.
-- Evaluation summaries show how many losses came from losing the capital.
+A game ends when one side holds every rival's original capital (domination), when a civilization loses its last city and settler, or at the turn limit (default 100), where the higher score wins and an exact tie is reported as a timeout. The score is 5 per city, 1 per citizen, 2 per technology and 1 per building, loosely after Civ VI's. Each turn's reward is a tenth of the change in your score, ±0.5 for each military unit killed or lost (±0.25 for civilians), ±3 for each city captured or lost, and ±10 for winning or losing.
 
-Left undefended, the capital falls in every game, around turn 31. One raider cannot take a healthy capital, because the capital's counterattacks kill it first, so the built-in heuristic keeps attacking. It turns back only when nearby raiders could destroy the capital, unless the city it is besieging is nearly taken. With default settings it wins 84% of games against one enemy city and loses its capital in 7%; against three cities over 200 turns, it wins 41% (97% on easy difficulty).
+| Option | Purpose |
+| --- | --- |
+| `--mode empire` | Play the empire game (a checkpoint keeps its mode). |
+| `--rivals 0\|1` | Play against one rival (default) or alone. A rival needs an odd `--height`. |
+| `--map-type continents\|islands` | One landmass connecting both starts (default), or one island each, separated by a row of coast. |
+| `--turn-limit N` | Turns before the higher score wins (10–500, default 100). `--max-steps` defaults to it. |
+| `--speed online\|quick\|standard` | Civ VI game speed: production, research, growth and border costs at 50%, 67% or 100% (default online, which suits 100 turns). |
+| `--difficulty easy\|normal\|hard\|curriculum` | The rival's production, science and gold multiplier: 0.75, 1.0, 1.25, or a ramp from 0.5 to 1.25 over `--curriculum-episodes` (default 1,000). `--rival-bonus` sets it directly. |
+| `--resource-density` | Share of tiles with a resource (0–0.5, default 0.15). |
+| `--width`, `--height`, `--land-types`, `--hills-density`, `--forest-density`, `--mountain-density`, `--water-density`, `--river-count` | Map generation, as in the siege (defaults 14×13, grassland and plains, 0.15 hills, 0.15 forest, 0.05 mountains, 0.05 water, 2 rivers). With a rival, the top half, its rivers included, is copied onto the bottom half. |
+
+Siege-only options such as `--unit-types` or `--economy` are rejected in empire mode, and empire options in a siege.
+
+### Cities, housing and amenities
+
+- **Settlers** found cities on open land at least four tiles from every city and outside foreign territory. A city starts with its tile and the six around it; the first is the capital, whose Palace adds 2 production, 2 science, 5 gold and 1 culture. A settler can only be started in a city of two or more citizens, costs a citizen when it completes, and costs 30 more (at standard speed) for each settler the civilization has already trained.
+- **Citizens** work the city's best tiles, as in the siege economy, and cannot work a tile an enemy unit stands on. Each citizen also produces half a science.
+- **Housing** is 2, 3 next to water, or 5 next to a river, plus 2 for a Granary and half a house for every farm, pasture, plantation or fishing boats in the city's territory. Growth slows near the housing limit as in the siege economy.
+- **Amenities.** A city needs one amenity for every two citizens, the first at three. Each improved luxury type supplies one amenity to up to four of its owner's cities, neediest first. The surplus sets the city's mood:
+
+| Surplus | Mood | Growth | Non-food yields |
+| --- | --- | --- | --- |
+| +3 or more | Ecstatic | +20% | +10% |
+| +1 to +2 | Happy | +10% | +5% |
+| 0 | Content | — | — |
+| −1 to −2 | Displeased | −15% | −5% |
+| −3 to −4 | Unhappy | −30% | −10% |
+| −5 to −6 | Unrest | none | −15% |
+| −7 or less | Revolt | none | −20% |
+
+The tiers follow Civ VI's base game; the percentages are approximate, and unrest and revolt raise no rebels here.
+
+- **Production** completes the city's chosen item; overflow carries over. Gold buys the item in production outright at 4 gold per point of its cost, and production already spent on it is lost.
+- **Culture** claims tiles up to three away as in the siege economy; a tile belongs to one city.
+- **Gold** pays 1 per military unit and 1 per Granary, Water Mill and Library each turn. A civilization whose treasury goes negative disbands one unit that costs maintenance each turn.
+
+### Research
+
+Science researches 15 technologies of Civ VI's Ancient and Classical eras, with their base costs (standard speed) and prerequisites. A boost (Eureka) pays half of a technology when its event happens, before or during research. Overflow carries to the next technology.
+
+| Technology | Cost | Needs | Boost | Unlocks here |
+| --- | --- | --- | --- | --- |
+| Pottery | 25 | — | — | Granary |
+| Animal Husbandry | 25 | — | — | Pasture |
+| Mining | 25 | — | — | Mine, Quarry |
+| Sailing | 50 | — | found a coastal city | Galley, Fishing Boats |
+| Irrigation | 50 | Pottery | farm a resource | Plantation |
+| Writing | 50 | Pottery | meet another civilization | Library |
+| Archery | 50 | Animal Husbandry | kill a unit with a slinger | Archer |
+| Masonry | 80 | Mining | build a quarry | Ancient Walls, Battering Ram |
+| Bronze Working | 80 | Mining | — | Spearman |
+| The Wheel | 80 | Mining | mine a resource | Heavy Chariot, Water Mill |
+| Currency | 120 | Writing | establish a trade route | Market, Trader |
+| Horseback Riding | 120 | Animal Husbandry | build a pasture | Horseman |
+| Iron Working | 120 | Bronze Working | mine iron | Swordsman |
+| Shipbuilding | 200 | Sailing | own two galleys | Quadrireme, embarking |
+| Engineering | 200 | The Wheel | build Ancient Walls | Roads bridge rivers |
+
+Bronze Working's boost needs barbarians, which this simulation does not have. Two players meet when any of their units or cities come within three tiles.
+
+### Units, buildings and tile improvements
+
+| Unit | Cost | Strength | Ranged (range) | Moves | Needs |
+| --- | --- | --- | --- | --- | --- |
+| Settler | 80 (+30 each) | — | — | 2 | 2 citizens |
+| Builder | 50 | — | — | 2 | 3 charges |
+| Trader | 40 | — | — | 2 | Currency |
+| Warrior | 40 | 20 | — | 2 | — |
+| Slinger | 35 | 5 | 15 (1) | 2 | — |
+| Archer | 60 | 15 | 25 (2) | 2 | Archery |
+| Spearman | 65 | 25 | — | 2 | Bronze Working |
+| Heavy Chariot | 65 | 28 | — | 2 (+1 starting on flat land) | The Wheel |
+| Horseman | 80 | 36 | — | 4 | Horseback Riding, improved Horses |
+| Swordsman | 90 | 35 | — | 2 | Iron Working, improved Iron |
+| Battering Ram | 65 | — | — | 2 | Masonry |
+| Galley | 65 | 30 | — | 3 | Sailing, coastal city |
+| Quadrireme | 120 | 20 | 25 (1) | 3 | Shipbuilding, coastal city |
+
+Costs are standard-speed values; the default online speed halves them. In this mode the archer uses Civ VI's 15/25 instead of the siege's 12/20.
+
+| Building | Cost | Effect | Needs |
+| --- | --- | --- | --- |
+| Monument | 60 | +2 culture | — |
+| Granary | 65 | +1 food, +2 housing | Pottery |
+| Water Mill | 80 | +1 food, +1 production | The Wheel, a river next to the city |
+| Library | 90 | +2 science | Writing |
+| Market | 120 | +3 gold, +1 trade route | Currency |
+| Ancient Walls | 80 | 100 wall health and a ranged strike | Masonry |
+
+Civ VI builds Libraries and Markets in Campus and Commercial Hub districts; there are no districts here, so they are city buildings.
+
+Builders spend a charge on an improvement in their civilization's territory: a **farm** (+1 food) on flat or hilly grassland or plains without a feature, a **mine** (+1 production) on hills without a feature (Mining), or the improvement a resource needs. Farms, pastures, plantations and fishing boats add half a house.
+
+| Resource | Kind | Yield | Improvement |
+| --- | --- | --- | --- |
+| Wheat, Rice | bonus | +1 food | Farm |
+| Cattle; Sheep (hills) | bonus | +1 food | Pasture (+1 production) |
+| Stone | bonus | +1 production | Quarry (+1 production) |
+| Fish; Crabs | bonus | +1 food; +2 gold | Fishing Boats (+1 food) |
+| Horses | strategic | +1 food, +1 production | Pasture |
+| Iron (hills) | strategic | +1 science | Mine |
+| Citrus; Cotton; Silk (forest) | luxury | +2 food; +3 gold; +1 culture | Plantation (+2 gold) |
+| Salt | luxury | +1 food, +1 gold | Mine |
+| Pearls | luxury | +1 faith | Fishing Boats |
+
+A builder places fishing boats on a coastal tile next to the land it stands on.
+
+### Movement, roads and ships
+
+Units have Civ VI's movement points: flat land costs 1, hills and forest one more each, and crossing a river without a bridge, embarking or disembarking uses all remaining movement. A unit with full movement can always enter one tile. Entering a tile next to an enemy military unit ends the move (zone of control). One military and one civilian unit may share a tile; a military unit that enters a tile holding only enemy civilians captures them.
+
+**Roads** cost one movement point between road tiles, whatever the terrain, and bridge rivers once Engineering is known. City tiles count as roads. Civ VI lays roads along trade routes, and so does this simulation: a **trader** opens a domestic route from its nearest city to the nearest other city it can reach over land, lays a road along the way, and becomes the route. Each route adds 1 food and 1 production to its origin city for the rest of the game. A civilization has one route, plus one per Market.
+
+**Ships and embarking.** Galleys and quadriremes sail coast tiles and their own coastal cities; nothing enters ocean, which needs Cartography in Civ VI. With Shipbuilding, land units embark onto the coast. Embarked units defend with strength 10, cannot attack, and do not heal. Ships can attack units on the shore and coastal cities, and a galley can capture a coastal city. On an islands map, an invasion needs Shipbuilding or a fleet.
+
+### Combat and cities
+
+Combat uses the siege's damage formula. A unit loses one strength for every 10 hit points of damage, as in Civ VI. Defenders gain the terrain's defense (hills and forest +3 each) and +5 against melee attacks across a river; spearmen gain +10 against cavalry. Ranged attacks draw no retaliation. A melee unit that destroys a land unit moves into its tile.
+
+A city has 100 health and defends with its owner's strongest available melee unit's strength plus 8 (28 with warriors, like the siege's normal city). It heals 10 health in any turn it is not damaged. Walls, rams and ranged attacks work as in the siege: melee attacks deal half damage to walls unless a ram stands next to the city, and ranged attacks cannot take a city's last hit point. Walled cities strike the weakest enemy unit within two tiles each turn with the owner's strongest ranged strength (15, or 25 with archers). A melee unit, or a galley, that brings a city to zero health captures it: the city keeps its territory, buildings and improvements, loses a citizen and its walls, drops to 50 health, and any garrison dies. A captured capital no longer has a Palace.
+
+Units heal 20 a turn in their own city, 15 in friendly territory, 10 in neutral and 5 in enemy territory if they neither moved nor attacked; ships heal only in friendly territory.
+
+### What the empire learner decides
+
+Each turn, every entity of your civilization makes one decision, so an observation is a list of decisions whose length changes as cities are founded and units trained or lost. Each decision has a handful of integer features and a menu of orders; the environment carries out each order with pathfinding:
+
+| Decision | Features | Options |
+| --- | --- | --- |
+| Research | turns left, technologies known, cities, coastal, threat, military balance, separated by sea | the available technologies (only "carry on" while researching) |
+| City | turns left, whether it is choosing, capital, population, housing room, amenities, food surplus, production, nearby sites, settlers, builder need, defenders, threats, coastal, cities, walls, army size, treasury (short of the item's price, within 100 gold above it, or richer) | any buildable item while choosing; otherwise carry on or buy |
+| Settler | turns left, this tile's quality, best site's quality and distance, threat, escort, cities | found here, head for the 1st/2nd/3rd best site, hold |
+| Builder | turns left, what it could improve here, targets, distance, charges, threat | improve, head for a resource, head for a tile, hold |
+| Land unit | turns left, type, health, threat, what it can attack now, the odds, distance to an enemy city, military balance, territory, whether it is a city's only defender, unescorted settlers | fortify, garrison, defend, hunt, siege, escort |
+| Ship | turns left, type, health, threat, contact, odds, enemy coastal city, balance | fortify, hunt, raid, patrol |
+| Trader | turns left, whether a route is available | open a route, hold |
+
+The odds are the exact chances that an attack succeeds and that the retaliation kills the attacker, computed from the combat formula. Nothing depends on map coordinates.
+
+### How the empire learner works
+
+`EmpireQAgent` is the default learner in empire mode. Like the tactical learner, it is tabular and tile-coded, but each decision estimates the whole civilization's return, as independent learners sharing one target would.
+
+- **Values.** A decision's value for an option is a situation value V, which every visit updates, plus an advantage A for the option, which only choosing it updates; each is a sum of table rows over a few subsets of the decision's features. Options are ranked by advantage, so the value level can follow the situation even for options seldom taken. A new row starts V at the target that created it and every advantage half a point below it (`--untried-penalty`), so options never tried look slightly worse, not better.
+- **Targets.** The target is the turn's reward plus the discounted mean, over next turn's decisions, of each decision's best value, leaving out the decision's own entity. A unit that holds still therefore cannot bootstrap from its own unchanged estimate. A sum over entities, as in the tactical learner, does not suit a civilization whose number of units changes: it credits training any unit with one more term and blames a builder for spending its last charge or a settler for founding a city. The first version did exactly that, building builders that never improved anything.
+- **Demonstrations and teacher labels.** As in the siege, 30% of training episodes are demonstrations played by the heuristic. Thirty or more entities share one reward, so a single unit's choice barely moves its target, and the learned advantages are noisy. The heuristic therefore also teaches with DQfD's large-margin loss (Hester et al. 2018): every option valued within `--demonstration-margin` (default 1.0) of the heuristic's choice is pushed down, while the chosen option keeps its learned value. Demonstrations label their own moves. In the learner's own episodes, the heuristic labels the states the learner actually reaches, as in DAgger (Ross et al. 2011), because the learner's play reaches states that demonstrations never show. The greedy policy follows these labels unless the learner's own experience values another option by more than the margin. `--margin-on demonstrations` limits the margin to demonstrations.
+- **Exploration** is per decision: each explores with probability epsilon (35% of those follow the heuristic), so a turn mixes exploration and greedy play instead of randomizing a whole empire at once.
+
+**The heuristic** expands while there are good sites, improves tiles, builds a Monument and the economic buildings its technologies allow, keeps one defender per city and answers threats, then masses an army, with a battering ram against walls and archers in support, and besieges the nearest rival city. It buys settlers, builders and urgently needed defenders, and spends any gold above a 100-gold reserve on whatever a city is building. Its melee units assault a city only when the retaliation is unlikely to kill them or a capture is likely. It plays the rival, the demonstrations and the "heuristic" baseline.
+
+### Empire results
+
+Held-out results over 100 evaluation games (seeds 100007–100106) against the heuristic rival with default settings (14×13 map, 100 turns, online speed, normal difficulty). "Learned" was trained for 500 episodes, on training seeds 1–3 for continents and seed 1 for islands; ties at the turn limit count as neither a win nor a loss.
+
+| Map | Policy | Wins | Losses | Score | Rival score | Cities | Population | Gold left |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| continents | learned (3 seeds) | 17%, 20%, 19% | 82%, 78%, 80% | 81.7, 83.2, 85.2 | 97.7–98.4 | 4.8–5.0 | 22.5–23.7 | 164–227 |
+| continents | heuristic | 55% | 44% | 99.4 | 97.4 | 5.6 | 28.1 | 105 |
+| continents | random | 0% | 100% | 41.3 | 101.0 | 2.0 | 7.3 | 71 |
+| islands | learned | 17% | 82% | 80.9 | 97.2 | 4.5 | 21.6 | 323 |
+| islands | heuristic | 48% | 49% | 94.8 | 96.7 | 4.8 | 26.6 | 105 |
+| islands | random | 0% | 100% | 50.5 | 109.4 | 2.4 | 9.8 | 58 |
+
+The learned policy plays a whole civilization: it expands to about five cities, researches nearly all 15 technologies, improves tiles, trades and fights, and wins about one game in five against the heuristic. That is far better than random play but still below the heuristic it learns from, which wins about half its games against an identical rival. The heuristic's roughly even record against itself is consistent with the mirrored map and alternating turn order being fair. The learned cities grow more slowly (about 23 citizens against 28), and the learner still ends with more unspent gold.
+
+How the learner got here, measured on held-out games against the heuristic rival:
+
+- With values summed over entities, as in the tactical learner, cities trained builders that never improved anything and units only fortified. After 400 episodes it won none of 30 games and ended with almost no cities.
+- Averaging targets and splitting values into situation values and advantages raised the score from about 17 to 51–66 (300 episodes, two seeds), but it still won at most 2 of 30 games.
+- Leaving each entity's own successor out of its target did not change these results by itself. It removes a feedback loop in which a unit that holds still keeps an overestimate alive.
+- The demonstration margin raised wins to 9–11 of 30 (scores 83–89) with a margin of 1.0, and to 14–16% of 100 games after 1,000 episodes. With a margin of 0.5, wins were 2–10 of 30, or 5–10 of 30 with half of all episodes as demonstrations.
+- Labelling the learner's own states with the heuristic's choices raised wins on continents to 23–30% after 500 episodes (14% on islands), against the heuristic as it then was, which spent gold only on settlers, builders and emergency defenders. That learner ended games with 540–680 unspent gold.
+- With the heuristic also spending its surplus gold, the rival grew stronger, and the learner still hoarded about 580 gold, because a city's features did not show its treasury. The treasury feature brought unspent gold down to 164–227, giving the results above.
+
+Each learned evaluation takes the greedy policy, without the heuristic. A training episode takes about 0.6 seconds.
+
+### Simplifications
+
+There are no civics, policies, governments, religion, great people, districts, wonders, barbarians, diplomacy, trade with rivals, fog of war or tile purchases. Rivals are always at war. Traders become their route instead of travelling it, and routes cannot be plundered. Builders place fishing boats from the shore. Purchases forfeit production already spent. Movement, healing and city values not listed above as Civ VI's are this simulation's own. Map generation is this project's own. With one rival the map is mirrored, so `--height` must be odd.
+
+The renderer draws each civilization's borders in its colour (blue for you, red for the rival), roads, resources (three-letter labels), improvements, cities with their population and health, units and ships with type labels, and an outline round embarked units.
 
 ## How the AI works
+
+This section describes the siege. Empire mode's learner is described in [How the empire learner works](#how-the-empire-learner-works).
 
 Evaluation compares three policies: the **learned** squad policy, a rule-based **heuristic**, and **random** play.
 
@@ -282,6 +437,8 @@ Each run writes to `--metrics-dir` (default `training_metrics`):
 
 Use separate output directories for experiments. Checkpoints save atomically; periodic saves preserve recoverable progress during long runs. `--checkpoint-every N` controls their interval.
 
+In empire mode, `steps` counts turns, and the `city_strength` column records the episode's rival bonus, which a curriculum ramps. Evaluation summaries also average each policy's final score, the rival's score, cities, population, technologies and gold, for example `learned: wins 9/30, ..., score 83.2, rival score 97.2, cities 4.8, ...`.
+
 Render evaluation after training or replay a saved policy:
 
 ```powershell
@@ -290,7 +447,9 @@ python run_game.py --episodes 0 --eval-episodes 3 --eval-policies learned --mode
 
 During playback, **Space** pauses/resumes, **Right Arrow** advances one turn while paused, **+ / -** change playback speed, **Y** toggles yield dots, and **Esc** exits. `--render-training` also displays training turns.
 
-Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer or slinger, **Y** toggles yield dots, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
+Playback works the same way for empire games (`--mode empire --render`), without manual play.
+
+Run `python game.py` to play a siege manually. **Tab** selects a unit, **Q/E/A/D/Z/X** move, **Space** heals, **F** shoots with an archer or slinger, **Y** toggles yield dots, **R** restarts, and **Esc** exits. Each command advances the whole squad's turn; the other units wait and heal.
 
 ## Verification
 
@@ -298,4 +457,4 @@ Run `python game.py` to play manually. **Tab** selects a unit, **Q/E/A/D/Z/X** m
 python -m unittest discover -s tests -v
 ```
 
-The tests cover simulation rules, independent environments, terminal rewards, legal actions, Q-learning updates, checkpoint validation/resumption, and runner behavior. `tests/test_tactical.py` checks the combat odds against simulated attacks, the tactical encoding, the heuristic's rules, and the tactical learner's arithmetic and checkpoints. A short training regression checks that the learner wins held-out games without guidance. Runner tests check that demonstrations are played entirely by the heuristic and train the learner through its normal update, that they pause while they score below the learner's own episodes, that a run with demonstrations split by a checkpoint matches an uninterrupted one, and that older checkpoints resume without them. GitHub Actions runs the suite on Python 3.12 with headless dependencies and executes a short CLI training/evaluation run. [UPGRADE_STATUS.md](UPGRADE_STATUS.md) tracks the upgrade areas and their integration evidence.
+The tests cover simulation rules, independent environments, terminal rewards, legal actions, Q-learning updates, checkpoint validation/resumption, and runner behavior. `tests/test_tactical.py` checks the combat odds against simulated attacks, the tactical encoding, the heuristic's rules, and the tactical learner's arithmetic and checkpoints. A short training regression checks that the learner wins held-out games without guidance. Runner tests check that demonstrations are played entirely by the heuristic and train the learner through its normal update, that they pause while they score below the learner's own episodes, that a run with demonstrations split by a checkpoint matches an uninterrupted one, and that older checkpoints resume without them. `tests/test_empire.py` covers the empire's map mirroring, settlers and city sites, housing, amenities, purchases, bankruptcy, borders, research and boosts, strategic resources, improvements, trade routes and roads, movement points, rivers, zones of control, embarking, ships, combat odds against simulated fights, walls, city strikes, capture and domination, and whole random and heuristic games; `tests/test_empire_learning.py` checks the empire learner's arithmetic, its own-entity exclusion, the demonstration margin and its checkpoints; and runner tests check that empire training resumes exactly. GitHub Actions runs the suite on Python 3.12 with headless dependencies and executes a short CLI training/evaluation run. [UPGRADE_STATUS.md](UPGRADE_STATUS.md) tracks the upgrade areas and their integration evidence.

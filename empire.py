@@ -44,6 +44,8 @@ CITY_NAMES = (
      'Ermineholm', 'Polecat Point', 'Wolverwick'),
 )
 OBSERVATION_SCHEMA = 'ml_civ6.empire.v1'
+# A city's treasury feature: short of the price, within this reserve above it, or richer.
+TREASURY_RESERVE = 100
 # A movement cost that uses all of a unit's remaining movement: crossing a river
 # without a bridge, embarking and disembarking.
 ALL_MOVES = 'all'
@@ -73,8 +75,9 @@ DECISION_KINDS = {
     'research': DecisionKind(('stage', 'technologies', 'cities', 'coastal', 'threat', 'balance', 'separated'),
                              (3, 4, 4, 1, 2, 2, 1), R.TECHNOLOGY_NAMES),
     'city': DecisionKind(('stage', 'idle', 'capital', 'population', 'housing', 'amenities', 'food', 'production',
-                          'sites', 'settlers', 'builders', 'defenders', 'threat', 'coastal', 'cities', 'walls', 'army'),
-                         (3, 1, 1, 4, 2, 2, 2, 3, 2, 2, 2, 2, 2, 1, 4, 1, 2), CITY_ITEMS + ('buy',)),
+                          'sites', 'settlers', 'builders', 'defenders', 'threat', 'coastal', 'cities', 'walls', 'army',
+                          'treasury'),
+                         (3, 1, 1, 4, 2, 2, 2, 3, 2, 2, 2, 2, 2, 1, 4, 1, 2, 2), CITY_ITEMS + ('buy',)),
     'settler': DecisionKind(('stage', 'here', 'best', 'distance', 'threat', 'escort', 'cities'),
                             (3, 3, 3, 3, 2, 1, 4), ('found', 'site_1', 'site_2', 'site_3', 'hold')),
     'builder': DecisionKind(('stage', 'here', 'targets', 'distance', 'charges', 'threat'),
@@ -1568,6 +1571,9 @@ class EmpireGame:
         sites = sum(hex_distance(p, city.position) <= 6 and self.legal_site(owner, p) for p in values)
         army = 0 if len(military) < len(self.player_cities(owner)) else 1 if len(military) < 2 * len(
             self.player_cities(owner)) + 2 else 2
+        # Measured against what the city is building, or a warrior while it chooses.
+        price = self.item_price(owner, city.item or 'warrior')
+        treasury = _bucket(self.players[owner].gold, (price, price + TREASURY_RESERVE))
         features = (stage, int(city.item is None), int(city.has_palace),
                     _bucket(city.population, (2, 3, 5, 8)),
                     _bucket(self.housing(city) - city.population, (1, 2)),
@@ -1575,7 +1581,7 @@ class EmpireGame:
                     _bucket(self.food_surplus(city, yields), (.01, 3)),
                     _bucket(yields.get('production', 0), (3, 5, 8)),
                     min(2, sites), min(2, settlers), builder_level, min(2, defenders), min(2, threat),
-                    int(self.coastal(city.position)), city_count, int(city.wall_hp_max > 0), army)
+                    int(self.coastal(city.position)), city_count, int(city.wall_hp_max > 0), army, treasury)
         return Decision('city', city.id, features, valid)
 
     def _settler_decision(self, unit, stage, city_count, values):
